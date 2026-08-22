@@ -1,0 +1,23 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+.venv/
+
+# ===== 运行日志 (含 token/请求细节, 不入库) =====
+logs/
+*.log
+
+# ===== 运行状态标记 (进程 / 签到状态, 不入库) =====
+data/
+.daemon.pid
+.daemon_last_signin
+.daemon_last_trae_retry
+.trae_signin_state
+
+# ===== 临时 / 事故备份 =====
+*.bak*
+config.json.polluted*
+
+# ===== 系统 =====
+Thumbs.db
+.DS_Store

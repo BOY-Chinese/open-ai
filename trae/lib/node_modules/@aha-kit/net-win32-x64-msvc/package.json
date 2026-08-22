@@ -1,0 +1,21 @@
+{
+  "name": "@aha-kit/net-win32-x64-msvc",
+  "version": "0.4.0-dev.25113f695920251126182417",
+  "cpu": [
+    "x64"
+  ],
+  "main": "index.win32-x64-msvc.node",
+  "files": [
+    "index.win32-x64-msvc.node"
+  ],
+  "engines": {
+    "node": ">= 6.14.2 < 7 || >= 8.11.2 < 9 || >= 9.11.0 < 10 || >= 10.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://code.byted.org/lark/aha_net"
+  },
+  "os": [
+    "win32"
+  ]
+}

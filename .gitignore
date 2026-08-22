@@ -21,3 +21,8 @@ config.json.polluted*
 # ===== 系统 =====
 Thumbs.db
 .DS_Store
+# ===== 安装器构建产物 =====
+installer/resources.zip
+installer/build/
+installer/dist/
+installer/*.spec

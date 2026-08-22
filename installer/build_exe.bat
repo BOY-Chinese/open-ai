@@ -1,41 +1,41 @@
 @echo off
 rem =====================================================
-rem open-ai ä¸€é”®å®‰è£…åŒ… æ„å»ºè„šæœ¬ (Windows + PyInstaller)
+rem open-ai Ò»¼ü°²×°°ü ¹¹½¨½Å±¾ (Windows + PyInstaller)
 rem =====================================================
-rem å‰ç½®: å·²å®‰è£… Python 3.10+ å¹¶åŠ å…¥ PATH (è„šæœ¬ä¼šè‡ªåŠ¨è£… pyinstaller)
-rem ç”¨æ³•: åŒå‡»è¿è¡Œæœ¬è„šæœ¬
-rem äº§å‡º: dist\open-ai-installer.exe + è‡ªåŠ¨å¤åˆ¶åˆ°æ¡Œé¢
+rem Ç°ÖÃ: ÒÑ°²×° Python 3.10+ ²¢¼ÓÈë PATH (½Å±¾»á×Ô¶¯×° pyinstaller)
+rem ÓÃ·¨: Ë«»÷ÔËĞĞ±¾½Å±¾
+rem ²ú³ö: dist\open-ai-installer.exe + ×Ô¶¯¸´ÖÆµ½×ÀÃæ
 rem =====================================================
 setlocal
 cd /d "%~dp0"
 
 echo ====================================================
-echo  open-ai ä¸€é”®å®‰è£…åŒ… æ„å»º
+echo  open-ai Ò»¼ü°²×°°ü ¹¹½¨
 echo ====================================================
 
-rem ---- 1. æ‰“åŒ…èµ„æº zip ----
+rem ---- 1. ´ò°ü×ÊÔ´ zip ----
 echo.
-echo [1/4] æ‰“åŒ… open-ai èµ„æº...
+echo [1/4] ´ò°ü open-ai ×ÊÔ´...
 python build_resources.py
 if errorlevel 1 goto :err
 
-rem ---- 2. æ‰¾ python + pyinstaller ----
+rem ---- 2. ÕÒ python + pyinstaller ----
 set PY=python
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] æœªæ‰¾åˆ° python, è¯·å…ˆå®‰è£… Python 3.10+
+    echo [ERROR] Î´ÕÒµ½ python, ÇëÏÈ°²×° Python 3.10+
     goto :err
 )
 %PY% -m pip show pyinstaller >nul 2>nul
 if errorlevel 1 (
-    echo [INFO] å®‰è£… pyinstaller...
+    echo [INFO] °²×° pyinstaller...
     %PY% -m pip install pyinstaller -q
     if errorlevel 1 goto :err
 )
 
-rem ---- 3. PyInstaller æ‰“åŒ… ----
+rem ---- 3. PyInstaller ´ò°ü ----
 echo.
-echo [2/4] PyInstaller æ‰“åŒ… exe (èµ„æºè¾ƒå¤§, éœ€å‡ åˆ†é’Ÿ)...
+echo [2/4] PyInstaller ´ò°ü exe (×ÊÔ´½Ï´ó, Ğè¼¸·ÖÖÓ)...
 %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
     --name "open-ai-installer" ^
     --add-data "resources.zip;." ^
@@ -43,27 +43,27 @@ echo [2/4] PyInstaller æ‰“åŒ… exe (èµ„æºè¾ƒå¤§, éœ€å‡ åˆ†é’Ÿ)...
     installer.py
 if errorlevel 1 goto :err
 
-rem ---- 4. å¤åˆ¶åˆ°æ¡Œé¢ ----
+rem ---- 4. ¸´ÖÆµ½×ÀÃæ ----
 echo.
-echo [3/4] å¤åˆ¶å®‰è£…åŒ…åˆ°æ¡Œé¢...
+echo [3/4] ¸´ÖÆ°²×°°üµ½×ÀÃæ...
 set DESKTOP=%USERPROFILE%\Desktop
 if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\Desktop
-if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\æ¡Œé¢
-if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\æ¡Œé¢
+if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\×ÀÃæ
+if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\×ÀÃæ
 copy /y "dist\open-ai-installer.exe" "%DESKTOP%\open-ai-installer.exe" >nul
 if errorlevel 1 (
-    echo [WARN] å¤åˆ¶åˆ°æ¡Œé¢å¤±è´¥, å®‰è£…åŒ…åœ¨ dist\ ç›®å½•
+    echo [WARN] ¸´ÖÆµ½×ÀÃæÊ§°Ü, °²×°°üÔÚ dist\ Ä¿Â¼
 ) else (
-    echo [OK] å·²å¤åˆ¶åˆ°æ¡Œé¢: %DESKTOP%\open-ai-installer.exe
+    echo [OK] ÒÑ¸´ÖÆµ½×ÀÃæ: %DESKTOP%\open-ai-installer.exe
 )
 
-rem ---- 5. å®Œæˆ ----
+rem ---- 5. Íê³É ----
 echo.
-echo [4/4] æ„å»ºå®Œæˆ!
+echo [4/4] ¹¹½¨Íê³É!
 echo ====================================================
-echo  å®‰è£…åŒ…: %DESKTOP%\open-ai-installer.exe
-echo  (è‹¥æ¡Œé¢æ²¡æœ‰, åœ¨ dist\open-ai-installer.exe)
-echo  æŠŠè¿™ä¸ª exe å‘ç»™ç”¨æˆ·, åŒå‡»å³å¯ä¸€é”®å®‰è£….
+echo  °²×°°ü: %DESKTOP%\open-ai-installer.exe
+echo  (Èô×ÀÃæÃ»ÓĞ, ÔÚ dist\open-ai-installer.exe)
+echo  °ÑÕâ¸ö exe ·¢¸øÓÃ»§, Ë«»÷¼´¿ÉÒ»¼ü°²×°.
 echo ====================================================
 dir "dist\open-ai-installer.exe" | findstr "open-ai"
 pause
@@ -71,6 +71,6 @@ goto :eof
 
 :err
 echo.
-echo [ERROR] æ„å»ºå¤±è´¥, è¯·æ£€æŸ¥ä¸Šæ–¹æ—¥å¿—.
+echo [ERROR] ¹¹½¨Ê§°Ü, Çë¼ì²éÉÏ·½ÈÕÖ¾.
 pause
 exit /b 1

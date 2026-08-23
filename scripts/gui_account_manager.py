@@ -96,10 +96,8 @@ class AccountManagerApp:
         root.title('open-ai 账号管理')
         root.geometry('760x620')
         root.minsize(600, 480)
-        try:
-            root.iconbitmap(default='')
-        except Exception:
-            pass
+        # 设置窗口图标 (任务栏/标题栏)
+        self._set_icon(root)
 
         self.busy = False
         self.result_q = queue.Queue()
@@ -111,6 +109,15 @@ class AccountManagerApp:
         self.root.after(300, self.on_refresh)
         # 回读开机自启状态
         self._refresh_autostart_state()
+
+    def _set_icon(self, root):
+        """设置窗口/任务栏图标为软件 logo。"""
+        try:
+            ico_path = os.path.join(os.path.dirname(BASE), 'pic', 'open-ai.ico')
+            if os.path.exists(ico_path):
+                root.iconbitmap(default=ico_path)
+        except Exception:
+            pass
 
     # ---------- 界面搭建 ----------
     def _build_ui(self):
@@ -739,7 +746,18 @@ class AccountManagerApp:
         self._run(work)
 
 
+def _set_windows_app_id():
+    """设置 Windows AppUserModelID, 让任务栏显示自定义图标而非 Python 默认图标。"""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            'openai.account-manager')
+    except Exception:
+        pass
+
+
 def main():
+    _set_windows_app_id()
     root = tk.Tk()
     app = AccountManagerApp(root)
     root.mainloop()

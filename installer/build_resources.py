@@ -23,10 +23,9 @@ INCLUDE = [
     '账号管理.bat',
     'providers', 'scripts', 'trae', 'tests', 'pic',
 ]
-# 额外: 图标 (来自 installer/ico/open-ai.ico -> 目标 pic/open-ai.ico)
+# 额外文件 (来自 installer/ 目录, 打进资源包)
+# 注: pic/open-ai.ico 已随 pic/ 目录遍历自动包含, 无需重复
 EXTRA_FILES = {
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ico', 'open-ai.ico'):
-        'pic/open-ai.ico',
     # 独立卸载程序 (由 build_exe.bat 先生成 installer/uninstall.exe, 再打进资源)
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uninstall.exe'):
         'uninstall.exe',

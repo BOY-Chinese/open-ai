@@ -82,7 +82,6 @@ open-ai/
 ├── start.bat               # 一键启动 (建 venv / 装依赖 / 拉起网关)
 ├── start_hidden.ps1        # 隐藏窗口启动网关 + 签到 (供开机自启调用)
 ├── open-ai-autostart.bat   # 开机自启入口 (放启动文件夹)
-├── uninstall.ps1           # 一键彻底卸载 (GUI 设置页调用)
 ├── providers/
 │   ├── __init__.py         # Provider 注册表 + 模型路由
 │   ├── workbuddy.py        # WorkBuddy (腾讯/混元) provider
@@ -178,8 +177,8 @@ start.bat        # 首次会建 .venv 并装依赖, 然后拉起 Node 后端(187
 2. `daemon.py`（pythonw 无窗口）→ 自愈 + 每日签到
 
 ### 卸载
-GUI「设置」页点「一键卸载」，或命令行运行 `uninstall.ps1`：停止全部进程、
-移除开机自启与计划任务，并彻底删除插件目录（含配置与账号）。
+GUI「设置」页点「一键卸载」，或运行安装目录下的 `uninstall.exe`：停止全部进程、
+移除开机自启/计划任务/桌面快捷方式，并彻底删除插件目录（含配置与账号）。
 
 ### 守护与保活
 - **`daemon.py`**：`pythonw.exe` 运行（无控制台窗口）。每 60s 检查 8000/18787，掉线则用

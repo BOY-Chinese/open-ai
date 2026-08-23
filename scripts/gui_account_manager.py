@@ -361,7 +361,7 @@ class AccountManagerApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_uninstall(self):
-        """一键卸载 (彻底删除)。"""
+        """一键卸载 (彻底删除): 调用独立的 uninstall.exe。"""
         if not messagebox.askyesno(
                 '一键卸载',
                 '⚠ 确认要彻底卸载 open-ai 吗？\n\n'
@@ -373,22 +373,24 @@ class AccountManagerApp:
                 '此操作不可恢复！'):
             return
 
-        # 卸载脚本会停止网关/daemon, 并最终关闭本界面、删除整个目录
-        self._log('开始彻底卸载 open-ai ...')
+        # 调用安装目录内的独立卸载程序 uninstall.exe
+        self._log('正在启动卸载程序 (uninstall.exe) ...')
         import subprocess as sp
+        uninstall_exe = os.path.join(os.path.dirname(BASE), 'uninstall.exe')
+        if not os.path.exists(uninstall_exe):
+            messagebox.showerror('一键卸载',
+                                 '未找到 uninstall.exe\n卸载程序缺失, 无法自动卸载。')
+            return
         try:
-            ps_script = os.path.join(os.path.dirname(BASE), 'uninstall.ps1')
-            sp.Popen(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                      '-File', ps_script],
+            # 以独立进程启动 uninstall.exe (GUI 已确认, 传 --silent 免二次询问)
+            sp.Popen([uninstall_exe, '--silent'],
                      cwd=os.path.dirname(BASE),
                      creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0))
         except Exception as e:
-            messagebox.showerror('一键卸载', f'卸载启动失败: {e}')
+            messagebox.showerror('一键卸载', f'卸载程序启动失败: {e}')
             return
-        # 提示后关闭本窗口 (卸载脚本会删除目录)
-        self._log('卸载已启动, 界面将自动关闭, 目录将于稍后删除。')
-        messagebox.showinfo('一键卸载',
-                            '卸载已启动！\n正在停止网关并删除 open-ai。\n本窗口即将关闭。')
+        # 提示后关闭本窗口 (uninstall.exe 负责停进程并删除目录)
+        self._log('卸载程序已启动, 本窗口即将关闭。')
         self.root.destroy()
 
     def _setup_table_style(self):

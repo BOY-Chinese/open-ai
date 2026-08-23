@@ -20,13 +20,16 @@ INCLUDE = [
     'main.py', 'daemon.py', 'watchdog_boot.py', 'anthropic_api.py',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',
-    'uninstall.ps1', '账号管理.bat',
+    '账号管理.bat',
     'providers', 'scripts', 'trae', 'tests', 'pic',
 ]
 # 额外: 图标 (来自 installer/ico/open-ai.ico -> 目标 pic/open-ai.ico)
 EXTRA_FILES = {
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ico', 'open-ai.ico'):
         'pic/open-ai.ico',
+    # 独立卸载程序 (由 build_exe.bat 先生成 installer/uninstall.exe, 再打进资源)
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uninstall.exe'):
+        'uninstall.exe',
 }
 # 排除项 (相对 project root)
 EXCLUDE_DIRS = {'__pycache__', '.venv', 'logs', 'data', '.git', 'installer'}

@@ -8,8 +8,9 @@
 ```
 installer/
 ├── installer.py          # 安装器主程序 (tkinter GUI)
+├── uninstaller.py        # 独立卸载程序 (打包为 uninstall.exe)
 ├── build_resources.py    # 把 open-ai 资源打包成 resources.zip
-├── build_exe.bat         # Windows 上生成 exe 并自动放到桌面
+├── build_exe.bat         # Windows 上构建 uninstall.exe + installer.exe 并放桌面
 ├── config.shell.json     # 空壳 config 模板 (安装时生成)
 ├── ico/open-ai.ico       # 软件图标 (用于 exe / 快捷方式 / 安装器窗口)
 └── resources.zip         # (构建产物) 打包好的资源
@@ -50,10 +51,15 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
 | 桌面快捷方式 | 创建单个「open-ai」快捷方式（先启网关，再开账号管理），用软件图标 |
 | 开机自启 | 询问用户，勾选则复制到启动文件夹 |
 
-## 卸载修复
+## 卸载 (uninstall.exe)
 
-之前「一键卸载」无法删除自身所在目录。已改为：卸载脚本把删除操作写入 TEMP（目录外），
-用从 System32 启动的分离进程删除整个 open-ai 目录，可彻底删除。
+安装目录内会放置独立的 **uninstall.exe**（像正常软件一样），负责彻底卸载：
+1. 停止网关/daemon/Node 进程
+2. 移除开机自启、计划任务、桌面快捷方式
+3. 复制自身到 TEMP 后，用从 System32 启动的分离进程删除整个安装目录
+
+- **GUI 卸载**：「账号管理」设置页点「一键卸载」→ 调用 uninstall.exe --silent
+- **手动卸载**：运行安装目录下的 uninstall.exe（会先确认）
 
 ## 注意
 

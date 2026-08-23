@@ -24,6 +24,13 @@ import time
 import urllib.error
 import urllib.request
 
+# 强制 stdout/stderr 用 utf-8, 避免 GBK 控制台因中文/emoji 崩溃
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 # Playwright 由 open-ai/.venv 提供
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -136,7 +143,7 @@ def main():
         print(f'[成功] 获取 token: uid={uid} len={len(tok)}')
 
         ok = verify_token(tok)
-        print(f'[验证] token 有效性: {"✅ 有效" if ok else "❌ 无效"}')
+        print(f'[验证] token 有效性: {"有效" if ok else "无效"}')
 
         if ok:
             # 写入 open-ai/config.json providers.trae.accounts
@@ -165,7 +172,7 @@ def main():
 
         browser.close()
         print()
-        print('✅ 登录完成, 浏览器已自动关闭')
+        print('登录完成, 浏览器已自动关闭')
         print('   提示: 重启 open-ai (start.bat) 后新账号即可参与轮询; cookie 13 天内 token 可自动续期')
 
 

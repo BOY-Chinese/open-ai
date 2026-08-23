@@ -30,6 +30,13 @@ import sys
 import time
 import uuid
 
+# 强制 stdout/stderr 用 utf-8, 避免 GBK 控制台因中文/emoji 崩溃
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 # Playwright 由 open-ai/.venv 提供
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -147,7 +154,7 @@ def main():
 
         browser.close()
         print()
-        print('✅ 登录完成, 浏览器已自动关闭')
+        print('登录完成, 浏览器已自动关闭')
         print('   提示: 重启 open-ai 网关后新账号即可参与轮询')
 
 

@@ -38,6 +38,10 @@ def _resource_dir():
 
 RESOURCES_ZIP = os.path.join(_resource_dir(), 'resources.zip')
 SHELL_CONFIG = os.path.join(_resource_dir(), 'config.shell.json')
+# 图标: 打包后位于 _MEIPASS/ico/open-ai.ico; 开发时在 installer/ico/open-ai.ico
+ICON_ICO = os.path.join(_resource_dir(), 'ico', 'open-ai.ico')
+if not os.path.exists(ICON_ICO):
+    ICON_ICO = os.path.join(_resource_dir(), 'open-ai.ico')
 
 # 下载地址 (Python / Node 官方)
 PYTHON_DOWNLOAD = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe'
@@ -116,8 +120,15 @@ class InstallerApp:
     def __init__(self, root):
         self.root = root
         root.title('open-ai 一键安装')
-        root.geometry('560x480')
+        root.geometry('560x500')
         root.resizable(False, False)
+
+        # 设置窗口图标
+        try:
+            if os.path.exists(ICON_ICO):
+                root.iconbitmap(ICON_ICO)
+        except Exception:
+            pass
 
         self.install_dir = tk.StringVar(value=DEFAULT_INSTALL_DIR)
         self.autostart = tk.BooleanVar(value=True)
@@ -132,8 +143,11 @@ class InstallerApp:
         # 标题
         ttk.Label(self.root, text='open-ai 一键安装', font=('Microsoft YaHei UI', 16, 'bold')) \
             .pack(pady=(20, 4))
-        ttk.Label(self.root, text='本地 AI 聚合网关 · 傻瓜式安装', foreground='#666666') \
-            .pack()
+        # 红色高亮提醒: 需以管理员身份运行
+        ttk.Label(self.root,
+                  text='注意：本安装程序需要以管理员身份运行',
+                  foreground='#d32f2f', font=('Microsoft YaHei UI', 11, 'bold')) \
+            .pack(pady=(0, 6))
 
         # 安装目录
         dir_frame = ttk.LabelFrame(self.root, text='安装目录')
@@ -348,29 +362,47 @@ class InstallerApp:
             self._log('✓ Playwright 浏览器安装完成')
 
     def _create_shortcuts(self, target):
-        """创建桌面快捷方式 (账号管理 + 启动网关)。"""
+        """创建单个 'open-ai' 桌面快捷方式 (先启动网关, 再打开账号管理)。"""
         desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
         if not os.path.isdir(desktop):
             desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
         if not os.path.isdir(desktop):
             self._log('⚠ 未找到桌面目录, 跳过快捷方式')
             return
-        venv_py = os.path.join(target, '.venv', 'Scripts', 'pythonw.exe')
-        gui = os.path.join(target, 'scripts', 'gui_account_manager.py')
-        start_bat = os.path.join(target, 'start.bat')
 
-        # 账号管理快捷方式
-        self._make_shortcut(
-            os.path.join(desktop, 'open-ai 账号管理.lnk'),
-            venv_py, f'"{gui}"', target, 'open-ai 账号管理')
-        # 启动网关快捷方式
-        self._make_shortcut(
-            os.path.join(desktop, 'open-ai 启动网关.lnk'),
-            'cmd.exe', f'/c ""{start_bat}""', target, 'open-ai 启动网关')
-        self._log('✓ 桌面快捷方式已创建')
+        # 创建合并启动 bat (先启网关, 再开账号管理)
+        launcher_bat = os.path.join(target, 'open-ai 启动.bat')
+        self._create_launcher_bat(target, launcher_bat)
 
-    def _make_shortcut(self, lnk_path, target_exe, args, workdir, desc):
-        """用 PowerShell WScript.Shell 创建 .lnk 快捷方式。"""
+        icon = os.path.join(target, 'pic', 'software_logo.png')  # 快捷方式图标(用PNG转的ico更好)
+        icon_ico = os.path.join(target, 'pic', 'open-ai.ico')
+        if not os.path.exists(icon_ico):
+            icon_ico = icon
+
+        self._make_shortcut(
+            os.path.join(desktop, 'open-ai.lnk'),
+            launcher_bat, '', os.path.dirname(launcher_bat),
+            'open-ai 本地AI聚合网关', icon_ico)
+        self._log('✓ 已创建桌面快捷方式: open-ai')
+
+    def _create_launcher_bat(self, target, launcher_bat):
+        """生成启动器: 先启动网关(后台), 再打开账号管理GUI。"""
+        bat_content = (
+            '@echo off\r\n'
+            'rem open-ai 一键启动: 先启网关(后台) 再开账号管理\r\n'
+            'cd /d "%~dp0"\r\n'
+            'start "" powershell.exe -NoProfile -ExecutionPolicy Bypass '
+            '-WindowStyle Hidden -File "%~dp0start_hidden.ps1"\r\n'
+            'timeout /t 3 /nobreak >nul\r\n'
+            'start "" "%~dp0.venv\\Scripts\\pythonw.exe" "%~dp0scripts\\gui_account_manager.py"\r\n'
+        )
+        with open(launcher_bat, 'w', encoding='gbk', newline='\r\n') as f:
+            f.write(bat_content)
+        self._log(f'✓ 已生成启动器: {os.path.basename(launcher_bat)}')
+
+    def _make_shortcut(self, lnk_path, target_exe, args, workdir, desc, icon_path=''):
+        """用 PowerShell WScript.Shell 创建 .lnk 快捷方式, 可选自定义图标。"""
+        icon_set = f"$s.IconLocation = '{icon_path}'; " if icon_path and os.path.exists(icon_path) else ''
         ps = (
             f"$ws = New-Object -ComObject WScript.Shell; "
             f"$s = $ws.CreateShortcut('{lnk_path}'); "
@@ -378,6 +410,7 @@ class InstallerApp:
             f"$s.Arguments = '{args}'; "
             f"$s.WorkingDirectory = '{workdir}'; "
             f"$s.Description = '{desc}'; "
+            f"{icon_set}"
             f"$s.Save()"
         )
         rc, out = run_cmd(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',

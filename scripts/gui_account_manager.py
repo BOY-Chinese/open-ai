@@ -369,20 +369,27 @@ class AccountManagerApp:
                 '· 全部插件文件（含代码、脚本、日志）\n'
                 '· 全部配置（config.json）\n'
                 '· 全部账号与 API 密钥\n'
-                '· 开机自启与计划任务\n\n'
+                '· 开机自启、计划任务、桌面快捷方式\n\n'
                 '此操作不可恢复！'):
             return
 
-        def work():
-            ok = self._run_ps('uninstall.ps1', [])
-            self.root.after(0, lambda: self._after_uninstall(ok))
-        self._run(work)
-
-    def _after_uninstall(self, ok):
-        self.autostart_var.set(False)
+        # 卸载脚本会停止网关/daemon, 并最终关闭本界面、删除整个目录
+        self._log('开始彻底卸载 open-ai ...')
+        import subprocess as sp
+        try:
+            ps_script = os.path.join(os.path.dirname(BASE), 'uninstall.ps1')
+            sp.Popen(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                      '-File', ps_script],
+                     cwd=os.path.dirname(BASE),
+                     creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0))
+        except Exception as e:
+            messagebox.showerror('一键卸载', f'卸载启动失败: {e}')
+            return
+        # 提示后关闭本窗口 (卸载脚本会删除目录)
+        self._log('卸载已启动, 界面将自动关闭, 目录将于稍后删除。')
         messagebox.showinfo('一键卸载',
-                            '卸载完成！\nopen-ai 已彻底删除（文件、配置、账号、API 密钥均已清除）。\n'
-                            '你可以关闭本窗口了。')
+                            '卸载已启动！\n正在停止网关并删除 open-ai。\n本窗口即将关闭。')
+        self.root.destroy()
 
     def _setup_table_style(self):
         """给表格加上明显的网格线(基于 ttk clam 主题)。"""

@@ -36,11 +36,23 @@ if errorlevel 1 (
 rem ---- 3. PyInstaller 打包 ----
 echo.
 echo [2/4] PyInstaller 打包 exe (资源较大, 需几分钟)...
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
-    --name "open-ai-installer" ^
-    --add-data "resources.zip;." ^
-    --add-data "config.shell.json;." ^
-    installer.py
+rem 需先确保 ico 存在 (若缺则提示)
+if not exist "ico\open-ai.ico" (
+    echo [WARN] 未找到 ico\open-ai.ico, 跳过图标
+    %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+        --name "open-ai-installer" ^
+        --add-data "resources.zip;." ^
+        --add-data "config.shell.json;." ^
+        installer.py
+) else (
+    %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+        --name "open-ai-installer" ^
+        --icon "ico\open-ai.ico" ^
+        --add-data "resources.zip;." ^
+        --add-data "config.shell.json;." ^
+        --add-data "ico\open-ai.ico;ico" ^
+        installer.py
+)
 if errorlevel 1 goto :err
 
 rem ---- 4. 复制到桌面 ----

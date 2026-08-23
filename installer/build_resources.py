@@ -21,8 +21,13 @@ INCLUDE = [
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',
     'uninstall.ps1', '账号管理.bat',
-    'providers', 'scripts', 'trae', 'tests',
+    'providers', 'scripts', 'trae', 'tests', 'pic',
 ]
+# 额外: 图标 (来自 installer/ico/open-ai.ico -> 目标 pic/open-ai.ico)
+EXTRA_FILES = {
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ico', 'open-ai.ico'):
+        'pic/open-ai.ico',
+}
 # 排除项 (相对 project root)
 EXCLUDE_DIRS = {'__pycache__', '.venv', 'logs', 'data', '.git', 'installer'}
 EXCLUDE_EXTS = {'.pyc', '.log'}
@@ -68,6 +73,13 @@ def build():
                             zf.write(full, rel)
                             count += 1
                             total_bytes += os.path.getsize(full)
+        # 追加额外图标文件
+        for src, arcname in EXTRA_FILES.items():
+            if os.path.exists(src):
+                zf.write(src, arcname)
+                count += 1
+                total_bytes += os.path.getsize(src)
+                print(f'  [图标] -> {arcname}')
     size_mb = os.path.getsize(OUT_ZIP) / 1024 / 1024
     print(f'[完成] 打包 {count} 个文件, {total_bytes/1024/1024:.1f} MB -> {size_mb:.1f} MB zip')
     print(f'  输出: {OUT_ZIP}')

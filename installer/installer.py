@@ -55,10 +55,11 @@ def log(msg):
 
 
 def run_cmd(cmd, timeout=600, capture=True):
-    """运行命令, 返回 (returncode, output)。"""
+    """运行命令, 返回 (returncode, output)。隐藏控制台窗口。"""
     try:
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
         p = subprocess.run(cmd, capture_output=capture, text=True,
-                           timeout=timeout, shell=False)
+                           timeout=timeout, shell=False, creationflags=flags)
         out = (p.stdout or '') + (p.stderr or '')
         return p.returncode, out
     except Exception as e:
@@ -297,15 +298,15 @@ class InstallerApp:
             f'填入 api_key 与 device_id (见 README §3)。'))
 
     def _patch_autostart_bat(self, target):
-        """把 open-ai-autostart.bat 里的硬编码路径替换为目标路径。"""
+        """把 open-ai-autostart.bat 里的硬编码路径替换为目标路径 (bat 为 GBK 编码)。"""
         bat = os.path.join(target, 'open-ai-autostart.bat')
         if not os.path.exists(bat):
             return
-        with open(bat, 'r', encoding='utf-8', errors='replace') as f:
+        with open(bat, 'r', encoding='gbk', errors='replace') as f:
             content = f.read()
         # 替换 D:\app\dsh_plugin\open-ai -> target
         content = content.replace(r'D:\app\dsh_plugin\open-ai', target)
-        with open(bat, 'w', encoding='utf-8') as f:
+        with open(bat, 'w', encoding='gbk', newline='\r\n') as f:
             f.write(content)
         self._log(f'✓ 已更新 open-ai-autostart.bat 路径 -> {target}')
 
@@ -386,15 +387,21 @@ class InstallerApp:
         self._log('✓ 已创建桌面快捷方式: open-ai')
 
     def _create_launcher_bat(self, target, launcher_bat):
-        """生成启动器: 先启动网关(后台), 再打开账号管理GUI。"""
+        """生成启动器: 先启动网关(后台), 再打开账号管理GUI。自动隐藏自身控制台。"""
         bat_content = (
             '@echo off\r\n'
             'rem open-ai 一键启动: 先启网关(后台) 再开账号管理\r\n'
+            'rem 隐藏本控制台窗口\r\n'
+            'if not "%1"=="hidden" (\r\n'
+            '    start "" /min cmd /c "%~f0" hidden\r\n'
+            '    exit /b\r\n'
+            ')\r\n'
             'cd /d "%~dp0"\r\n'
             'start "" powershell.exe -NoProfile -ExecutionPolicy Bypass '
             '-WindowStyle Hidden -File "%~dp0start_hidden.ps1"\r\n'
             'timeout /t 3 /nobreak >nul\r\n'
             'start "" "%~dp0.venv\\Scripts\\pythonw.exe" "%~dp0scripts\\gui_account_manager.py"\r\n'
+            'exit /b\r\n'
         )
         with open(launcher_bat, 'w', encoding='gbk', newline='\r\n') as f:
             f.write(bat_content)

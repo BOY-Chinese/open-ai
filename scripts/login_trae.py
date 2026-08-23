@@ -158,7 +158,9 @@ def main():
                     'cookie': cookie_str,
                 })
                 print(f'[新增] 新账号 {uid} 已加入 accounts')
-            json.dump(cfg, open(OPENAI_CFG, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+            # 原子写入: 先写临时文件再替换, 避免并发覆盖/损坏
+            with open(OPENAI_CFG, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
             print('[写入] open-ai/config.json providers.trae.accounts 完成')
 
         browser.close()

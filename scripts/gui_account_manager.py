@@ -619,12 +619,13 @@ class AccountManagerApp:
             self.root.after(0, lambda: self._set_busy(False))
 
     def _subprocess_stream(self, py, script, title):
-        """后台运行 login_*.py 并实时显示输出。"""
+        """后台运行 login_*.py 并实时显示输出 (隐藏控制台窗口)。"""
         self._write_log(title)
         try:
             p = subprocess.Popen([py, script], cwd=os.path.dirname(BASE),
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, encoding='utf-8', errors='replace')
+                                 text=True, encoding='utf-8', errors='replace',
+                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             for line in p.stdout:
                 self.result_q.put(line.rstrip())
             p.wait()
@@ -689,9 +690,23 @@ class AccountManagerApp:
             self.result_q.put('>>> 即将打开 TRAE 网页登录, 请在浏览器中完成登录 <<<')
             self._subprocess_stream(VENV_PY, os.path.join(BASE, 'login_trae.py'),
                                     'TRAE 登录助手 (login_trae.py)')
-            self.result_q.put('[提示] 登录成功后建议重启 open-ai (start.bat) 使新账号生效')
-            self.fill_credits()
+            # 添加后强制 server.js 重新加载账号池, 并刷新列表
+            self.result_q.put('[设置] 正在让后端重新加载账号...')
+            self._reload_trae_server()
+            self.refresh_account_list()   # 立即从 config 刷新账号列表(无网络)
+            self.fill_credits()           # 再补积分
         self._run(work)
+
+    def _reload_trae_server(self):
+        """请求运行中的 trae server.js 重新加载账号池。"""
+        import urllib.request
+        try:
+            req = urllib.request.Request('http://127.0.0.1:18787/v1/admin/reconnect',
+                                         method='POST')
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.result_q.put(f'[设置] 后端重新加载完成 (HTTP {resp.status})')
+        except Exception as e:
+            self.result_q.put(f'[设置] 后端重载失败(可忽略): {type(e).__name__}')
 
     def on_add_wb(self):
         def work():

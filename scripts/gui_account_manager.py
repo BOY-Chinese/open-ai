@@ -12,6 +12,14 @@ open-ai 账号管理 - 图形界面版 (Tkinter)
       [4] 重新连接      — 验证全部 provider token 是否可用
 页面2「操作日志」: 点击该页签才显示操作日志
 """
+# ---- 必须在 import tkinter 之前设置 AppUserModelID ----
+# 否则 Microsoft Store 版 Python 的 pythonw.exe 任务栏会显示 Python 默认图标
+try:
+    import ctypes
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('openai.account-manager')
+except Exception:
+    pass
+
 import json
 import os
 import subprocess
@@ -111,11 +119,32 @@ class AccountManagerApp:
         self._refresh_autostart_state()
 
     def _set_icon(self, root):
-        """设置窗口/任务栏图标为软件 logo。"""
+        """设置窗口/任务栏图标为软件 logo。
+        对 Microsoft Store 版 Python, 额外用 Win32 WM_SETICON 强制设置, 确保任务栏显示正确图标。"""
+        ico_path = os.path.join(os.path.dirname(BASE), 'pic', 'open-ai.ico')
+        if not os.path.exists(ico_path):
+            return
         try:
-            ico_path = os.path.join(os.path.dirname(BASE), 'pic', 'open-ai.ico')
-            if os.path.exists(ico_path):
-                root.iconbitmap(default=ico_path)
+            root.iconbitmap(default=ico_path)
+        except Exception:
+            pass
+        # Win32 级别强制设置图标 (兼容 Store 版 Python 的任务栏)
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            WM_SETICON = 0x0080
+            ICON_SMALL, ICON_BIG = 0, 1
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            root.update_idletasks()
+            # tkinter 顶层窗口 HWND = GetParent(root.winfo_id())
+            hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+            for size in (ICON_SMALL, ICON_BIG):
+                dim = 16 if size == ICON_SMALL else 32
+                hicon = user32.LoadImageW(None, ico_path, IMAGE_ICON, dim, dim,
+                                          LR_LOADFROMFILE)
+                if hicon:
+                    user32.SendMessageW(hwnd, WM_SETICON, size, hicon)
         except Exception:
             pass
 

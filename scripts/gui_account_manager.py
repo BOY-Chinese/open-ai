@@ -234,8 +234,14 @@ class AccountManagerApp:
         self.root.destroy()
 
     def _set_icon(self, root):
-        """设置窗口/任务栏图标为软件 logo。
-        对 Microsoft Store 版 Python, 额外用 Win32 WM_SETICON 强制设置, 确保任务栏显示正确图标。"""
+        """设置窗口/任务栏图标为软件 logo (多层兜底)。
+
+        Store 版 Python 的 pythonw.exe 图标资源是 Python 默认图标, 任务栏对
+        "无快捷方式的裸进程" 会回落用 exe 图标 —— 仅 WM_SETICON (窗口图标)
+        不够, 还要设窗口类图标 (SetClassLongPtrW) 并给窗口本身显式绑定
+        AppUserModelID (SHGetPropertyStoreForWindow + SetValue), Explorer
+        才会改用窗口自己的图标渲染任务栏按钮。
+        """
         ico_path = os.path.join(os.path.dirname(BASE), 'pic', 'open-ai.ico')
         if not os.path.exists(ico_path):
             return
@@ -243,23 +249,113 @@ class AccountManagerApp:
             root.iconbitmap(default=ico_path)
         except Exception:
             pass
-        # Win32 级别强制设置图标 (兼容 Store 版 Python 的任务栏)
         try:
             import ctypes
+            from ctypes import wintypes
             user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+            # 明确 64/32 位下指针参数类型, 避免 SetClassLongPtrW 截断
+            user32.SetClassLongPtrW.restype = ctypes.c_void_p
+            user32.SetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int,
+                                                ctypes.c_void_p]
+            shell32.SHGetPropertyStoreForWindow.restype = ctypes.HRESULT
+            shell32.SHGetPropertyStoreForWindow.argtypes = [
+                wintypes.HWND, ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p)]
+
             WM_SETICON = 0x0080
             ICON_SMALL, ICON_BIG = 0, 1
+            GCLP_HICON, GCLP_HICONSM = -14, -34
             IMAGE_ICON = 1
             LR_LOADFROMFILE = 0x0010
             root.update_idletasks()
             # tkinter 顶层窗口 HWND = GetParent(root.winfo_id())
             hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+
+            # 1) 给顶层窗口显式绑定 AppUserModelID (任务栏按窗口 AUMID 归组)
+            #    无快捷方式时 Explorer 回落用窗口自身图标而非 exe 图标
+            try:
+                class _GUID(ctypes.Structure):
+                    _fields_ = [('Data1', ctypes.c_ulong),
+                                ('Data2', ctypes.c_ushort),
+                                ('Data3', ctypes.c_ushort),
+                                ('Data4', ctypes.c_ubyte * 8)]
+                # IID_IPropertyStore = {886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}
+                iid = _GUID()
+                iid.Data1 = 0x886D8EEB
+                iid.Data2 = 0x8CF2
+                iid.Data3 = 0x4446
+                iid.Data4 = (ctypes.c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA,
+                                                 0x1D, 0xBD, 0xCF, 0x99)
+                ppv = ctypes.c_void_p()
+                if shell32.SHGetPropertyStoreForWindow(hwnd, ctypes.byref(iid),
+                                                       ctypes.byref(ppv)) == 0 and ppv:
+                    # IPropertyStore 手工 vtable 调用: 只需 SetValue + Commit
+                    # PKEY_AppUserModel_ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5
+                    class _PROPERTYKEY(ctypes.Structure):
+                        _fields_ = [('fmtid', _GUID), ('pid', ctypes.c_ulong)]
+                    key = _PROPERTYKEY()
+                    key.fmtid.Data1 = 0x9F4C2855
+                    key.fmtid.Data2 = 0x9F79
+                    key.fmtid.Data3 = 0x4B39
+                    key.fmtid.Data4 = (ctypes.c_ubyte * 8)(0xA8, 0xD0, 0xE1,
+                                                           0xD4, 0x2D, 0xE1,
+                                                           0xD5, 0xF3)
+                    key.pid = 5
+                    # PROPVARIANT (VT_LPWSTR)
+                    class _PROPVARIANT(ctypes.Structure):
+                        class U(ctypes.Union):
+                            _fields_ = [('pwszVal', ctypes.c_wchar_p),
+                                        ('padding', ctypes.c_ubyte * 16)]
+                        _anonymous_ = ('u',)
+                        _fields_ = [('vt', ctypes.c_ushort),
+                                    ('wReserved1', ctypes.c_ushort),
+                                    ('wReserved2', ctypes.c_ushort),
+                                    ('wReserved3', ctypes.c_ushort),
+                                    ('u', U)]
+                    pv = _PROPVARIANT()
+                    pv.vt = 31  # VT_LPWSTR
+                    pv.pwszVal = ctypes.c_wchar_p('openai.account-manager')
+                    # vtbl: 对 **ppv 取下标 → POINTER(c_void_p), 其内容即函数指针数组
+                    vtbl = ctypes.cast(
+                        ctypes.cast(ppv, ctypes.POINTER(ctypes.c_void_p)).contents,
+                        ctypes.POINTER(ctypes.c_void_p))
+                    # IUnknown: QueryInterface(0), AddRef(1), Release(2)
+                    # IPropertyStore: GetCount(3), GetAt(4), GetValue(5),
+                    #                 SetValue(6), Commit(7)
+                    setvalue = ctypes.WINFUNCTYPE(
+                        ctypes.HRESULT, ctypes.c_void_p, _PROPERTYKEY,
+                        _PROPVARIANT)(vtbl[6])
+                    commit = ctypes.WINFUNCTYPE(ctypes.HRESULT,
+                                                ctypes.c_void_p)(vtbl[7])
+                    release = ctypes.WINFUNCTYPE(ctypes.HRESULT,
+                                                 ctypes.c_void_p)(vtbl[2])
+                    setvalue(ppv.value, key, pv)
+                    commit(ppv.value)
+                    release(ppv.value)
+            except Exception:
+                pass
+
+            # 2) 窗口图标 (标题栏 + Alt-Tab)
             for size in (ICON_SMALL, ICON_BIG):
                 dim = 16 if size == ICON_SMALL else 32
                 hicon = user32.LoadImageW(None, ico_path, IMAGE_ICON, dim, dim,
                                           LR_LOADFROMFILE)
                 if hicon:
                     user32.SendMessageW(hwnd, WM_SETICON, size, hicon)
+
+            # 3) 窗口类图标: 任务栏回落渲染用 (pythonw.exe 类默认继承 exe 图标)
+            hicon32 = user32.LoadImageW(None, ico_path, IMAGE_ICON, 32, 32,
+                                        LR_LOADFROMFILE)
+            hicon16 = user32.LoadImageW(None, ico_path, IMAGE_ICON, 16, 16,
+                                        LR_LOADFROMFILE)
+            try:
+                if hicon32:
+                    user32.SetClassLongPtrW(hwnd, GCLP_HICON, hicon32)
+                if hicon16:
+                    user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, hicon16)
+            except Exception:
+                pass
         except Exception:
             pass
 

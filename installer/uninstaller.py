@@ -111,6 +111,8 @@ class UninstallerApp:
         try:
             self._log('正在停止进程...')
             self._stop_processes()
+            self._log('等待进程完全退出...')
+            self._wait_processes_gone()
             self._log('正在清理开机自启与快捷方式...')
             self._cleanup_shortcuts_and_autostart()
             self._log('正在删除安装目录...')
@@ -136,8 +138,43 @@ class UninstallerApp:
             self.root.after(0, lambda: messagebox.showerror('卸载失败', str(e)))
 
     def _show_done(self):
+        if self.silent:
+            # 静默模式 (GUI 调用): 直接退出, 让延迟删除脚本尽快清掉 uninstall.exe 自身
+            self.root.destroy()
+            return
         messagebox.showinfo('卸载完成', 'open-ai 已成功卸载！\n本窗口即将关闭。')
         self.root.destroy()
+
+    def _matching_process_names(self):
+        """列出仍以安装目录为命令行运行的 python/node/launcher 进程描述。"""
+        try:
+            esc = self.target.replace('\\', '\\\\').replace("'", "''")
+            code, out = run_cmd([
+                'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                '-Command',
+                (f"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+                 f"Where-Object {{ ($_.Name -match 'pythonw?\\.exe' -or $_.Name -match '^node\\.exe$' "
+                 f"-or $_.Name -match '^open-ai-launcher\\.exe$') "
+                 f"-and $_.CommandLine -match [regex]::Escape('{esc}') }} | "
+                 f"ForEach-Object {{ \"$($_.Name)#$($_.ProcessId)\" }}")
+            ], timeout=30)
+            return [x.strip() for x in (out or '').splitlines() if x.strip()]
+        except Exception:
+            return []
+
+    def _wait_processes_gone(self, timeout=15):
+        """轮询等待安装目录相关进程真正退出 (Stop-Process 后 exe 释放句柄需要时间)。
+        这是 .venv 目录删不掉的主因: 命令下发后进程还没退出, 文件仍被占用。"""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            left = self._matching_process_names()
+            if not left:
+                time.sleep(1)  # 再缓冲 1s, 等 Windows 释放文件句柄
+                return
+            time.sleep(0.5)
+        # 超时则再强杀一轮并等待
+        self._stop_processes()
 
     def _stop_processes(self):
         """停止匹配安装目录的 python/node 进程, 并释放网关/Node 端口。"""
@@ -188,34 +225,74 @@ class UninstallerApp:
     def _delete_directory(self):
         """同步删除安装目录(除自身外), 返回残留文件列表(空=全部删除成功)。
 
-        自身 uninstall.exe 通过 TEMP 副本延迟删除, 确保不留残留。
+        自身 uninstall.exe 通过 TEMP 副本延迟删除, 不留残留:
+        - 先带重试删除其余文件 (瞬时占用最多再等 10s 重试)
+        - 仍失败的项写进延迟脚本兜底再删 (等自身完全退出后)
+        - 延迟脚本用重试循环等自身退出后再删自身 + 整目录, 直到成功
         """
         if not os.path.isdir(self.target):
             return []
         self_exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
         errors = []
-        # 1) 同步删除目录内所有项 (跳过自身)
+        # 1) 同步删除目录内所有项 (跳过自身), 失败项带重试 (进程退出/句柄释放竞态)
         for name in sorted(os.listdir(self.target)):
             p = os.path.join(self.target, name)
             if os.path.normcase(p) == os.path.normcase(self_exe):
                 continue
-            try:
-                if os.path.isdir(p) and not os.path.islink(p):
-                    shutil.rmtree(p, ignore_errors=False)
-                else:
-                    os.remove(p)
-            except Exception as e:
-                errors.append(f'{name}: {e}')
-        # 2) 部署延迟删除脚本: 等自身退出后删除自身 + 清理空目录
+            ok = False
+            last_err = ''
+            for attempt in range(4):  # 首次 + 3 次重试, 共约 10s
+                try:
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        shutil.rmtree(p, ignore_errors=False)
+                    else:
+                        os.remove(p)
+                    ok = True
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    import time
+                    time.sleep(2.5)
+            if not ok:
+                errors.append(f'{name}: {last_err}')
+        # 2) 部署延迟删除脚本: 等自身退出后重试删除自身 + 清理残留/空目录
         try:
             ps_script = os.path.join(os.environ.get('TEMP', '.'),
                                      f'openai_del_{os.getpid()}.ps1')
+            # 延迟脚本: 先等 uninstall 进程退出 (最多 30s), 再循环重试删除
+            # 失败项/自身/整目录 (每 2s 一轮, 最多 60s), 应对未释放的文件占用
+            leftover = [os.path.join(self.target, e.split(':', 1)[0]) for e in errors]
+            leftover_lines = '\n'.join(
+                f"  Remove-Item -LiteralPath '{p}' -Recurse -Force -ErrorAction SilentlyContinue"
+                for p in leftover)
             del_script = (
-                f"Start-Sleep -Seconds 2\n"
                 f"$self='{self_exe}'\n"
                 f"$dir='{self.target}'\n"
-                f"if (Test-Path $self) {{ Remove-Item -LiteralPath $self -Force -ErrorAction SilentlyContinue }}\n"
-                f"if (Test-Path $dir) {{ Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }}\n"
+                f"$me=$PID\n"
+                # 等待 uninstall 进程退出 (自身除外), 最多 30s
+                f"for ($i=0; $i -lt 15; $i++) {{\n"
+                f"  $p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+                f"Where-Object {{ $_.Name -match 'uninstall.*\\.exe$' -and $_.ProcessId -ne $me }}\n"
+                f"  if (-not $p) {{ break }}\n"
+                f"  Start-Sleep -Seconds 2\n"
+                f"}}\n"
+                # 循环重试删除, 直到目录消失 (最长 60s)
+                f"for ($i=0; $i -lt 30; $i++) {{\n"
+                f"{leftover_lines}\n"
+                f"  if (Test-Path $self) {{ Remove-Item -LiteralPath $self -Force -ErrorAction SilentlyContinue }}\n"
+                f"  if (Test-Path $dir) {{ Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }}\n"
+                f"  if (-not (Test-Path $dir)) {{ break }}\n"
+                f"  Start-Sleep -Seconds 2\n"
+                f"}}\n"
+                # 兜底: 清掉可能残留的空目录 (.venv/logs 等)
+                f"if (Test-Path $dir) {{\n"
+                f"  Get-ChildItem -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue | "
+                f"Sort-Object {{ $_.FullName.Length }} -Descending | "
+                f"Where-Object {{ $_.PSIsContainer -and -not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue) }} | "
+                f"Remove-Item -Force -ErrorAction SilentlyContinue\n"
+                f"  if (-not (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {{ "
+                f"Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue }}\n"
+                f"}}\n"
                 f"Remove-Item -LiteralPath '{ps_script}' -Force -ErrorAction SilentlyContinue\n"
             )
             with open(ps_script, 'w', encoding='utf-8') as f:

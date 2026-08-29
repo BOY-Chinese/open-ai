@@ -1,0 +1,20 @@
+# 统一换行符策略, 防止 Windows 脚本被 git 规范化成 LF 导致 cmd/PowerShell 解析错乱
+# (LF 的 GBK 批处理在 chcp 切换代码页后, cmd 文件定位错乱, 会把中文字节劈开当命令执行)
+* text=auto
+
+# Windows 脚本必须 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 源码与配置用 LF
+*.py text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# 二进制不走任何转换
+*.exe binary
+*.ico binary
+*.png binary
+*.zip binary

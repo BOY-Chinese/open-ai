@@ -115,6 +115,8 @@ class AccountManagerApp:
         self.refresh_account_list()
         # 启动后自动拉取一次积分/状态
         self.root.after(300, self.on_refresh)
+        # 启动后自动加载模型列表(含积分倍率), 独立线程不锁界面
+        self.root.after(800, self.on_model_refresh)
         # 回读开机自启状态
         self._refresh_autostart_state()
 
@@ -171,11 +173,12 @@ class AccountManagerApp:
         self.trae_frame = ttk.LabelFrame(page_acct, text='TRAE 通道')
         self.trae_frame.pack(fill='both', expand=True, **pad)
         self.tree_trae = self._make_tree(self.trae_frame)
-
+        self.tree_trae.bind('<ButtonRelease-1>', self._on_account_click)
         # WorkBuddy 通道 (下)
         self.wb_frame = ttk.LabelFrame(page_acct, text='WorkBuddy 通道')
         self.wb_frame.pack(fill='both', expand=True, **pad)
         self.tree_wb = self._make_tree(self.wb_frame)
+        self.tree_wb.bind('<ButtonRelease-1>', self._on_account_click)
 
         # 按钮区 —— 4 个功能按键
         btn_frame = ttk.Frame(page_acct)
@@ -210,7 +213,34 @@ class AccountManagerApp:
                   self.btn_api_copy, self.btn_api_delete):
             b.pack(side='left', fill='x', expand=True, padx=3)
 
-        # ---- 页面3: 设置 ----
+        # ---- 页面3: 模型列表（含积分消耗倍率）----
+        page_model = ttk.Frame(self.notebook)
+        self.notebook.add(page_model, text='模型列表')
+
+        # TRAE 模型 (上)
+        self.trae_model_frame = ttk.LabelFrame(page_model, text='TRAE 模型')
+        self.trae_model_frame.pack(fill='both', expand=True, **pad)
+        self.model_tree_trae = self._make_model_tree(self.trae_model_frame)
+
+        # WorkBuddy 模型 (下)
+        self.wb_model_frame = ttk.LabelFrame(page_model, text='WorkBuddy 模型')
+        self.wb_model_frame.pack(fill='both', expand=True, **pad)
+        self.model_tree_wb = self._make_model_tree(self.wb_model_frame)
+
+        # 刷新按钮 + 显示未知倍率勾选框
+        model_btn = ttk.Frame(page_model)
+        model_btn.pack(fill='x', **pad)
+        self.btn_model_refresh = ttk.Button(model_btn, text='刷新模型列表',
+                                            command=self.on_model_refresh)
+        self.btn_model_refresh.pack(side='left', fill='x', expand=True, padx=3)
+        self.show_unknown_rate_var = tk.BooleanVar(value=False)
+        self.chk_show_unknown = tk.Checkbutton(
+            model_btn, text='显示未知倍率模型', variable=self.show_unknown_rate_var,
+            command=self.on_model_refresh, anchor='w',
+            bg='#f0f0f0', activebackground='#f0f0f0')
+        self.chk_show_unknown.pack(side='right', padx=5)
+
+        # ---- 页面4: 设置 ----
         page_set = ttk.Frame(self.notebook)
         self.notebook.add(page_set, text='设置')
 
@@ -410,7 +440,7 @@ class AccountManagerApp:
             return
 
         # 调用安装目录内的独立卸载程序 uninstall.exe
-        self._log('正在启动卸载程序 (uninstall.exe) ...')
+        self._write_log('正在启动卸载程序 (uninstall.exe) ...')
         import subprocess as sp
         uninstall_exe = os.path.join(os.path.dirname(BASE), 'uninstall.exe')
         if not os.path.exists(uninstall_exe):
@@ -426,7 +456,7 @@ class AccountManagerApp:
             messagebox.showerror('一键卸载', f'卸载程序启动失败: {e}')
             return
         # 提示后关闭本窗口 (uninstall.exe 负责停进程并删除目录)
-        self._log('卸载程序已启动, 本窗口即将关闭。')
+        self._write_log('卸载程序已启动, 本窗口即将关闭。')
         self.root.destroy()
 
     def _setup_table_style(self):
@@ -463,15 +493,16 @@ class AccountManagerApp:
 
     def _make_tree(self, parent):
         """创建带上下+左右滚动条的列表, 返回 ttk.Treeview。"""
-        cols = ('account', 'detail')
+        cols = ('enabled', 'account', 'detail')
         frame = ttk.Frame(parent)
         frame.pack(fill='both', expand=True, padx=6, pady=4)
         tree = ttk.Treeview(frame, columns=cols, show='headings', height=4,
                             style='Grid.Treeview')
+        tree.heading('enabled', text='启用')
         tree.heading('account', text='账号')
         tree.heading('detail', text='积分 / 状态')
-        # 列宽设宽, 超出可视区即可左右滑动; 文字居中
-        tree.column('account', width=420, minwidth=180, anchor='center')
+        tree.column('enabled', width=50, minwidth=40, anchor='center')
+        tree.column('account', width=380, minwidth=180, anchor='center')
         tree.column('detail', width=300, minwidth=160, anchor='center')
         vs = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
         hs = ttk.Scrollbar(frame, orient='horizontal', command=tree.xview)
@@ -622,6 +653,31 @@ class AccountManagerApp:
         self.log.configure(state='disabled')
         self.root.update_idletasks()
 
+    def _make_model_tree(self, parent):
+        """模型列表表格: 模型名 / 倍率 / 上游模型id (可滚动)。"""
+        cols = ('name', 'rate', 'upstream')
+        frame = ttk.Frame(parent)
+        frame.pack(fill='both', expand=True, padx=6, pady=4)
+        tree = ttk.Treeview(frame, columns=cols, show='headings', height=6,
+                            style='Grid.Treeview')
+        tree.heading('name', text='模型名称')
+        tree.heading('rate', text='积分倍率')
+        tree.heading('upstream', text='上游模型 id')
+        tree.column('name', width=220, minwidth=120, anchor='w')
+        tree.column('rate', width=90, minwidth=70, anchor='center')
+        tree.column('upstream', width=320, minwidth=180, anchor='w')
+        vs = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
+        hs = ttk.Scrollbar(frame, orient='horizontal', command=tree.xview)
+        tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        tree.grid(row=0, column=0, sticky='nsew')
+        vs.grid(row=0, column=1, sticky='ns')
+        hs.grid(row=1, column=0, sticky='ew')
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree.tag_configure('odd', background='#f2f5f9')
+        tree.tag_configure('even', background='#ffffff')
+        return tree
+
     def _set_busy(self, busy):
         self.busy = busy
         for b in (self.btn_refresh, self.btn_add_trae, self.btn_add_wb, self.btn_reconnect):
@@ -677,26 +733,30 @@ class AccountManagerApp:
         items_t, items_w = [], []
         trae, trae_accs, device_id, invalid_map = trae_info
         for i, a in enumerate(trae_accs, 1):
-            items_t.append((trae_row_name(trae, a, invalid_map, i), ''))
+            enabled = '✓' if a.get('enabled', True) else '✗'
+            items_t.append((enabled, trae_row_name(trae, a, invalid_map, i), ''))
         wb, wb_accs, domain, product = wb_info
         for i, a in enumerate(wb_accs, 1):
-            items_w.append((wb_row_name(wb, a, i), ''))
+            enabled = '✓' if a.get('enabled', True) else '✗'
+            items_w.append((enabled, wb_row_name(wb, a, i), ''))
         self._update_trees(items_t, items_w)
 
     def _build_items_with_credits(self):
         """读取账号并计算每一行的积分(会发网络请求)。
-        返回 (trae_items, wb_items, err), 每项为 (账号名, 积分/状态)。"""
+        返回 (trae_items, wb_items, err), 每项为 (启用状态, 账号名, 积分/状态)。"""
         trae_info, wb_info, err = load_account_groups()
         if err:
             return [], [], err
         items_t, items_w = [], []
         trae, trae_accs, device_id, invalid_map = trae_info
         for i, a in enumerate(trae_accs, 1):
-            items_t.append((trae_row_name(trae, a, invalid_map, i),
+            enabled = '✓' if a.get('enabled', True) else '✗'
+            items_t.append((enabled, trae_row_name(trae, a, invalid_map, i),
                             trae_row_detail(a, device_id)))
         wb, wb_accs, domain, product = wb_info
         for i, a in enumerate(wb_accs, 1):
-            items_w.append((wb_row_name(wb, a, i), wb_row_detail(a, domain, product)))
+            enabled = '✓' if a.get('enabled', True) else '✗'
+            items_w.append((enabled, wb_row_name(wb, a, i), wb_row_detail(a, domain, product)))
         return items_t, items_w, None
 
     def fill_credits(self):
@@ -711,11 +771,134 @@ class AccountManagerApp:
         for tree, items in ((self.tree_trae, items_t), (self.tree_wb, items_w)):
             for i in tree.get_children():
                 tree.delete(i)
-            for idx, (acct, det) in enumerate(items):
+            for idx, (enabled, acct, det) in enumerate(items):
                 tag = 'even' if idx % 2 == 0 else 'odd'
-                tree.insert('', 'end', values=(acct, det), tags=(tag,))
+                tree.insert('', 'end', values=(enabled, acct, det), tags=(tag,))
+
+    # ---------- 账号启用/禁用 ----------
+    def _on_account_click(self, event):
+        """点击表格行时, 若点在"启用"列则切换启用状态, 并通知后端重新加载。"""
+        tree = event.widget
+        col = tree.identify_column(event.x)
+        if col != '#0':  # 非树形列, 转换为列索引
+            col_idx = int(col.replace('#', '')) - 1
+        else:
+            return
+        if col_idx != 0:  # 只处理"启用"列
+            return
+        region = tree.identify_region(event.x, event.y)
+        if region != 'cell':
+            return
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        values = tree.item(item, 'values')
+        # 判断该行属于 trae 还是 wb
+        is_trae = tree == self.tree_trae
+        is_wb = tree == self.tree_wb
+        if not is_trae and not is_wb:
+            return
+        # 根据行索引找账号
+        all_items = tree.get_children()
+        row_idx = list(all_items).index(item)
+        enabled = values[0]
+        new_enabled = enabled == '✗'  # 切换
+        # 保存到 config.json
+        ok, msg = self._save_account_enabled('trae' if is_trae else 'workbuddy', row_idx, new_enabled)
+        if ok:
+            tree.set(item, 'enabled', '✓' if new_enabled else '✗')
+            # 通知后端重新加载账号
+            self._trigger_reload(is_trae)
+
+    def _trigger_reload(self, is_trae):
+        """通知对应后端重新加载账号配置。"""
+        import urllib.request
+        if is_trae:
+            try:
+                req = urllib.request.Request('http://127.0.0.1:18787/v1/admin/reconnect', method='POST')
+                urllib.request.urlopen(req, timeout=5)
+                self.result_q.put('[设置] TRAE 后端已重载账号状态')
+            except Exception as e:
+                self.result_q.put(f'[设置] TRAE 后端重载失败: {e}')
+        else:
+            try:
+                req = urllib.request.Request('http://127.0.0.1:8000/v1/admin/reload-providers', method='POST')
+                urllib.request.urlopen(req, timeout=5)
+                self.result_q.put('[设置] WorkBuddy 后端已重载账号状态')
+            except Exception as e:
+                self.result_q.put(f'[设置] WorkBuddy 后端重载失败: {e}')
+
+    def _save_account_enabled(self, provider_key, row_idx, enabled):
+        """保存账号启用状态到 config.json。provider_key: 'trae' 或 'workbuddy'。返回 (成功否, 消息)。"""
+        try:
+            with open(OPENAI_CFG, encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception as e:
+            return False, str(e)
+        prov = cfg.get('providers', {}).get(provider_key, {})
+        accs = prov.get('accounts', [])
+        if row_idx < 0 or row_idx >= len(accs):
+            return False, f'索引越界: {row_idx}/{len(accs)}'
+        accs[row_idx]['enabled'] = enabled
+        try:
+            with open(OPENAI_CFG, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            return True, 'ok'
+        except Exception as e:
+            return False, str(e)
 
     # ---------- 4 个功能 ----------
+    # ---------- 模型列表 ----------
+    def _render_models(self):
+        """后台线程拉取两个平台模型+倍率, 主线程填充表格。"""
+        def work():
+            self.result_q.put('正在拉取模型列表及积分倍率 ...')
+            trae_items, trae_err = am.trae_model_rates()
+            wb_items, wb_err = am.wb_model_rates()
+            self.root.after(0, lambda: self._fill_model_trees(
+                trae_items, trae_err, wb_items, wb_err))
+        # 用独立线程, 不占用账号操作的 busy 锁
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fill_model_trees(self, trae_items, trae_err, wb_items, wb_err):
+        show_unknown = self.show_unknown_rate_var.get() if hasattr(self, 'show_unknown_rate_var') else False
+
+        def fill(tree, rows, empty_msg):
+            tree.delete(*tree.get_children())
+            if empty_msg:
+                tree.insert('', 'end', values=('', empty_msg, ''), tags=('even',))
+                return
+            for idx, row in enumerate(rows):
+                tag = 'even' if idx % 2 == 0 else 'odd'
+                tree.insert('', 'end', values=row, tags=(tag,))
+        # TRAE: (config_name, display, model_name, rate, err)
+        if trae_err:
+            fill(self.model_tree_trae, [], f'获取失败: {trae_err}')
+        else:
+            rows = []
+            for name, disp, mdl, rate, e in trae_items:
+                r = '未知' if rate is None else f'{rate:.2f}x'
+                if not show_unknown and rate is None:
+                    continue  # 不显示未知倍率
+                rows.append((disp, r, mdl))
+            fill(self.model_tree_trae, rows, '' if rows else '无模型（全部未知倍率，勾选"显示未知倍率模型"查看）')
+        # WorkBuddy: (id, name, credits, err)
+        if wb_err:
+            fill(self.model_tree_wb, [], f'获取失败: {wb_err}')
+        else:
+            rows = []
+            for mid, name, credits, e in wb_items:
+                r = '未知' if credits is None else str(credits)
+                if not show_unknown and credits is None:
+                    continue  # 不显示未知倍率
+                rows.append((name, r, mid))
+            fill(self.model_tree_wb, rows, '' if rows else '无模型（全部未知倍率，勾选"显示未知倍率模型"查看）')
+
+    def on_model_refresh(self):
+        # 独立线程加载, 不占用账号操作的 busy 锁
+        self.result_q.put('正在拉取模型列表及积分倍率 ...')
+        self._render_models()
+
     def on_refresh(self):
         def work():
             self.fill_credits()

@@ -21,3 +21,9 @@ config.json.polluted*
 # ===== 系统 =====
 Thumbs.db
 .DS_Store
+
+# ===== installer build artifacts (regenerable, published via GitHub Release) =====
+installer/build/
+installer/dist/
+installer/resources.zip
+*.exe

@@ -15,13 +15,14 @@ Open-API — 统一 OpenAI 兼容聚合网关 (open-ai, 端口 8000)
 鉴权: Authorization: Bearer <api_key> (config.json 的 api_key, 默认 open-api-key)
 
 模型路由 (providers/__init__.py route_provider):
-  模型名含 "trae" 或以 "tr-" 开头  → trae provider (trae-flash-official → DeepSeek-V4-Flash-Official)
+  模型名以 "tr-" 开头或含 "trae"      → trae provider (tr-<上游模型名>, Work 积分通道)
   模型名含 "workbuddy" 或以 "wb-" 开头 → workbuddy provider
   其他 → 第一个 provider (workbuddy)
 
-WorkBuddy 自定义模型 (需配 ~/.workbuddy/models.json):
-  WorkBuddy 客户端会发送 model = "custom-local:<id>", 各 provider 的
-  normalize_model 会剥离该前缀后再做别名映射。
+模型列表: 两通道均每日自动同步上游 (/v1/models 无需改代码跟随上游更新)。
+对外命名: trae 通道统一 tr- 前缀; workbuddy 通道统一 wb- 前缀 (另保留
+auto / deepseek-chat / deepseek-reasoner 三个通用别名)。历史裸名与
+custom-local: 前缀的请求仍兼容, 但不再出现在列表中。
 """
 import asyncio
 import collections
@@ -76,6 +77,44 @@ MAX_REQ_PER_MIN = int(CONFIG.get("max_req_per_min", 30))
 PROVIDERS = build_providers(CONFIG)
 
 app = FastAPI(title="Open-API 聚合网关", version="1.0.0")
+
+# 模型每日自动刷新: 启动时强制拉取一次上游 /v3/config, 之后每 24h 拉一次。
+# 拉取失败自动回退上次结果/静态表, 不影响网关启动与既有请求。
+MODEL_REFRESH_INTERVAL = 86400  # 秒
+
+
+async def _refresh_workbuddy_models(force: bool = False):
+    wb = PROVIDERS.get("workbuddy")
+    if wb is not None and hasattr(wb, "refresh_models"):
+        try:
+            await wb.refresh_models(force=force)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("workbuddy 模型刷新异常: %s", e)
+
+
+async def _refresh_trae_models(force: bool = False):
+    tr = PROVIDERS.get("trae")
+    if tr is not None and hasattr(tr, "sync_models"):
+        try:
+            await tr.sync_models(force=force)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("trae 模型刷新异常: %s", e)
+
+
+async def _model_refresh_loop():
+    """启动时先刷新, 之后每 24h 刷新一次 (workbuddy + trae 动态模型)。"""
+    await _refresh_workbuddy_models(force=True)
+    await _refresh_trae_models()
+    while True:
+        await asyncio.sleep(MODEL_REFRESH_INTERVAL)
+        await _refresh_workbuddy_models()
+        await _refresh_trae_models()
+
+
+@app.on_event("startup")
+async def _startup_refresh():
+    asyncio.create_task(_model_refresh_loop())
+    logger.info("动态模型每日刷新任务已启动 (每 %d 秒)", MODEL_REFRESH_INTERVAL)
 
 
 class SlidingWindowLimiter:
@@ -270,6 +309,20 @@ async def anthropic_messages(request: Request):
              "error": {"type": "api_error", "message": str(e)[:300]}},
             status_code=502)
     return openai_to_anthropic(oa_resp, model)
+
+
+@app.post("/v1/admin/reload-providers")
+async def reload_providers(request: Request):
+    """重新加载 config.json 并重建所有 provider（用于账号启用/禁用等配置变更后热更新）。"""
+    global PROVIDERS, CONFIG
+    try:
+        CONFIG = load_config()
+        PROVIDERS = build_providers(CONFIG)
+        logger.info("provider 已重新加载: %s", list(PROVIDERS.keys()))
+        return {"status": "ok", "providers": list(PROVIDERS.keys())}
+    except Exception as e:
+        logger.exception("provider 重载失败")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 if __name__ == "__main__":

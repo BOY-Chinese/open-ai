@@ -70,7 +70,21 @@ const SWITCH_EVERY = CFG.switchEvery || 10;
 let globalCallCount = 0;
 
 function pickAccount() {
-  const valid = ACCOUNTS.filter(a => !a.invalid);
+  // 每次请求都从 config.json 实时读取账号启用状态，确保 GUI 切换立即生效
+  try {
+    const cfg = JSON.parse(fs.readFileSync(OPENAI_CFG_PATH, 'utf-8'));
+    const t = (cfg.providers && cfg.providers.trae) || {};
+    const fresh = (t.accounts && t.accounts.length > 0) ? t.accounts : [];
+    // 合并内存中的 invalid 状态（由健康检查运行时设置）
+    for (const a of ACCOUNTS) {
+      const match = fresh.find(f => f.uid === a.uid || f.token === a.token);
+      if (match) match.invalid = !!a.invalid;
+    }
+    ACCOUNTS = fresh.length > 0 ? fresh : ACCOUNTS;
+  } catch (e) {
+    // 读取失败则沿用内存 ACCOUNTS
+  }
+  const valid = ACCOUNTS.filter(a => !a.invalid && a.enabled !== false);
   if (valid.length === 0) {
     throw new Error('TRAE 账号池为空或全部已失效, 请在 账号管理.bat 中 [4] 重新连接 或添加账号');
   }
@@ -202,10 +216,85 @@ async function healthCheck(reason) {
   }
 }
 
+// ======================= 动态模型 (启动/每日刷新, 失败回退配置表) =======================
+// 调用上游 get_detail_param 实时拉取 Trae 模型列表, 缓存到内存。
+// 每天至多刷新一次(默认), 拉取失败回退 config.json 的 providers.trae.models。
+const MODEL_REFRESH_INTERVAL = (CFG.modelRefreshInterval || 86400) * 1000; // 秒→ms
+let DYNAMIC_MODELS = [];        // 最近一次拉到的上游 config_name 数组
+let DYNAMIC_LAST_OK = 0;        // 上次成功拉取时间戳(ms)
+let dynamicRefreshing = false;
+
+function hasDynamicModels() {
+  return DYNAMIC_MODELS.length > 0;
+}
+
+async function fetchUpstreamModels() {
+  // 用任一账号通过 ahaNet 调 get_detail_param, 返回 config_name 数组; 失败抛错。
+  const valid = ACCOUNTS.filter(a => !a.invalid);
+  if (valid.length === 0) throw new Error('TRAE 账号池为空, 无法拉取模型列表');
+  const acc = valid[0];
+  const body = {
+    function: CFG.function || 'chat_v3',
+    config_names: null,
+    need_prompt: false,
+    current_config_info: null,
+    poly_prompt: true,
+    mode_type: null,
+    agent_type: null,
+  };
+  const resp = await ahaNet.fetch('https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param', {
+    method: 'POST',
+    headers: {
+      ...BASE_HDRS,
+      'x-ide-token': acc.token,
+      'content-type': 'application/json',
+      'referer': 'https://trae-api-cn.mchost.guru/',
+    },
+    body: JSON.stringify(body),
+  });
+  if (resp.status !== 200) {
+    throw new Error(`get_detail_param HTTP ${resp.status}`);
+  }
+  const data = await resp.json().catch(() => ({}));
+  const list = (data && data.config_info_list) || [];
+  const names = list
+    .map(c => c && c.config_name)
+    .filter(n => typeof n === 'string' && n.length > 0);
+  if (names.length === 0) throw new Error('get_detail_param 返回空模型列表');
+  return names;
+}
+
+// 拉取并更新缓存; 返回是否成功。force=true 忽略每日间隔强制刷新。
+async function refreshModels(force) {
+  if (dynamicRefreshing) return DYNAMIC_MODELS.length > 0;
+  const now = Date.now();
+  if (!force && DYNAMIC_LAST_OK && (now - DYNAMIC_LAST_OK) < MODEL_REFRESH_INTERVAL) {
+    return DYNAMIC_MODELS.length > 0; // 未到期, 用缓存
+  }
+  dynamicRefreshing = true;
+  try {
+    const names = await fetchUpstreamModels();
+    DYNAMIC_MODELS = names;
+    DYNAMIC_LAST_OK = now;
+    console.log(`[动态模型] 更新成功: ${names.length} 个 (${names.slice(0, 8).join(', ')}${names.length > 8 ? '...' : ''})`);
+    return true;
+  } catch (e) {
+    console.error(`[动态模型] 拉取失败: ${e.message} (回退配置表, 保留上次缓存)`);
+    return DYNAMIC_MODELS.length > 0;
+  } finally {
+    dynamicRefreshing = false;
+  }
+}
+
 // ======================= 模型映射 =======================
 function resolveModel(model) {
   if (!model) return CFG.default_model;
-  return CFG.models[model] || model;
+  // 动态模型表优先(上游 config_name)
+  if (DYNAMIC_MODELS.includes(model)) return model;
+  // config.json 显式别名
+  if (CFG.models && CFG.models[model]) return CFG.models[model];
+  // 兜底: 原样透传 (动态表里的模型名直接可用)
+  return model;
 }
 
 // ======================= 消息转换 (OpenAI -> Trae) =======================
@@ -444,11 +533,25 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (req.method === 'GET' && url.pathname === '/v1/models') {
-    const models = Object.entries(CFG.models || {}).map(([id, name]) => ({
-      id, object: 'model', created: 0, owned_by: 'trae-proxy',
-    }));
+    // 优先返回动态拉取的上游模型, 失败/未拉取时回退 config.json 表
+    const makeEntry = (id) => ({ id, object: 'model', created: 0, owned_by: 'trae-proxy' });
+    let data;
+    if (hasDynamicModels()) {
+      data = DYNAMIC_MODELS.map(makeEntry);
+    } else {
+      const fromCfg = Object.entries(CFG.models || {}).map(([id]) => makeEntry(id));
+      // 补上 default_model 与反向别名, 确保 /v1/models 完整
+      const seen = new Set(fromCfg.map(e => e.id));
+      for (const [alias, name] of Object.entries(CFG.models || {})) {
+        if (!seen.has(name)) { fromCfg.push(makeEntry(name)); seen.add(name); }
+      }
+      if (CFG.default_model && !seen.has(CFG.default_model)) {
+        fromCfg.push(makeEntry(CFG.default_model));
+      }
+      data = fromCfg;
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ object: 'list', data: models }));
+    res.end(JSON.stringify({ object: 'list', data }));
     return;
   }
 
@@ -590,4 +693,8 @@ server.listen(PORT, HOST, () => {
   }
   setTimeout(() => healthCheck('启动检查'), 1000);
   setInterval(() => healthCheck('每小时定时检查'), CHECK_INTERVAL);
+  // 动态模型: 启动时强制拉取一次, 之后每 MODEL_REFRESH_INTERVAL(默认1天) 刷新
+  setTimeout(() => { refreshModels(true).catch(() => {}); }, 2000);
+  setInterval(() => { refreshModels(false).catch(() => {}); }, MODEL_REFRESH_INTERVAL);
+  console.log(`[动态模型] 每日自动刷新已启用 (每 ${MODEL_REFRESH_INTERVAL / 1000 / 3600} 小时)`);
 });

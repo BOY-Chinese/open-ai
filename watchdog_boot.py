@@ -22,6 +22,26 @@ DAEMON = os.path.join(BASE, 'daemon.py')
 PIDFILE = os.path.join(DATA_DIR, '.daemon.pid')
 
 
+_SINGLE_MUTEX = 'Global\\open-ai-daemon-mutex'
+
+
+def daemon_single_mutex_taken():
+    """返回 True 表示已有一个 daemon 持有互斥体(即在运行), 用于 watchdog 判定。"""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        h = kernel32.CreateMutexW(None, False, _SINGLE_MUTEX)
+        if h:
+            err = kernel32.GetLastError()
+            taken = (err == ERROR_ALREADY_EXISTS)
+            kernel32.CloseHandle(h)
+            return taken
+    except Exception:
+        pass
+    return False
+
+
 def log(msg):
     try:
         os.makedirs(LOGS_DIR, exist_ok=True)
@@ -76,7 +96,8 @@ def start_daemon():
 
 
 if __name__ == '__main__':
-    if daemon_running():
+    # 结合 pid 文件 + 互斥体双保险: 任一判定已在运行则不重复拉起
+    if daemon_running() or daemon_single_mutex_taken():
         pass  # 已在运行
     else:
         log('[boot] 检测到 daemon 未运行, 启动它')

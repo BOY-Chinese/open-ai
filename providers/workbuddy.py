@@ -18,12 +18,16 @@ import base64
 import itertools
 import json
 import logging
+import os
 import time
 import uuid
 
 import httpx
 
 from providers.base import Provider, make_chunk_id
+
+# 每次 _pick_account 都从 config.json 实时读取启用状态
+_WB_CONFIG_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'config.json'))
 
 logger = logging.getLogger("openapi.workbuddy")
 
@@ -39,8 +43,14 @@ MODEL_ALIASES = {
     "deepseek-v4-flash": "deepseek-v4-flash",
     "deepseek-v4-pro": "deepseek-v4-pro",
     "auto": "deepseek-v4-flash",
-    # 腾讯网关其他内置模型（/v3/config 抓包确认可用）
+    # 腾讯网关其他内置模型（/v3/config 抓包确认可用, 以 cli agent models 为准）
     "hy3": "hy3",
+    "hy3-x": "hy3-x",
+    "hy4": "hy4-preview",
+    "hy4-preview": "hy4-preview",
+    "hy4-preview-x": "hy4-preview-x",
+    "glm-5.3": "glm-5.3",
+    "glm-5.3-flash": "glm-5.3-flash",
     "glm-5.2": "glm-5.2",
     "glm-5.1": "glm-5.1",
     "glm-5v-turbo": "glm-5v-turbo",
@@ -52,12 +62,10 @@ MODEL_ALIASES = {
     "wb-deepseek-v4-flash": "deepseek-v4-flash",
     "wb-deepseek-v4-pro": "deepseek-v4-pro",
     "wb-hy3": "hy3",
-    "custom-local:wb-deepseek-v4-flash": "deepseek-v4-flash",
-    "custom-local:wb-deepseek-v4-pro": "deepseek-v4-pro",
-    "custom-local:wb-hy3": "hy3",
-    "custom-local:deepseek-v4-flash": "deepseek-v4-flash",
-    "custom-local:deepseek-v4-pro": "deepseek-v4-pro",
-    "custom-local:hy3": "hy3",
+    "wb-hy3-x": "hy3-x",
+    "wb-hy4": "hy4-preview",
+    "wb-glm-5.3": "glm-5.3",
+    "wb-glm-5.3-flash": "glm-5.3-flash",
 }
 
 
@@ -191,30 +199,119 @@ class WorkBuddyProvider(Provider):
         self.aliases.update({k: v for k, v in (cfg.get("models") or {}).items()})
         self._client: httpx.AsyncClient | None = None
         self._refresh_lock = asyncio.Lock()
+        # ---- 动态模型拉取 (启动/每日刷新, 失败回退静态表) ----
+        self._upstream_models: list[str] = []       # 最近一次从 /v3/config 拉到的上游模型名
+        self._upstream_fetched_at: float = 0.0      # 上次成功拉取时间戳
+        self._models_lock = asyncio.Lock()          # 刷新时防并发
 
     def _pick_account(self) -> dict:
-        """按次数批量轮换: 返回当前账号 dict。无账号时返回空 dict。"""
-        if not self.accounts:
+        """按次数批量轮换: 返回当前账号 dict（跳过 enabled=false 的账号）。无可用账号时返回空 dict。"""
+        # 每次请求都从 config.json 实时读取启用状态
+        try:
+            with open(_WB_CONFIG_PATH, encoding='utf-8') as _f:
+                _wb_cfg = json.load(_f).get('providers', {}).get('workbuddy', {})
+            _fresh = _wb_cfg.get('accounts', [])
+            # 合并内存中的 token 刷新状态
+            for _old in self.accounts:
+                _match = next((_n for _n in _fresh if _n.get('userId') == _old.get('userId') or _n.get('accessToken') == _old.get('accessToken')), None)
+                if _match:
+                    _match['accessToken'] = _old.get('accessToken', _match.get('accessToken', ''))
+                    _match['refreshToken'] = _old.get('refreshToken', _match.get('refreshToken', ''))
+            self.accounts = _fresh if _fresh else self.accounts
+        except Exception:
+            pass  # 读取失败则沿用内存 accounts
+        # 过滤出启用的账号
+        enabled = [a for a in self.accounts if a.get("enabled", True)]
+        if not enabled:
             return {}
         self._req_count += 1
-        if self._req_count % self.switch_every == 1:
-            self._cur_idx = next(self._cycle)
-        return self.accounts[self._cur_idx]
+        # 按次数批量轮换 (与 trae/server.js pickAccount 同口径):
+        # 直接按请求序号计算批次索引, 启用账号数变化时也能均匀轮换
+        self._cur_idx = (self._req_count - 1) // self.switch_every % len(enabled)
+        return enabled[self._cur_idx]
 
     def get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self.timeout)
         return self._client
 
+    # ---------- 动态模型 (启动/每日刷新, 失败回退静态表) ----------
+    async def refresh_models(self, force: bool = False) -> bool:
+        """从上游 /v3/config 拉取模型列表, 合并进 aliases。
+
+        每天至多刷新一次 (由 main.py 定时调用 force=False);
+        force=True 仅用于启动时首次强制拉取或手动调用。
+        拉取失败时保留上次结果(或静态表), 不抛异常。
+        """
+        async with self._models_lock:
+            now = time.time()
+            if not force and now - self._upstream_fetched_at < 86400:
+                return self._upstream_fetched_at > 0
+            try:
+                models = await self._fetch_upstream_models()
+                if models:
+                    self._upstream_models = models
+                    self._upstream_fetched_at = time.time()
+                    for m in models:
+                        self.aliases.setdefault(m, m)
+                        self.aliases.setdefault(f"wb-{m}", m)
+                    logger.info("workbuddy 动态模型更新成功: %d 个 (%s)",
+                                len(models), ", ".join(models[:8]) + ("..." if len(models) > 8 else ""))
+                    return True
+                logger.warning("workbuddy /v3/config 返回空模型列表, 保留现有列表")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("workbuddy 动态拉取模型失败: %s (回退现有列表)", e)
+            return self._upstream_fetched_at > 0
+
+    async def _fetch_upstream_models(self) -> list[str]:
+        """GET /v3/config 取 cli agent 的模型列表。遍历账号, 401 走 token 刷新重试。"""
+        if not self.accounts:
+            raise RuntimeError("workbuddy 无账号, 无法拉取上游模型")
+        last_err = None
+        for account in self.accounts:
+            if await self._refresh_token(account):
+                try:
+                    headers = _upstream_headers(account, self.domain, self.product, b"")
+                    client = self.get_client()
+                    resp = await client.get(
+                        f"https://{UPSTREAM_HOST}/v3/config", headers=headers, timeout=30.0)
+                    if resp.status_code in (401, 403):
+                        last_err = f"{resp.status_code}"
+                        continue
+                    if resp.status_code != 200:
+                        last_err = f"HTTP {resp.status_code}"
+                        continue
+                    data = resp.json()
+                    models: list[str] = []
+                    for agent in (data.get("data") or {}).get("agents") or []:
+                        models.extend(agent.get("models") or [])
+                    if models:
+                        return models
+                    last_err = "empty"
+                except Exception as e:  # noqa: BLE001
+                    last_err = repr(e)
+        raise RuntimeError(f"所有账号均无法拉取上游模型: {last_err}")
+
+    # 列表额外保留的通用兼容别名 (OpenAI 风格叫法, 请求始终可用)
+    _COMPAT_ALIASES = ("deepseek-chat", "deepseek-reasoner", "auto")
+
+    def _model_ids(self) -> set[str]:
+        """对外列表: 统一 wb- 前缀 (每模型一个名字), 另加 3 个通用兼容别名。
+
+        上游目标名 = 静态别名 values + config 别名 values + 动态上游模型;
+        裸名(上游原名)不再出现在列表里, 但 normalize_model 仍接受(向后兼容)。
+        """
+        targets = set(MODEL_ALIASES.values()) | set(self.aliases.values()) \
+            | set(self._upstream_models)
+        ids = {f"wb-{m}" for m in targets}
+        ids |= set(self._COMPAT_ALIASES)
+        return ids
+
     def list_models(self) -> list[dict]:
-        # 对外统一暴露 workbuddy-<上游模型名>
-        upstream_models = [
-            "deepseek-v4-flash", "deepseek-v4-pro",
-            "hy3", "glm-5.2", "glm-5.1", "glm-5v-turbo",
-            "minimax-m3", "kimi-k3-1", "kimi-k2.7", "kimi-k2.6",
-        ]
-        return [{"id": f"workbuddy-{m}", "object": "model", "owned_by": "tencent"}
-                for m in upstream_models]
+        # wb- 前缀统一展示; 裬名仅作为请求别名保留, 不再暴露
+        ids = self._model_ids()
+        return [{"id": m, "object": "model", "owned_by": "tencent"}
+                for m in sorted(ids)]
 
     def normalize_model(self, model: str) -> str:
         return normalize_model_name(model, self.default_model, self.aliases)

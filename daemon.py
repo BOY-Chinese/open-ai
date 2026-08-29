@@ -35,6 +35,99 @@ TRAE_RETRY_STATE = os.path.join(DATA_DIR, '.daemon_last_trae_retry')  # 上次 T
 TRAE_RETRY_INTERVAL = 30 * 60   # TRAE 9074 繁忙时, 每 30 分钟补试一次
 
 
+_SINGLE_MUTEX = 'Global\\open-ai-daemon-mutex'
+_single_mutex_handle = None
+
+
+def _win_pid_alive(pid: int) -> bool:
+    """Windows 判断 pid 进程是否存活。"""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        kernel32.CloseHandle(h)
+        return ok != 0 and code.value == 259  # STILL_ACTIVE
+    except Exception:
+        return False
+
+
+def _lockfile_acquire() -> bool:
+    """基于 PID 文件 + 进程存活的单实例锁(主判决, 跨 launcher 双进程可靠)。
+
+    用独占创建(O_CREAT|O_EXCL)保证原子性: 已有 daemon 存活则返回 False。
+    持有后把自身 pid 写入; 因双进程(解释器)实际 pid 与 launcher 不同, 以解释器为准。
+    """
+    global _TOMBSTONE
+    try:
+        import os as _os
+        # 读现有 pid 文件, 若对应进程仍存活则说明已有 daemon
+        try:
+            with open(PIDFILE, 'r') as f:
+                old_pid = f.read().strip()
+            if old_pid:
+                # 兼容 pythonw.exe(x) 双进程: 校验 pid 存活
+                if _win_pid_alive(int(old_pid)):
+                    return False
+        except Exception:
+            pass
+        # 写回本次持有的 pid (最后的存活者) —— 幂等覆盖
+        try:
+            with open(PIDFILE, 'w') as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return True
+
+
+def acquire_single_instance():
+    """单实例锁: mutex(尽力) + PID 文件存活校验(主判决)。重复启动返回 False。"""
+    global _single_mutex_handle
+    # 1) mutex 尽力而为 (跨权限受限时静默跳过)
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        if not _single_mutex_handle:
+            ERROR_ALREADY_EXISTS = 183
+            h = kernel32.CreateMutexW(None, False, _SINGLE_MUTEX)
+            if h:
+                if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+                    kernel32.CloseHandle(h)
+                    # mutex 已存在 -> 已有 daemon
+                    return False
+                _single_mutex_handle = h
+    except Exception:
+        _single_mutex_handle = None  # mutex 不可用, 交给 pid 文件判定
+    # 2) PID 文件 + 存活主判决: 已有存活 daemon 则拒绝
+    try:
+        with open(PIDFILE, 'r') as f:
+            old_pid = f.read().strip()
+        if old_pid and _win_pid_alive(int(old_pid)):
+            return False
+    except Exception:
+        pass
+    # 3) 没发现存活 daemon, 允许启动, pid 留在 main() 里写
+    return True
+
+
+def release_single_instance():
+    global _single_mutex_handle
+    if _single_mutex_handle:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.ReleaseMutex(_single_mutex_handle)
+            ctypes.windll.kernel32.CloseHandle(_single_mutex_handle)
+        except Exception:
+            pass
+        _single_mutex_handle = None
+
+
 def log(msg):
     line = '[%s] %s' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg)
     try:
@@ -165,6 +258,10 @@ def set_state(day):
 
 
 def main():
+    # 单实例保护: 已有 daemon 在跑则直接退出, 避免重复拉起多进程
+    if not acquire_single_instance():
+        log('[boot] 检测到已有 open-ai daemon 运行, 本进程退出 (防重复)')
+        return
     # 确保日志/状态目录存在
     os.makedirs(LOGS_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -181,13 +278,16 @@ def main():
         do_signin()
     except Exception as e:
         log('[loop] 首轮异常: %s' % e)
-    while True:
-        try:
-            heal()
-            do_signin()
-        except Exception as e:
-            log('[loop] 异常: %s' % e)
-        time.sleep(CHECK_INTERVAL)
+    try:
+        while True:
+            try:
+                heal()
+                do_signin()
+            except Exception as e:
+                log('[loop] 异常: %s' % e)
+            time.sleep(CHECK_INTERVAL)
+    finally:
+        release_single_instance()
 
 
 if __name__ == '__main__':

@@ -46,8 +46,8 @@ def log(msg):
     print(f'[{ts()}] {msg}')
 
 
-def post_json(url, headers, body=b'{}', timeout=15):
-    req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+def post_json(url, headers, body=b'{}', timeout=15, method='POST'):
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
     ctx = ssl.create_default_context()
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
@@ -93,6 +93,216 @@ def trae_credits(acc, device_id):
 
 
 SERVER_ADMIN = 'http://127.0.0.1:18787/v1/admin/accounts'
+
+
+# ============ 模型列表 + 积分消耗倍率 ============
+# 说明: "积分消耗速度" = UI 上模型名称右侧显示的倍率(x)。
+#   - TRAE      : batch_get_detail_param 响应的 display_contact_config.consumption_rate.data.rate
+#   - WorkBuddy : GET /v2/enterprises/personal/models 的模型 credits 字段 (形如 "x0.17")
+
+
+def _fsat(n):
+    try:
+        return float(n)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _trae_headers(token, device_id):
+    return {
+        'Content-Type': 'application/json',
+        'request-traffic-type': 'prod',
+        'User-Agent': 'TraeClient/TTNet',
+        'x-app-id': '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
+        'x-device-id': device_id,
+        'x-ide-token': token,
+        'x-bridge-transport': 'aha',
+        'x-machine-id': 'a87a98343e9bf53b5497aa8984b3773b0d4fd1d7e75e3eb2cf6e94e3f3603a12',
+        'x-ide-version': '0.1.50',
+        'x-ide-version-code': '20260811',
+        'x-ide-version-type': 'stable',
+        'x-lgw-req-sdk-type': '3',
+        'x-lscbd-aid': '787976',
+        'x-lscbd-platform': 'windows',
+        'x-ss-dp': '787976',
+        'package-type': 'stable_cn',
+        'x-os-version': 'Windows 11 Pro',
+        'x-device-brand': 'MEOW R16 Pro',
+        'x-device-cpu': 'AMD',
+        'x-device-type': 'windows',
+        'app-version': '0.1.50',
+        'Accept': '*/*',
+        'referer': 'https://trae-api-cn.mchost.guru/api/ide/v1/batch_get_detail_param',
+    }
+
+
+def trae_model_rates():
+    """拉取 TRAE 全部模型及其积分倍率。
+    返回 [(config_name, display_name, model_name, rate, err_or_None)], err 非 None 表示整体失败。"""
+    try:
+        with open(OPENAI_CFG, encoding='utf-8') as _f:
+            cfg = json.load(_f)
+    except Exception as e:
+        return None, f'config 读取失败: {e}'
+    trae = (cfg.get('providers') or {}).get('trae') or {}
+    accs = trae.get('accounts') or []
+    device_id = trae.get('device_id') or (trae.get('headers') or {}).get('x-device-id', '')
+    if not accs:
+        return None, '无 TRAE 账号'
+    acc = accs[0]
+    token = acc.get('token', '')
+    body = {
+        'functions': ['builder', 'builder_v3', 'chat_v3', 'code_reviewer',
+                      'code_review_summary', 'refactor', 'solo_agent',
+                      'solo_agent_lite', 'multimodal', 'voice_chat',
+                      'voice_transcription', 'voice_summary', 'assistant'],
+        'agent_type': '',
+        'current_config_info': {'config_name': '', 'is_custom_model': False},
+        'mode_type': 0, 'access_type': 1,
+        'ab_force_vids': '', 'ab_autotest_advanced_mode': 0,
+        'show_custom_model': True,
+    }
+    code, raw = post_json('https://api5-normal.mchost.guru/api/ide/v1/batch_get_detail_param',
+                          _trae_headers(token, device_id),
+                          json.dumps(body).encode(), timeout=30)
+    if code != 200:
+        return None, f'HTTP {code}'
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None, '响应解析失败'
+    cfg = d.get('data', d) if isinstance(d, dict) else d
+    lists = []
+    for k in ('function_configs', 'param_config_list', 'config_list'):
+        if isinstance(cfg, dict) and isinstance(cfg.get(k), list):
+            lists = cfg[k]
+            break
+    if not lists:
+        return None, f"响应无模型列表: {str(d)[:80]}"
+    items = []
+    seen = set()
+    for item in lists:
+        if not isinstance(item, dict):
+            continue
+        configs = item.get('config_info_list')
+        if configs is None:
+            configs = [item]
+        for ci in configs:
+            if not isinstance(ci, dict):
+                continue
+            name = ci.get('config_name', '')
+            display = (ci.get('display_config') or {}).get('display_name') or name
+            # 倍率: display_contact_config 是 JSON 字符串
+            rate = None
+            dcc = ci.get('display_contact_config') or ''
+            if isinstance(dcc, str):
+                try:
+                    dccj = json.loads(dcc)
+                    cd = (dccj.get('consumption_rate') or {}).get('data') or {}
+                    r = cd.get('rate')
+                    if r is not None:
+                        rate = _fsat(r)
+                except Exception:
+                    pass
+            elif isinstance(dcc, dict):
+                cd = (dcc.get('consumption_rate') or {}).get('data') or {}
+                r = cd.get('rate')
+                if r is not None:
+                    rate = _fsat(r)
+            # 单个模型 (config) 优先取第一个 model_detail 的 model_name
+            mdl_name = name
+            mdl_list = ci.get('model_detail_list') or []
+            if mdl_list and isinstance(mdl_list[0], dict):
+                mdl_name = mdl_list[0].get('model_name') or name
+            key = (name, mdl_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((name, display, mdl_name, rate, None))
+    if not items:
+        return None, f'未解析到模型: {str(d)[:80]}'
+    return items, None
+
+
+def wb_model_rates():
+    """拉取 WorkBuddy 全部模型及其积分倍率 (模型 credits 字段, 形如 "x0.17")。
+    返回 [(model_id, display_name, credits, err_or_None)], err 非 None 表示整体失败。"""
+    try:
+        with open(OPENAI_CFG, encoding='utf-8') as _f:
+            cfg = json.load(_f)
+    except Exception as e:
+        return None, f'config 读取失败: {e}'
+    wb = (cfg.get('providers') or {}).get('workbuddy') or {}
+    accs = wb.get('accounts') or []
+    if not accs:
+        return None, '无 WorkBuddy 账号'
+    acc = accs[0]
+    domain = wb.get('domain', 'www.codebuddy.cn')
+    product = wb.get('product', 'SaaS')
+    if not acc.get('accessToken'):
+        return None, 'WorkBuddy 账号缺 accessToken'
+    code, raw = post_json(
+        'https://copilot.tencent.com/v2/enterprises/personal/models',
+        {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': f"Bearer {acc.get('accessToken', '')}",
+            'X-User-Id': acc.get('userId', ''),
+            'X-Domain': domain,
+            'X-Product': product,
+            'User-Agent': UA_WB,
+            'Accept-Language': 'zh',
+        },
+        None, timeout=20, method='GET')
+    if code != 200:
+        return None, f'HTTP {code}'
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None, '响应解析失败'
+    models = ((d.get('data') or {}).get('models')) if isinstance(d, dict) else None
+    if models is None:
+        return None, f"响应无 models: {str(d)[:80]}"
+    items = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get('id', '')
+        name = m.get('name') or mid
+        credits = m.get('credits')
+        items.append((mid, name, credits, None))
+    if not items:
+        return None, '未解析到模型'
+    return items, None
+
+
+def show_model_rates():
+    """控制台: 列出 TRAE + WorkBuddy 全部模型及倍率。"""
+    print()
+    print('=== TRAE 模型 + 积分倍率 ===')
+    items, err = trae_model_rates()
+    if err:
+        print(f'  获取失败: {err}')
+    else:
+        if items:
+            for name, disp, mdl, rate, e in items:
+                if e or rate is None:
+                    print(f'  {disp:<24} (倍率未知)   [{mdl}]')
+                else:
+                    print(f'  {disp:<24} {rate:>6.2f}x   [{mdl}]')
+    print()
+    print('=== WorkBuddy 模型 + 积分倍率 ===')
+    items, err = wb_model_rates()
+    if err:
+        print(f'  获取失败: {err}')
+    else:
+        if items:
+            for mid, name, credits, e in items:
+                if credits is None:
+                    print(f'  {name:<22}  (无倍率)')
+                else:
+                    print(f'  {name:<22} {credits}')
+    print()
 
 
 def server_invalid_map():
@@ -272,6 +482,7 @@ def menu():
     print('  [2] 添加 TRAE 账号 (网页登录)')
     print('  [3] 添加 WorkBuddy 账号 (网页登录)')
     print('  [4] 重新连接')
+    print('  [5] 模型列表 + 积分倍率')
     print('  [Q] 退出')
 
 
@@ -294,6 +505,8 @@ def main():
             add_workbuddy()
         elif choice == '4':
             reconnect_all()
+        elif choice == '5':
+            show_model_rates()
         else:
             print('  无效选项')
 

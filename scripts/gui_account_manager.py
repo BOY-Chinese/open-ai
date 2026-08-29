@@ -625,7 +625,7 @@ class AccountManagerApp:
                 '一键更新',
                 f'发现新版本 {tag}（当前 {cur}）。\n\n'
                 f'将下载「{asset_name or "安装包"}」并启动安装程序。\n'
-                f'安装完成后可能需要重新打开本工具。\n\n是否继续？'):
+                f'安装程序会保留当前目录的 config.json（账号/密钥不受影响）。\n\n是否继续？'):
             self._write_log('[更新] 用户取消更新')
             return
         self._start_download(tag, asset_url)
@@ -700,7 +700,9 @@ class AccountManagerApp:
         self._write_log(f'[更新] 下载完成: {dest} ({os.path.getsize(dest)} bytes), 启动安装程序…')
         try:
             import subprocess as sp
-            sp.Popen([dest], cwd=os.path.dirname(dest),
+            # --dir 传入当前安装目录: 安装器预填路径, 且保留该目录已有 config.json
+            sp.Popen([dest, '--dir', os.path.dirname(BASE)],
+                     cwd=os.path.dirname(dest),
                      creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0))
             messagebox.showinfo(
                 '一键更新',

@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import zipfile
 from tkinter import filedialog, messagebox, ttk
@@ -132,6 +133,14 @@ class InstallerApp:
             pass
 
         self.install_dir = tk.StringVar(value=DEFAULT_INSTALL_DIR)
+        # 支持 --dir <路径> 预填安装目录 (一键更新时由 GUI 传入当前安装目录)
+        if '--dir' in sys.argv:
+            try:
+                d = sys.argv[sys.argv.index('--dir') + 1]
+                if d and os.path.isdir(d):
+                    self.install_dir.set(os.path.abspath(d))
+            except Exception:
+                pass
         self.autostart = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value='准备就绪')
         self.progress = tk.DoubleVar(value=0)
@@ -237,10 +246,21 @@ class InstallerApp:
             zf.extractall(target)
         self._log(f'✓ 资源解压完成 ({len(os.listdir(target))} 项)')
 
-        # 2. 生成空壳 config
+        # 2. 生成配置文件 (关键: 保留用户已有 config, 不覆盖!)
         self._set_status('生成配置文件...', 15)
-        if os.path.exists(SHELL_CONFIG):
-            shutil.copy(SHELL_CONFIG, os.path.join(target, 'config.json'))
+        cfg_path = os.path.join(target, 'config.json')
+        if os.path.exists(cfg_path):
+            # 覆盖安装 (一键更新): 已有配置是用户真实数据 (token/api_key/device_id),
+            # 绝不能用空壳覆盖; 另存时间戳备份以防新版本字段结构升级需对照迁移
+            stamp = time.strftime('%Y%m%d_%H%M%S')
+            bak = os.path.join(target, f'config.json.bak-{stamp}')
+            try:
+                shutil.copy2(cfg_path, bak)
+                self._log(f'✓ 检测到已有 config.json, 保留原配置 (备份: {os.path.basename(bak)})')
+            except Exception as e:
+                self._log(f'⚠ config.json 备份失败 (继续保留原文件): {e}')
+        elif os.path.exists(SHELL_CONFIG):
+            shutil.copy(SHELL_CONFIG, cfg_path)
             self._log('✓ 已生成 config.json (空壳, 需自行填 api_key/device_id)')
 
         # 3. 处理 open-ai-autostart.bat 硬编码路径
@@ -353,8 +373,17 @@ class InstallerApp:
         self._log('✓ 依赖安装完成')
 
     def _setup_playwright(self, target):
-        """安装 Playwright 浏览器。"""
+        """安装 Playwright 浏览器 (已装过则跳过, 避免更新时无谓重装)。"""
         venv_py = os.path.join(target, '.venv', 'Scripts', 'python.exe')
+        if os.path.exists(venv_py):
+            rc, out = run_cmd([venv_py, '-c',
+                               'from playwright.sync_api import sync_playwright; '
+                               'import sys; '
+                               'p = sync_playwright().start(); '
+                               'b = p.chromium; sys.exit(0)'], timeout=60)
+            if rc == 0:
+                self._log('✓ Playwright 已就绪, 跳过重装')
+                return
         self._log('安装 Playwright 浏览器 (可能需要几分钟)...')
         rc, out = run_cmd([venv_py, '-m', 'playwright', 'install'], timeout=1800)
         if rc != 0:

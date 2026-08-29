@@ -18,6 +18,7 @@ OUT_ZIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources.zi
 # 需要打包的顶层文件/目录
 INCLUDE = [
     'main.py', 'daemon.py', 'watchdog_boot.py', 'anthropic_api.py',
+    'version.py',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',
     '账号管理.bat',

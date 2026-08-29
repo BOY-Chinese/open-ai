@@ -138,7 +138,10 @@ def _trae_headers(token, device_id):
 
 def trae_model_rates():
     """拉取 TRAE 全部模型及其积分倍率。
-    返回 [(config_name, display_name, model_name, rate, err_or_None)], err 非 None 表示整体失败。"""
+    返回 [(config_name, display_name, model_name, rate, err_or_None)], err 非 None 表示整体失败。
+    上游会为同一模型返回多个内部功能配置 (如 refactor_scoper/finder/planner/incrementer
+    四条管道配置、glm-5.2_advisor_* 变体等), 它们的展示名与上游模型 id 完全相同,
+    按 (display_name, model_name) 归并只保留一条 (倍率取组内已知值), 避免列表重复显示。"""
     try:
         with open(OPENAI_CFG, encoding='utf-8') as _f:
             cfg = json.load(_f)
@@ -219,6 +222,24 @@ def trae_model_rates():
                 continue
             seen.add(key)
             items.append((name, display, mdl_name, rate, None))
+    # ---- 按 (展示名, 上游模型名) 归并去重 (展示名比较不区分大小写) ----
+    # 上游同一模型会带多个内部功能配置 (refactor_* 管道、*_advisor* 变体、
+    # summary_mobile、code-review-judge 等), 展示名与上游 id 完全相同;
+    # 有的还只差大小写 (官方 "GLM-4.7" vs 内部 "glm-4.7")。归并为一条,
+    # 保留最"正式"的: 倍率已知优先 → config_name 最短优先 → 先出现优先;
+    # 展示名实质不同 (同一上游 id 服务不同入口, 如 Seed-Code 与 summary) 不归并。
+    merged = {}
+    for name, disp, mdl_name, rate, _e in items:
+        k = ((disp or '').strip().lower(), mdl_name)
+        cur = merged.get(k)
+        if cur is None:
+            merged[k] = [name, disp, mdl_name, rate]
+            continue
+        if (rate is not None and cur[3] is None) or \
+           (rate is not None and cur[3] is not None and len(name) < len(cur[0])) or \
+           (rate is None and cur[3] is None and len(name) < len(cur[0])):
+            merged[k] = [name, disp, mdl_name, rate]
+    items = [tuple(v) + (None,) for v in merged.values()]
     if not items:
         return None, f'未解析到模型: {str(d)[:80]}'
     return items, None

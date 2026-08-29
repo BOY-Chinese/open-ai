@@ -10,7 +10,16 @@ open-ai 账号管理 - 图形界面版 (Tkinter)
       [2] 添加 TRAE 账号 — 打开网页登录, 自动抓 token 入池 (login_trae.py)
       [3] 添加 WorkBuddy 账号 — 打开网页登录, 自动抓 token 入池 (login_workbuddy.py)
       [4] 重新连接      — 验证全部 provider token 是否可用
-页面2「操作日志」: 点击该页签才显示操作日志
+页面2「API 管理」:
+  - 顶部展示网关地址 (OpenAI / Anthropic 兼容端点, 按 config.json 的 host/port 生成),
+    每行带「⧉ 复制」按钮; 另有「⧉ 复制地址+密钥」把地址和选中密钥一并复制
+  - API 列表: 创建 / 命名 / 复制 / 删除 API 密钥
+页面3「模型列表」:
+  - 右键模型行: 复制模型名称 / 复制上游模型 id / 固定到顶部(取消固定) / 隐藏(取消隐藏)
+  - 固定与隐藏互相独立, 持久化于 data/model_view_state.json (key: TRAE=config_name,
+    WorkBuddy=model_id); 上游更新后新模型正常进入列表, 已消失的 key 自动惰性清理
+  - 底部「显示已隐藏模型」勾选框: hidden>0 显示计数; 勾选后隐藏行灰显可恢复
+页面4「操作日志」: 点击该页签才显示操作日志
 """
 # ---- 必须在 import tkinter 之前设置 AppUserModelID ----
 # 否则 Microsoft Store 版 Python 的 pythonw.exe 任务栏会显示 Python 默认图标
@@ -37,6 +46,99 @@ import api_store
 BASE = os.path.dirname(os.path.abspath(__file__))
 OPENAI_CFG = am.OPENAI_CFG
 VENV_PY = am.OPENAI_VENV_PY if os.path.isfile(am.OPENAI_VENV_PY) else sys.executable
+
+# ---- 模型列表视图状态 (固定/隐藏) 持久化 ----
+# 存储文件: data/model_view_state.json, 结构 {"pinned": {"trae": [key..], "workbuddy": [key..]},
+#          "hidden": {"trae": [key..], "workbuddy": [key..]}}
+# key 为模型唯一标识: TRAE=config_name, WorkBuddy=model_id。
+# 固定与隐藏互相独立; 上游更新后仍存在的 key 自动生效, 已消失的 key 惰性清理。
+MODEL_STATE_PATH = os.path.join(os.path.dirname(BASE), 'data', 'model_view_state.json')
+MODEL_PROVIDERS = ('trae', 'workbuddy')
+
+
+def load_model_state():
+    """读取模型视图状态, 返回 {'pinned': {prov: set()}, 'hidden': {prov: set()}}。"""
+    st = {'pinned': {p: set() for p in MODEL_PROVIDERS},
+          'hidden': {p: set() for p in MODEL_PROVIDERS}}
+    try:
+        with open(MODEL_STATE_PATH, encoding='utf-8') as f:
+            data = json.load(f)
+        for grp in ('pinned', 'hidden'):
+            for p in MODEL_PROVIDERS:
+                v = (data or {}).get(grp, {}).get(p) or []
+                st[grp][p] = set(str(x) for x in v)
+    except Exception:
+        pass
+    return st
+
+
+def save_model_state(st):
+    """持久化模型视图状态 (列表化, 失败仅写日志不影响界面)。"""
+    try:
+        os.makedirs(os.path.dirname(MODEL_STATE_PATH), exist_ok=True)
+        data = {grp: {p: sorted(st[grp].get(p) or set()) for p in MODEL_PROVIDERS}
+                for grp in ('pinned', 'hidden')}
+        with open(MODEL_STATE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f'[model_state] 保存失败: {e}')
+
+
+class Toast:
+    """轻量 toast 提示: 无边框小窗, 短暂显示后自动淡出 (非模态)。"""
+
+    def __init__(self, root, text, ms=1400):
+        self.root = root
+        self.sw = root.winfo_screenwidth()
+        self.sh = root.winfo_screenheight()
+        self.toplevel = None
+        self._after_id = None
+        self._show(text, ms)
+
+    def _show(self, text, ms):
+        import tkinter.font as tkfont
+        try:
+            f = tkfont.Font(family='Microsoft YaHei UI', size=10)
+            w = min(max(int(f.measure(text)) + 36, 120), 420)
+        except Exception:
+            w = 200
+        h = 34
+        x = self.sw // 2 - w // 2
+        y = max(self.sh - 140, 40)  # 屏幕右下角上方
+        tl = tk.Toplevel(self.root)
+        self.toplevel = tl
+        tl.overrideredirect(True)
+        try:
+            tl.attributes('-topmost', True)
+        except Exception:
+            pass
+        try:
+            tl.attributes('-alpha', 0.96)
+        except Exception:
+            pass
+        tl.geometry(f'{w}x{h}+{x}+{y}')
+        frm = tk.Frame(tl, bg='#323232', bd=0, highlightthickness=1,
+                       highlightbackground='#323232')
+        frm.pack(fill='both', expand=True)
+        tk.Label(frm, text=text, bg='#323232', fg='#ffffff',
+                 font=('Microsoft YaHei UI', 10)).pack(expand=True)
+        tl.bind('<Button-1>', lambda e: self.close())
+        self._after_id = tl.after(ms, self.close)
+
+    def close(self):
+        tl = self.toplevel
+        if tl is None:
+            return
+        self.toplevel = None
+        try:
+            if self._after_id is not None:
+                tl.after_cancel(self._after_id)
+        except Exception:
+            pass
+        try:
+            tl.destroy()
+        except Exception:
+            pass
 
 
 # ================= 账号数据获取 =================
@@ -109,6 +211,12 @@ class AccountManagerApp:
 
         self.busy = False
         self.result_q = queue.Queue()
+        # 模型列表视图状态 (固定/隐藏), 持久化于 data/model_view_state.json
+        self.model_state = load_model_state()
+        self._model_cache = {'trae': None, 'workbuddy': None}  # 最近一次成功拉取的模型行
+        self._model_errs = {'trae': None, 'workbuddy': None}
+        self._model_rerender_job = None  # 勾选框触发的重渲染防抖
+        root.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self._build_ui()
         self._poll_result_q()
@@ -119,6 +227,11 @@ class AccountManagerApp:
         self.root.after(800, self.on_model_refresh)
         # 回读开机自启状态
         self._refresh_autostart_state()
+
+    def _on_close(self):
+        """窗口关闭: 保存模型视图状态后退出。"""
+        save_model_state(self.model_state)
+        self.root.destroy()
 
     def _set_icon(self, root):
         """设置窗口/任务栏图标为软件 logo。
@@ -196,6 +309,30 @@ class AccountManagerApp:
 
         api_pad = {'padx': 6, 'pady': 3}
 
+        # 网关地址区: 展示 OpenAI / Anthropic 兼容端点, 一键复制, 方便接入客户端
+        gw_frame = ttk.LabelFrame(page_api, text='网关地址（接口接入信息）')
+        gw_frame.pack(fill='x', **api_pad)
+        self.gw_url_vars = []
+        for i, (label, url) in enumerate(self._gateway_urls()):
+            row = ttk.Frame(gw_frame)
+            row.pack(fill='x', padx=8, pady=2)
+            ttk.Label(row, text=label, width=22, anchor='w').pack(side='left')
+            var = tk.StringVar(value=url)
+            self.gw_url_vars.append(var)
+            ent = ttk.Entry(row, textvariable=var, state='readonly')
+            ent.pack(side='left', fill='x', expand=True, padx=(0, 6))
+            ttk.Button(row, text='⧉ 复制',
+                       command=lambda u=url, l=label: self._copy_gateway_url(u, l)) \
+                .pack(side='left')
+        self.btn_gw_copy_all = ttk.Button(gw_frame, text='⧉ 复制地址+密钥',
+                                          command=self._copy_gateway_with_key)
+        self.btn_gw_copy_all.pack(anchor='e', padx=8, pady=(0, 2))
+        ttk.Label(gw_frame,
+                  text='Claude Code / CC Switch 把 ANTHROPIC_BASE_URL 指向 Anthropic 兼容地址，'
+                       'OpenAI 客户端把 Base URL 指向 OpenAI 兼容地址即可。',
+                  foreground='#666666', wraplength=680, justify='left') \
+            .pack(anchor='w', padx=8, pady=(0, 6))
+
         # API 表格 (可滚动)
         api_frame = ttk.LabelFrame(page_api, text='API 列表')
         api_frame.pack(fill='both', expand=True, **api_pad)
@@ -221,13 +358,15 @@ class AccountManagerApp:
         self.trae_model_frame = ttk.LabelFrame(page_model, text='TRAE 模型')
         self.trae_model_frame.pack(fill='both', expand=True, **pad)
         self.model_tree_trae = self._make_model_tree(self.trae_model_frame)
+        self.model_tree_trae.bind('<Button-3>', self._on_model_menu_trae)
 
         # WorkBuddy 模型 (下)
         self.wb_model_frame = ttk.LabelFrame(page_model, text='WorkBuddy 模型')
         self.wb_model_frame.pack(fill='both', expand=True, **pad)
         self.model_tree_wb = self._make_model_tree(self.wb_model_frame)
+        self.model_tree_wb.bind('<Button-3>', self._on_model_menu_workbuddy)
 
-        # 刷新按钮 + 显示未知倍率勾选框
+        # 刷新按钮 + 显示未知倍率勾选框 + 显示已隐藏勾选框
         model_btn = ttk.Frame(page_model)
         model_btn.pack(fill='x', **pad)
         self.btn_model_refresh = ttk.Button(model_btn, text='刷新模型列表',
@@ -239,6 +378,13 @@ class AccountManagerApp:
             command=self.on_model_refresh, anchor='w',
             bg='#f0f0f0', activebackground='#f0f0f0')
         self.chk_show_unknown.pack(side='right', padx=5)
+        # 显示已隐藏模型: 勾选后隐藏行灰显展示, 供右键取消隐藏恢复 (不删除任何数据)
+        self.show_hidden_var = tk.BooleanVar(value=False)
+        self.chk_show_hidden = tk.Checkbutton(
+            model_btn, text='显示已隐藏模型', variable=self.show_hidden_var,
+            command=self.on_show_hidden_toggle, anchor='w',
+            bg='#f0f0f0', activebackground='#f0f0f0')
+        self.chk_show_hidden.pack(side='right', padx=5)
 
         # ---- 页面4: 设置 ----
         page_set = ttk.Frame(self.notebook)
@@ -284,6 +430,191 @@ class AccountManagerApp:
         self.btn_uninstall = self._make_red_button(uni_frame, '一键卸载',
                                                    self._on_uninstall)
         self.btn_uninstall.pack(anchor='w', padx=10, pady=(0, 10))
+
+        # 版本与更新区
+        ver_frame = ttk.LabelFrame(page, text='版本')
+        ver_frame.pack(fill='x', **pad)
+        ver_row = ttk.Frame(ver_frame)
+        ver_row.pack(fill='x', padx=10, pady=(6, 2))
+        ttk.Label(ver_row, text=f'当前版本: {self._current_version()}',
+                  font=('Microsoft YaHei UI', 11, 'bold')).pack(side='left')
+        self.btn_update = ttk.Button(ver_row, text='一键更新',
+                                     command=self.on_check_update)
+        self.btn_update.pack(side='right')
+        ttk.Label(ver_frame,
+                  text='检查并更新到 GitHub 最新发布版本 (github.com/BOY-Chinese/open-ai/releases)。',
+                  foreground='#666666').pack(anchor='w', padx=10, pady=(0, 8))
+
+    # ---------- 版本与一键更新 ----------
+    UPDATE_REPO_API = 'https://api.github.com/repos/BOY-Chinese/open-ai/releases/latest'
+    UPDATE_ASSET_KEYWORD = 'installer'  # release 资产名关键字 (open-ai-installer.exe)
+
+    @staticmethod
+    def _current_version():
+        """当前版本号 (根目录 version.py 的 APP_VERSION, 读取失败回退未知)。
+        GUI 以 scripts/gui_account_manager.py 启动时根目录不在 sys.path, 需按路径加载。"""
+        try:
+            from version import APP_VERSION
+            return APP_VERSION
+        except Exception:
+            pass
+        try:
+            import importlib.util
+            p = os.path.join(os.path.dirname(BASE), 'version.py')
+            spec = importlib.util.spec_from_file_location('openai_version', p)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            return m.APP_VERSION
+        except Exception:
+            return '(未知)'
+
+    @staticmethod
+    def _version_tuple(v):
+        """'v2.3.1' -> (2, 3, 1), 便于比较。"""
+        import re
+        nums = re.findall(r'\d+', str(v or ''))
+        return tuple(int(n) for n in nums) if nums else (0,)
+
+    def on_check_update(self):
+        """一键更新入口: 后台线程查最新 release, 主线程弹窗确认后下载安装。"""
+        if getattr(self, '_updating', False):
+            return
+        self._updating = True
+        self.btn_update.configure(state='disabled', text='检查中…')
+
+        def work():
+            import urllib.request
+            try:
+                req = urllib.request.Request(
+                    self.UPDATE_REPO_API,
+                    headers={'User-Agent': 'open-ai-updater',
+                             'Accept': 'application/vnd.github+json'})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    rel = json.load(resp)
+                tag = rel.get('tag_name') or ''
+                asset_url, asset_name = '', ''
+                for a in rel.get('assets') or []:
+                    if self.UPDATE_ASSET_KEYWORD in (a.get('name') or '').lower():
+                        asset_url = a.get('browser_download_url') or ''
+                        asset_name = a.get('name') or ''
+                        break
+                self.root.after(0, lambda: self._after_check_update(
+                    tag, asset_url, asset_name, None))
+            except Exception as e:
+                err = f'{type(e).__name__}: {e}'
+                self.root.after(0, lambda: self._after_check_update(
+                    '', '', '', err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_check_update(self, tag, asset_url, asset_name, err):
+        """检查完成 (主线程): 比较版本并确认。"""
+        self.btn_update.configure(state='normal', text='一键更新')
+        self._updating = False
+        if err:
+            self._write_log(f'[更新] 检查失败: {err}')
+            # 检查阶段失败多为网络不通, 按网络错误统一提示
+            messagebox.showerror('一键更新', '网络环境错误，无法下载！')
+            return
+        self._write_log(f'[更新] 最新 release: {tag or "(未获取到)"}')
+        cur = self._current_version()
+        if not tag:
+            messagebox.showerror('一键更新', '网络环境错误，无法下载！')
+            return
+        if self._version_tuple(tag) <= self._version_tuple(cur):
+            messagebox.showinfo('一键更新',
+                                f'已是最新版本。\n\n当前版本: {cur}\n线上版本: {tag}')
+            return
+        if not messagebox.askyesno(
+                '一键更新',
+                f'发现新版本 {tag}（当前 {cur}）。\n\n'
+                f'将下载「{asset_name or "安装包"}」并启动安装程序。\n'
+                f'安装完成后可能需要重新打开本工具。\n\n是否继续？'):
+            self._write_log('[更新] 用户取消更新')
+            return
+        self._start_download(tag, asset_url)
+
+    def _start_download(self, tag, asset_url):
+        """下载安装包 (后台线程), 进度写日志, 完成后主线程启动安装。"""
+        self.btn_update.configure(state='normal', text='下载中…')
+        self._updating = True
+
+        def work():
+            import urllib.request
+            import tempfile
+            ok, dest, err = False, '', ''
+            if not asset_url:
+                err = 'release 未找到安装包资产'
+            else:
+                try:
+                    tmpdir = tempfile.mkdtemp(prefix='openai_update_')
+                    dest = os.path.join(tmpdir, asset_url.rsplit('/', 1)[-1] or
+                                        'open-ai-installer.exe')
+                    req = urllib.request.Request(
+                        asset_url, headers={'User-Agent': 'open-ai-updater'})
+                    self.root.after(0, lambda: self._write_log(
+                        f'[更新] 开始下载: {asset_url}'))
+                    downloaded = [0]
+
+                    def report(n):
+                        mb = n / 1048576
+                        if mb - downloaded[0] >= 2 or n == 0:  # 每 2MB 记一次
+                            downloaded[0] = mb
+                            self.root.after(0, lambda m=mb: self._write_log(
+                                f'[更新] 已下载 {m:.1f} MB …'))
+
+                    with urllib.request.urlopen(req, timeout=60) as resp, \
+                            open(dest, 'wb') as f:
+                        while True:
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            report(f.tell())
+                    size = os.path.getsize(dest)
+                    if size <= 0:
+                        err = '下载内容为空'
+                        try:
+                            os.remove(dest)
+                        except Exception:
+                            pass
+                    else:
+                        ok = True
+                except Exception as e:
+                    err = f'{type(e).__name__}: {e}'
+                    try:
+                        if os.path.isfile(dest):
+                            os.remove(dest)
+                    except Exception:
+                        pass
+            self.root.after(0, lambda: self._after_download(
+                ok, dest, tag, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_download(self, ok, dest, tag, err):
+        """下载完成 (主线程): 启动安装程序或报网络错误。"""
+        self.btn_update.configure(state='normal', text='一键更新')
+        self._updating = False
+        if not ok:
+            self._write_log(f'[更新] 下载失败: {err}')
+            # 下载阶段任何失败 (网络中断/超时/资产缺失) 都按网络错误提示
+            messagebox.showerror('一键更新', '网络环境错误，无法下载！')
+            return
+        self._write_log(f'[更新] 下载完成: {dest} ({os.path.getsize(dest)} bytes), 启动安装程序…')
+        try:
+            import subprocess as sp
+            sp.Popen([dest], cwd=os.path.dirname(dest),
+                     creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0))
+            messagebox.showinfo(
+                '一键更新',
+                f'安装包 {tag} 已下载并启动安装程序。\n\n'
+                f'按安装向导完成后, 重新打开「账号管理」即可。')
+            self._write_log('[更新] 安装程序已启动')
+        except Exception as e:
+            self._write_log(f'[更新] 安装程序启动失败: {e}')
+            messagebox.showerror('一键更新',
+                                 f'安装程序启动失败:\n{e}')
 
     def _autostart_chk_colors(self, checked):
         """返回选中/未选中时钩子的颜色配置 (钩子画在方框内)。
@@ -555,6 +886,8 @@ class AccountManagerApp:
                 tag = 'legacy'
             name_disp = name if name else '（未命名）'
             self.api_tree.insert('', 'end', values=(name_disp, key), tags=(tag,))
+        if hasattr(self, 'gw_url_vars'):
+            self.refresh_gateway_info()
 
     def _selected_api(self):
         """返回当前选中行的 (display_name, key, legacy)，未选择返回 None。"""
@@ -567,7 +900,68 @@ class AccountManagerApp:
         is_legacy = 'legacy' in tags
         return name, key, is_legacy
 
+    # ---------- 网关地址 ----------
+    def _gateway_base_url(self):
+        """从 config.json 读取网关地址 (host + port)。
+        监听 0.0.0.0 / 空时按本机回环展示, 保证复制出去的地址可直接使用。"""
+        host, port = '127.0.0.1', 8000
+        try:
+            with open(OPENAI_CFG, encoding='utf-8') as f:
+                cfg = json.load(f)
+            host = (cfg.get('host') or '').strip() or '127.0.0.1'
+            port = int(cfg.get('port') or 8000)
+        except Exception:
+            pass
+        if host in ('0.0.0.0', '::', ''):
+            host = '127.0.0.1'
+        return f'http://{host}:{port}'
+
+    def _gateway_urls(self):
+        """网关对外地址清单: [(说明, 完整地址), ...]。"""
+        base = self._gateway_base_url()
+        return [
+            ('OpenAI 兼容地址', base + '/v1'),
+            ('对话端点', base + '/v1/chat/completions'),
+            ('Anthropic 兼容地址 (Claude/CC Switch)', base),
+        ]
+
+    def _copy_to_clipboard(self, text, log_msg):
+        """复制文本到剪贴板并写操作日志 (tk 主线程调用)。"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self._write_log(log_msg)
+
+    def _copy_gateway_url(self, text, label):
+        self._copy_to_clipboard(text, f'[API] 已复制{label}: {text}')
+        messagebox.showinfo('复制成功', f'{label}已复制到剪贴板：\n{text}')
+
+    def _copy_gateway_with_key(self):
+        """复制「地址 + API 密钥」组合 (未选中密钥时只复制地址)。"""
+        base = self._gateway_base_url()
+        sel = self._selected_api()
+        if not sel:
+            self._copy_to_clipboard(
+                base, f'[API] 已复制网关地址(未选密钥): {base}')
+            messagebox.showinfo(
+                '复制成功',
+                '网关地址已复制到剪贴板（未选择 API，未含密钥）:\n' + base)
+            return
+        name, key, legacy = sel
+        disp = name if name else '（未命名）'
+        text = f'地址: {base}\nAPI Key: {key}'
+        self._copy_to_clipboard(
+            text, f'[API] 已复制网关地址+密钥: {base}  key={key[:12]}… ({disp})')
+        messagebox.showinfo(
+            '复制成功',
+            f'已复制到剪贴板:\n\n地址: {base}\nAPI Key: {key}（{disp}）')
+
     # ---------- API 操作 ----------
+    def refresh_gateway_info(self):
+        """回读 config.json 的 host/port, 刷新网关地址区显示。"""
+        for var, (label, url) in zip(self.gw_url_vars, self._gateway_urls()):
+            var.set(url)
+
     def on_api_create(self):
         try:
             name, key = api_store.create_api()
@@ -577,6 +971,7 @@ class AccountManagerApp:
             return
         self._write_log(f'[API] 已创建: {name}  key={key}')
         self.refresh_api_list()
+        self.refresh_gateway_info()
         messagebox.showinfo('API 管理', f'已创建 API：{name}\n请在客户端使用该密钥连接。')
 
     def on_api_rename(self):
@@ -676,6 +1071,9 @@ class AccountManagerApp:
         frame.columnconfigure(0, weight=1)
         tree.tag_configure('odd', background='#f2f5f9')
         tree.tag_configure('even', background='#ffffff')
+        # 已隐藏模型灰显样式 (勾选"显示已隐藏模型"时使用)
+        tree.tag_configure('hidden', background='#ececec',
+                           foreground='#9e9e9e')
         return tree
 
     def _set_busy(self, busy):
@@ -848,51 +1246,226 @@ class AccountManagerApp:
             return False, str(e)
 
     # ---------- 4 个功能 ----------
-    # ---------- 模型列表 ----------
+    # ---------- 模型列表 (右键: 复制 / 固定 / 隐藏) ----------
+
+    def _model_visible_rows(self, prov, items, show_unknown):
+        """把上游模型行整理为渲染行 (应用隐藏/固定/未知倍率过滤与排序)。
+        返回 [(key, (name, rate_txt, upstream), is_hidden)]。
+        key: TRAE=config_name, WorkBuddy=model_id。
+        排序: 固定的在前, 其余保持原始顺序 —— 取消固定即自然回到原位;
+        隐藏行始终参与排序 (取消隐藏后, 之前固定的行仍在顶部, 两状态互不干扰)。"""
+        st = self.model_state
+        pinned = st['pinned'].get(prov) or set()
+        hidden = st['hidden'].get(prov) or set()
+        rows = []
+        for it in items:
+            if prov == 'trae':
+                name, disp, mdl, rate, _e = it
+                key, upstream = name, mdl
+                row_name = disp or name  # 展示名优先 (与旧版一致)
+            else:
+                mid, name, rate, _e = it
+                key, upstream = mid, mid
+                row_name = name
+            is_hidden = key in hidden
+            if rate is None and not show_unknown:
+                continue  # 未知倍率过滤 (隐藏行同样受控)
+            r = '未知' if rate is None else (f'{rate:.2f}x' if prov == 'trae' else str(rate))
+            rows.append((key, (row_name, r, upstream), is_hidden))
+        rows.sort(key=lambda t: 0 if t[0] in pinned else 1)  # 稳定排序, 组内保持原序
+        return rows
+
+    def _fill_model_tree(self, tree, prov, items, err, show_unknown):
+        """渲染单个模型表格。"""
+        tree.delete(*tree.get_children())
+        if err:
+            tree.insert('', 'end', values=('', f'获取失败: {err}', ''), tags=('even',))
+            return
+        if not items:
+            tree.insert('', 'end', values=('', '无模型', ''), tags=('even',))
+            return
+        show_hidden = self.show_hidden_var.get()
+        rows = self._model_visible_rows(prov, items, show_unknown)
+        unknown_rows = self._model_visible_rows(prov, items, True)  # 含未知倍率的全量行
+        if show_hidden:
+            visible = rows
+        else:
+            visible = [row for row in rows if not row[2]]
+        if not unknown_rows:
+            tree.insert('', 'end', values=('', '无模型', ''), tags=('even',))
+            return
+        if not rows:
+            tree.insert('', 'end', values=('', '无模型（全部未知倍率，勾选"显示未知倍率模型"查看）', ''),
+                        tags=('even',))
+            return
+        if not visible:
+            tree.insert('', 'end',
+                        values=('', '所有模型已隐藏，勾选"显示已隐藏模型"可恢复', ''),
+                        tags=('even',))
+            return
+        for i, (_key, values, is_hidden) in enumerate(visible):
+            tag = 'hidden' if is_hidden else ('even' if i % 2 == 0 else 'odd')
+            tree.insert('', 'end', values=values, tags=(tag,))
+
+    def _fill_model_trees(self, trae_items, trae_err, wb_items, wb_err):
+        """渲染两表并缓存成功数据 (勾选框切换时用缓存重渲染, 免重复网络请求)。"""
+        show_unknown = self.show_unknown_rate_var.get() if hasattr(self, 'show_unknown_rate_var') else False
+        self._update_hidden_checkbox()
+        # TRAE: (config_name, display, model_name, rate, err)
+        if trae_err:
+            self._model_errs['trae'] = trae_err
+        else:
+            self._model_cache['trae'] = trae_items
+        self._fill_model_tree(self.model_tree_trae, 'trae',
+                              self._model_cache['trae'] or [], self._model_errs['trae'],
+                              show_unknown)
+        # WorkBuddy: (id, name, credits, err)
+        if wb_err:
+            self._model_errs['workbuddy'] = wb_err
+        else:
+            self._model_cache['workbuddy'] = wb_items
+        self._fill_model_tree(self.model_tree_wb, 'workbuddy',
+                              self._model_cache['workbuddy'] or [], self._model_errs['workbuddy'],
+                              show_unknown)
+
+    def _update_hidden_checkbox(self):
+        """「显示已隐藏模型」勾选框文案: hidden 数量 > 0 时追加计数。"""
+        n = sum(len(self.model_state['hidden'].get(p) or set()) for p in MODEL_PROVIDERS)
+        try:
+            self.chk_show_hidden.configure(
+                text=f'显示已隐藏模型 ({n})' if n > 0 else '显示已隐藏模型')
+        except Exception:
+            pass
+
+    def on_show_hidden_toggle(self):
+        """勾选「显示已隐藏模型」: 仅用缓存重渲染, 不发网络请求。"""
+        self._render_model_views()
+
+    def _render_model_views(self):
+        """按当前勾选状态重渲染两表 (仅用缓存)。"""
+        show_unknown = self.show_unknown_rate_var.get()
+        self._update_hidden_checkbox()
+        self._fill_model_tree(self.model_tree_trae, 'trae',
+                              self._model_cache['trae'] or [],
+                              self._model_errs['trae'], show_unknown)
+        self._fill_model_tree(self.model_tree_wb, 'workbuddy',
+                              self._model_cache['workbuddy'] or [],
+                              self._model_errs['workbuddy'], show_unknown)
+
+    def _on_model_menu_trae(self, event):
+        self._show_model_menu(event, 'trae', self.model_tree_trae)
+
+    def _on_model_menu_workbuddy(self, event):
+        self._show_model_menu(event, 'workbuddy', self.model_tree_wb)
+
+    def _show_model_menu(self, event, prov, tree):
+        """模型行右键菜单: 复制模型名称 / 复制上游模型 id / 固定到顶部 / 隐藏。"""
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        tree.selection_set(iid)
+        values = tree.item(iid, 'values')
+        if len(values) < 3:
+            return
+        name, upstream = values[0], values[2]
+        # 用渲染行反查唯一 key (树可能把值规范化为 int 等, 按字符串比较)
+        rows = self._model_visible_rows(prov, self._model_cache.get(prov) or [],
+                                        self.show_unknown_rate_var.get())
+        key = None
+        for k, vals, _h in rows:
+            if str(vals[0]) == str(values[0]) and str(vals[2]) == str(values[2]):
+                key = k
+                break
+        if key is None:
+            return  # 提示行/失败行不给菜单
+        st = self.model_state
+        pinned = st['pinned'].get(prov) or set()
+        hidden = st['hidden'].get(prov) or set()
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label='复制模型名称',
+                         command=lambda: self._model_copy(name, '模型名称'))
+        menu.add_command(label='复制上游模型 id',
+                         command=lambda: self._model_copy(upstream, '上游模型 id'))
+        menu.add_separator()
+        menu.add_command(label='取消固定' if key in pinned else '固定到顶部',
+                         command=lambda: self._toggle_pin(prov, key, key not in pinned))
+        menu.add_command(label='取消隐藏' if key in hidden else '隐藏',
+                         command=lambda: self._toggle_hide(prov, key, key not in hidden))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _model_copy(self, text, label):
+        """复制到剪贴板, toast 提示 (非模态, 不打断操作)。"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self._write_log(f'[模型] 已复制{label}: {text}')
+        Toast(self.root, f'已复制{label}')
+
+    def _toggle_pin(self, prov, key, pin):
+        """固定/取消固定。取消固定 = 从 pinned 移除, 行回到数据原始顺序位置。"""
+        st = self.model_state
+        st['pinned'].setdefault(prov, set())
+        if pin:
+            st['pinned'][prov].add(key)
+            Toast(self.root, '已固定到顶部')
+        else:
+            st['pinned'][prov].discard(key)
+            Toast(self.root, '已取消固定')
+        save_model_state(st)
+        self._render_model_views()
+
+    def _toggle_hide(self, prov, key, hide):
+        """隐藏/取消隐藏。固定与隐藏相互独立: 取消隐藏不改动固定状态。"""
+        st = self.model_state
+        st['hidden'].setdefault(prov, set())
+        if hide:
+            st['hidden'][prov].add(key)
+            Toast(self.root, '已隐藏')
+        else:
+            st['hidden'][prov].discard(key)
+            Toast(self.root, '已取消隐藏')
+        save_model_state(st)
+        self._update_hidden_checkbox()
+        self._render_model_views()
+
     def _render_models(self):
-        """后台线程拉取两个平台模型+倍率, 主线程填充表格。"""
+        """后台线程拉取两个平台模型+倍率, 主线程填充表格。
+        上游更新后: 新模型按原始顺序进入列表; 状态里已消失的 key 自动惰性清理。"""
         def work():
             self.result_q.put('正在拉取模型列表及积分倍率 ...')
             trae_items, trae_err = am.trae_model_rates()
             wb_items, wb_err = am.wb_model_rates()
-            self.root.after(0, lambda: self._fill_model_trees(
+            self.root.after(0, lambda: self._after_models_fetched(
                 trae_items, trae_err, wb_items, wb_err))
         # 用独立线程, 不占用账号操作的 busy 锁
         threading.Thread(target=work, daemon=True).start()
 
-    def _fill_model_trees(self, trae_items, trae_err, wb_items, wb_err):
-        show_unknown = self.show_unknown_rate_var.get() if hasattr(self, 'show_unknown_rate_var') else False
+    def _after_models_fetched(self, trae_items, trae_err, wb_items, wb_err):
+        """拉取完成 (主线程): 先清理上游已消失的 key, 再渲染。"""
+        if not trae_err and trae_items:
+            self._prune_model_state('trae', [it[0] for it in trae_items])
+        if not wb_err and wb_items:
+            self._prune_model_state('workbuddy', [it[0] for it in wb_items])
+        self._fill_model_trees(trae_items, trae_err, wb_items, wb_err)
 
-        def fill(tree, rows, empty_msg):
-            tree.delete(*tree.get_children())
-            if empty_msg:
-                tree.insert('', 'end', values=('', empty_msg, ''), tags=('even',))
-                return
-            for idx, row in enumerate(rows):
-                tag = 'even' if idx % 2 == 0 else 'odd'
-                tree.insert('', 'end', values=row, tags=(tag,))
-        # TRAE: (config_name, display, model_name, rate, err)
-        if trae_err:
-            fill(self.model_tree_trae, [], f'获取失败: {trae_err}')
-        else:
-            rows = []
-            for name, disp, mdl, rate, e in trae_items:
-                r = '未知' if rate is None else f'{rate:.2f}x'
-                if not show_unknown and rate is None:
-                    continue  # 不显示未知倍率
-                rows.append((disp, r, mdl))
-            fill(self.model_tree_trae, rows, '' if rows else '无模型（全部未知倍率，勾选"显示未知倍率模型"查看）')
-        # WorkBuddy: (id, name, credits, err)
-        if wb_err:
-            fill(self.model_tree_wb, [], f'获取失败: {wb_err}')
-        else:
-            rows = []
-            for mid, name, credits, e in wb_items:
-                r = '未知' if credits is None else str(credits)
-                if not show_unknown and credits is None:
-                    continue  # 不显示未知倍率
-                rows.append((name, r, mid))
-            fill(self.model_tree_wb, rows, '' if rows else '无模型（全部未知倍率，勾选"显示未知倍率模型"查看）')
+    def _prune_model_state(self, prov, current_keys):
+        """清理 pinned/hidden 中上游已不存在的 key (只清状态引用, 不动模型数据)。"""
+        st = self.model_state
+        cur = set(str(k) for k in current_keys)
+        changed = False
+        for grp in ('pinned', 'hidden'):
+            s = st[grp].get(prov) or set()
+            dead = {k for k in s if k not in cur}
+            if dead:
+                s.difference_update(dead)
+                changed = True
+        if changed:
+            self._write_log(f'[模型] {prov} 上游已更新, 已清理失效的固定/隐藏项')
+            save_model_state(st)
+        return changed
 
     def on_model_refresh(self):
         # 独立线程加载, 不占用账号操作的 busy 锁

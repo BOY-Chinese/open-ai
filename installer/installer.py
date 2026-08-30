@@ -67,6 +67,22 @@ def run_cmd(cmd, timeout=600, capture=True):
         return -1, str(e)
 
 
+def verify_venv_python(venv_py):
+    """验证 venv 的 python.exe 真的可执行 (存在且能跑通)。
+
+    背景: CPython 3.13/3.14 的 venv 在 Windows 上复制 venvlauncher.exe 失败时
+    只 logger.warning 不报错, `python -m venv` 仍返回 0, 但 Scripts 下没有
+    python.exe -> 后续 subprocess 直接 FileNotFoundError [WinError 2]。
+    """
+    if not os.path.isfile(venv_py):
+        return False, '不存在'
+    rc, out = run_cmd([venv_py, '-c', 'import sys; print(sys.version)'],
+                      timeout=60)
+    if rc != 0:
+        return False, f'无法执行 (rc={rc}): {out[-200:]}'
+    return True, out.strip().splitlines()[0] if out.strip() else ''
+
+
 def find_python():
     """查找系统 Python 3.10+。"""
     candidates = ['python', 'py']
@@ -353,30 +369,124 @@ class InstallerApp:
             raise RuntimeError(f'Node.js 安装失败 (rc={rc})')
         self._log('✓ Node.js 安装完成')
 
+    def _repair_venv_python(self, target, py_cmd):
+        """手动修复 venv: 把基础解释器的启动器补齐为 Scripts 下的 python(.w).exe。
+
+        CPython 3.13+ 的 Windows venv 依赖 Lib/venv/scripts/nt/venvlauncher.exe,
+        venv 复制环节被静默跳过时这里手动补齐 (等价 pymanager #133 官方修复)。
+        """
+        venv_dir = os.path.join(target, '.venv')
+        scripts = os.path.join(venv_dir, 'Scripts')
+        os.makedirs(scripts, exist_ok=True)
+        rc, out = run_cmd(
+            [py_cmd, '-c',
+             'import sys, os, sysconfig;'
+             'base = getattr(sys, "_base_executable", "") or sys.executable;'
+             'print(base);'
+             'print(os.path.join(sysconfig.get_paths()["stdlib"],'
+             '"venv", "scripts", "nt"))'],
+            timeout=30)
+        if rc != 0:
+            return False
+        lines = [x.strip() for x in (out or '').splitlines() if x.strip()]
+        if len(lines) < 2:
+            return False
+        base_exe, launcher_dir = lines[0], lines[1]
+        venv_py = os.path.join(scripts, 'python.exe')
+        venv_pyw = os.path.join(scripts, 'pythonw.exe')
+        candidates = {
+            venv_py: [os.path.join(launcher_dir, 'venvlauncher.exe'), base_exe],
+            venv_pyw: [os.path.join(launcher_dir, 'venvwlauncher.exe'), base_exe],
+        }
+        for dst, srcs in candidates.items():
+            if os.path.isfile(dst):
+                continue
+            for src in srcs:
+                try:
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dst)
+                        break
+                except Exception:
+                    pass
+        return os.path.isfile(venv_py)
+
     def _setup_venv(self, target):
-        """创建 venv 并安装 requirements。"""
+        """创建 venv 并安装 requirements。
+
+        关键防御: CPython 3.13/3.14 的 venv 在 Windows 上若 venvlauncher.exe
+        复制失败 (杀软拦截/新版官方安装器的运行时目录布局变化), 命令仍返回 0
+        但 Scripts 目录下 python.exe 不会生成, 后续调用它装依赖就会报
+        "[WinError 2] 系统找不到指定的文件"。因此创建后必须校验可执行性:
+        校验失败 -> 清除重建 -> 手动修复 -> 最后才回退无 venv 直装。
+        """
         py_cmd, _ = find_python()
         if not py_cmd:
             raise RuntimeError('未找到 Python')
-        venv_py = os.path.join(target, '.venv', 'Scripts', 'python.exe')
+        venv_dir = os.path.join(target, '.venv')
+        venv_py = os.path.join(venv_dir, 'Scripts', 'python.exe')
+        req = os.path.join(target, 'requirements.txt')
+
+        ok, info = verify_venv_python(venv_py) if os.path.exists(venv_py) else (False, '不存在')
+        if not ok:
+            self._log(f'⚠ 检测到损坏/不完整的 venv ({info}), 正在重建...')
+            shutil.rmtree(venv_dir, ignore_errors=True)
         if not os.path.exists(venv_py):
             self._log('创建虚拟环境...')
-            rc, out = run_cmd([py_cmd, '-m', 'venv', os.path.join(target, '.venv')], timeout=300)
+            rc, out = run_cmd([py_cmd, '-m', 'venv', venv_dir], timeout=300)
             if rc != 0:
                 raise RuntimeError(f'venv 创建失败: {out[-300:]}')
+            ok, info = verify_venv_python(venv_py)
+            if not ok:
+                # 3.13/3.14 静默失败高发: 命令返回 0 但没有 python.exe。
+                self._log(f'⚠ venv 创建后不可用 ({info}), 清除重建...')
+                shutil.rmtree(venv_dir, ignore_errors=True)
+                rc, out = run_cmd([py_cmd, '-m', 'venv', '--clear', venv_dir],
+                                  timeout=300)
+                if rc != 0:
+                    raise RuntimeError(f'venv 创建失败 (重试): {out[-300:]}')
+                ok, info = verify_venv_python(venv_py)
+                if not ok and self._repair_venv_python(target, py_cmd):
+                    self._log('⚠ 已手动补齐 venv 解释器, 重新校验...')
+                    ok, info = verify_venv_python(venv_py)
+                if not ok:
+                    self._log(f'⚠ venv 仍不可用 ({info}), 回退为直接用系统 Python 安装依赖')
+                    self._log('  (稍后可通过 start.bat 首次运行时重建 venv)')
+                    self._pip_install(py_cmd, req, target)
+                    self.final_python = py_cmd
+                    self._log('✓ 依赖安装完成 (无 venv 模式)')
+                    return
         self._log('安装依赖 (清华镜像)...')
-        rc, out = run_cmd([venv_py, '-m', 'pip', 'install', '-q',
-                           '-r', os.path.join(target, 'requirements.txt'),
-                           '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'], timeout=900)
-        if rc != 0:
-            raise RuntimeError(f'依赖安装失败: {out[-300:]}')
+        self._pip_install(venv_py, req, target)
+        self.final_python = venv_py
         self._log('✓ 依赖安装完成')
+
+    def _pip_install(self, python_cmd, requirements, target):
+        """用指定 Python 执行 pip 安装, 失败时把完整输出写入日志文件。"""
+        rc, out = run_cmd([python_cmd, '-m', 'pip', 'install', '-q',
+                           '-r', requirements,
+                           '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'],
+                          timeout=900)
+        if rc != 0:
+            try:
+                log_path = os.path.join(target, 'pip-install-error.log')
+                with open(log_path, 'w', encoding='utf-8', errors='replace') as f:
+                    f.write(out or '(无输出)')
+                hint = f'完整输出已保存: {log_path}'
+            except Exception:
+                hint = f'输出末尾: {out[-300:]}'
+            raise RuntimeError(f'依赖安装失败 (rc={rc}); {hint}; {out[-300:]}')
 
     def _setup_playwright(self, target):
         """安装 Playwright 浏览器 (已装过则跳过, 避免更新时无谓重装)。"""
+        # 跟随 _setup_venv 的结论: 优先用验证过的解释器, venv 损坏时退回系统 Python
         venv_py = os.path.join(target, '.venv', 'Scripts', 'python.exe')
-        if os.path.exists(venv_py):
-            rc, out = run_cmd([venv_py, '-c',
+        py_cmd = getattr(self, 'final_python', None) or venv_py
+        ok, _info = verify_venv_python(py_cmd)
+        if not ok:
+            py_cmd, _ = find_python()
+        if py_cmd and os.path.exists(py_cmd if os.sep in py_cmd else
+                                     shutil.which(py_cmd) or py_cmd):
+            rc, out = run_cmd([py_cmd, '-c',
                                'from playwright.sync_api import sync_playwright; '
                                'import sys; '
                                'p = sync_playwright().start(); '
@@ -384,8 +494,11 @@ class InstallerApp:
             if rc == 0:
                 self._log('✓ Playwright 已就绪, 跳过重装')
                 return
+        if not py_cmd:
+            self._log('⚠ 未找到可用 Python, 跳过 Playwright 浏览器安装')
+            return
         self._log('安装 Playwright 浏览器 (可能需要几分钟)...')
-        rc, out = run_cmd([venv_py, '-m', 'playwright', 'install'], timeout=1800)
+        rc, out = run_cmd([py_cmd, '-m', 'playwright', 'install'], timeout=1800)
         if rc != 0:
             self._log('⚠ Playwright 浏览器安装失败 (可稍后手动安装)')
         else:

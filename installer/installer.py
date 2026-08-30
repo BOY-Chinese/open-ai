@@ -48,6 +48,20 @@ if not os.path.exists(ICON_ICO):
 PYTHON_DOWNLOAD = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe'
 NODE_DOWNLOAD = 'https://nodejs.org/dist/v20.18.0/node-v20.18.0-x64.msi'
 
+# pip 镜像源回退链: 单一镜像故障/劫持/缓存污染时自动切换 (末位为官方源)
+PIP_INDEXES = [
+    'https://pypi.tuna.tsinghua.edu.cn/simple',      # 清华 (主)
+    'https://mirrors.aliyun.com/pypi/simple',        # 阿里云
+    'https://mirrors.cloud.tencent.com/pypi/simple', # 腾讯云
+    'https://pypi.org/simple',                       # PyPI 官方 (兜底)
+]
+# Playwright 浏览器下载镜像 (npm 官方 CDN 在部分网络不可达)
+PLAYWRIGHT_DOWNLOAD_HOSTS = [
+    'https://npmmirror.com/mirrors/playwright',      # 淘宝 npmmirror
+    'https://registry.npmmirror.com/-/binary/playwright',
+    '',                                              # 官方默认 (兜底)
+]
+
 
 # ================= 工具函数 =================
 
@@ -111,6 +125,51 @@ def find_node():
         except Exception:
             pass
     return None, None
+
+
+def check_python_arch(py_cmd):
+    """检测 Python 是否为 x86_64 (AMD64)。py_cmd 可为 'python' 或 ['py','-3.12']。
+
+    背景: playwright 等只发布 win_amd64 wheel; 若用户装的是 ARM64/32 位
+    Python, pip 会出现 'from versions: none' 的静默解析失败。
+    返回 ('x64', arch_str) 或 ('bad', arch_str)。
+    """
+    cmd = list(py_cmd) if isinstance(py_cmd, (list, tuple)) else [py_cmd]
+    rc, out = run_cmd(cmd + ['-c',
+                       'import platform, struct; '
+                       'print(platform.machine(), struct.calcsize("P")*8)'],
+                      timeout=30)
+    if rc != 0:
+        return 'bad', 'unknown'
+    parts = (out or '').split()
+    machine = parts[0].upper() if parts else 'UNKNOWN'
+    bits = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if machine in ('AMD64', 'X86_64', 'X64') and bits == 64:
+        return 'x64', f'{machine} {bits}bit'
+    return 'bad', f'{machine} {bits}bit'
+
+
+def find_corrected_python():
+    """架构纠正后重新查找可用的 64 位 Python, 返回命令前缀 (list)。
+
+    优先尝试 `py -3.12` (新装解释器在 PyManager/launcher 体系下可能不是
+    `python` 别名的默认指向), 再回退逐个检测 py/python/python3。
+    """
+    for prefix in (['py', '-3.12'], ['py'], ['python'], ['python3']):
+        rc, out = run_cmd(prefix + ['--version'], timeout=15)
+        if rc != 0:
+            continue
+        ver = (out or '').strip().split()[-1]
+        try:
+            parts = tuple(int(x) for x in ver.split('.')[:2])
+        except Exception:
+            continue
+        if parts < PYTHON_MIN:
+            continue
+        arch, _ = check_python_arch(prefix)
+        if arch == 'x64':
+            return prefix
+    return None
 
 
 def download_file(url, dest, progress_cb=None):
@@ -282,14 +341,33 @@ class InstallerApp:
         # 3. 处理 open-ai-autostart.bat 硬编码路径
         self._patch_autostart_bat(target)
 
-        # 4. 检测/安装 Python
+        # 4. 检测/安装 Python (含架构校验: playwright 等仅发布 win_amd64 wheel,
+        #    ARM64/32 位 Python 会导致 pip 'from versions: none' 静默失败)
         self._set_status('检测 Python...', 25)
         py_cmd, py_ver = find_python()
         if py_cmd:
-            self._log(f'✓ 检测到 Python {py_ver}')
+            arch, arch_str = check_python_arch(py_cmd)
+            if arch == 'x64':
+                self._log(f'✓ 检测到 Python {py_ver} ({arch_str})')
+            else:
+                self._log(f'⚠ Python {py_ver} 架构不兼容 ({arch_str}), playwright 等包无法安装')
+                self._log('正在自动补装 64 位 Python 3.12 (不影响已有 Python)...')
+                self._install_python(reason='架构纠正')
+                fixed = find_corrected_python()
+                if not fixed:
+                    raise RuntimeError('64 位 Python 3.12 补装失败, 请手动从 python.org'
+                                       ' 安装 3.12.10 (64-bit) 后重新运行安装器')
+                rc2, out2 = run_cmd(list(fixed) + ['--version'], timeout=15)
+                py_ver = (out2 or '').strip().split()[-1] if rc2 == 0 and out2.strip() else '3.12'
+                py_cmd = fixed
+                self._log(f'✓ 已启用 64 位 Python {py_ver}')
         else:
             self._log('未检测到 Python, 正在自动下载安装...')
             self._install_python()
+
+        # 记录最终可用的 Python 前缀 (供 _setup_venv/_setup_playwright 复用,
+        # 避免架构纠正后又被 find_python() 抓回不合规的解释器)
+        self.python_prefix = py_cmd
 
         # 5. 检测/安装 Node
         self._set_status('检测 Node.js...', 40)
@@ -346,9 +424,9 @@ class InstallerApp:
             f.write(content)
         self._log(f'✓ 已更新 open-ai-autostart.bat 路径 -> {target}')
 
-    def _install_python(self):
-        """下载并静默安装 Python。"""
-        self._log('下载 Python 3.12...')
+    def _install_python(self, reason=''):
+        """下载并静默安装 Python (64 位 3.12.10, 官方安装器)。"""
+        self._log(f'下载 Python 3.12{(" (%s)" % reason) if reason else ""}...')
         exe = os.path.join(os.environ.get('TEMP', '.'), 'python-installer.exe')
         download_file(PYTHON_DOWNLOAD, exe, lambda p: self._set_status(f'下载 Python {p*100:.0f}%', 25 + p * 10))
         self._log('安装 Python (静默)...')
@@ -378,8 +456,9 @@ class InstallerApp:
         venv_dir = os.path.join(target, '.venv')
         scripts = os.path.join(venv_dir, 'Scripts')
         os.makedirs(scripts, exist_ok=True)
+        prefix = list(py_cmd) if isinstance(py_cmd, (list, tuple)) else [py_cmd]
         rc, out = run_cmd(
-            [py_cmd, '-c',
+            [*prefix, '-c',
              'import sys, os, sysconfig;'
              'base = getattr(sys, "_base_executable", "") or sys.executable;'
              'print(base);'
@@ -419,9 +498,10 @@ class InstallerApp:
         "[WinError 2] 系统找不到指定的文件"。因此创建后必须校验可执行性:
         校验失败 -> 清除重建 -> 手动修复 -> 最后才回退无 venv 直装。
         """
-        py_cmd, _ = find_python()
+        py_cmd = getattr(self, 'python_prefix', None) or find_python()[0]
         if not py_cmd:
             raise RuntimeError('未找到 Python')
+        prefix = list(py_cmd) if isinstance(py_cmd, (list, tuple)) else [py_cmd]
         venv_dir = os.path.join(target, '.venv')
         venv_py = os.path.join(venv_dir, 'Scripts', 'python.exe')
         req = os.path.join(target, 'requirements.txt')
@@ -432,7 +512,7 @@ class InstallerApp:
             shutil.rmtree(venv_dir, ignore_errors=True)
         if not os.path.exists(venv_py):
             self._log('创建虚拟环境...')
-            rc, out = run_cmd([py_cmd, '-m', 'venv', venv_dir], timeout=300)
+            rc, out = run_cmd([*prefix, '-m', 'venv', venv_dir], timeout=300)
             if rc != 0:
                 raise RuntimeError(f'venv 创建失败: {out[-300:]}')
             ok, info = verify_venv_python(venv_py)
@@ -440,69 +520,116 @@ class InstallerApp:
                 # 3.13/3.14 静默失败高发: 命令返回 0 但没有 python.exe。
                 self._log(f'⚠ venv 创建后不可用 ({info}), 清除重建...')
                 shutil.rmtree(venv_dir, ignore_errors=True)
-                rc, out = run_cmd([py_cmd, '-m', 'venv', '--clear', venv_dir],
+                rc, out = run_cmd([*prefix, '-m', 'venv', '--clear', venv_dir],
                                   timeout=300)
                 if rc != 0:
                     raise RuntimeError(f'venv 创建失败 (重试): {out[-300:]}')
                 ok, info = verify_venv_python(venv_py)
-                if not ok and self._repair_venv_python(target, py_cmd):
+                if not ok and self._repair_venv_python(target, prefix):
                     self._log('⚠ 已手动补齐 venv 解释器, 重新校验...')
                     ok, info = verify_venv_python(venv_py)
                 if not ok:
                     self._log(f'⚠ venv 仍不可用 ({info}), 回退为直接用系统 Python 安装依赖')
                     self._log('  (稍后可通过 start.bat 首次运行时重建 venv)')
-                    self._pip_install(py_cmd, req, target)
-                    self.final_python = py_cmd
+                    self._pip_install(prefix, req, target)
+                    self.final_python = prefix
                     self._log('✓ 依赖安装完成 (无 venv 模式)')
                     return
-        self._log('安装依赖 (清华镜像)...')
+        self._log('安装依赖 (多镜像源自动回退)...')
         self._pip_install(venv_py, req, target)
         self.final_python = venv_py
         self._log('✓ 依赖安装完成')
 
     def _pip_install(self, python_cmd, requirements, target):
-        """用指定 Python 执行 pip 安装, 失败时把完整输出写入日志文件。"""
-        rc, out = run_cmd([python_cmd, '-m', 'pip', 'install', '-q',
-                           '-r', requirements,
-                           '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple'],
-                          timeout=900)
-        if rc != 0:
-            try:
-                log_path = os.path.join(target, 'pip-install-error.log')
-                with open(log_path, 'w', encoding='utf-8', errors='replace') as f:
-                    f.write(out or '(无输出)')
-                hint = f'完整输出已保存: {log_path}'
-            except Exception:
-                hint = f'输出末尾: {out[-300:]}'
-            raise RuntimeError(f'依赖安装失败 (rc={rc}); {hint}; {out[-300:]}')
+        """用指定 Python 执行 pip 安装。
+
+        - 统一 --no-cache-dir: 本地 HTTP 缓存被污染会持续报 from versions: none
+        - 多镜像源回退: 清华 -> 阿里云 -> 腾讯云 -> PyPI 官方
+        - 失败时完整输出写入日志文件
+        """
+        prefix = list(python_cmd) if isinstance(python_cmd, (list, tuple)) \
+            else [python_cmd]
+        last = ''
+        for i, index in enumerate(PIP_INDEXES):
+            rc, out = run_cmd([*prefix, '-m', 'pip', 'install', '-q',
+                               '--no-cache-dir',
+                               '-r', requirements,
+                               '-i', index,
+                               '--timeout', '30'], timeout=900)
+            if rc == 0:
+                if i:
+                    self._log(f'✓ 第 {i + 1} 源 ({index}) 安装成功')
+                return
+            last = out or ''
+            short = ' '.join(last.split())[-160:]
+            self._log(f'⚠ 第 {i + 1} 源失败 ({index}): {short}')
+            if 'No matching distribution' not in last and \
+                    'versions: none' not in last and rc == 1:
+                # 非镜像源问题 (如依赖冲突/网络中断), 换源意义不大
+                break
+        try:
+            log_path = os.path.join(target, 'pip-install-error.log')
+            with open(log_path, 'w', encoding='utf-8', errors='replace') as f:
+                f.write(last or '(无输出)')
+            hint = f'完整输出已保存: {log_path}'
+        except Exception:
+            hint = f'输出末尾: {last[-300:]}'
+        raise RuntimeError(f'依赖安装失败 (rc={rc}); {hint}; {last[-300:]}')
 
     def _setup_playwright(self, target):
         """安装 Playwright 浏览器 (已装过则跳过, 避免更新时无谓重装)。"""
-        # 跟随 _setup_venv 的结论: 优先用验证过的解释器, venv 损坏时退回系统 Python
+        # 跟随 _setup_venv 的结论: playwright 包装在哪个解释器里, 就用哪个跑 CLI
+        # (venv 成功 -> final_python=venv_py; 兜底直装 -> final_python=系统前缀)
         venv_py = os.path.join(target, '.venv', 'Scripts', 'python.exe')
         py_cmd = getattr(self, 'final_python', None) or venv_py
-        ok, _info = verify_venv_python(py_cmd)
-        if not ok:
-            py_cmd, _ = find_python()
-        if py_cmd and os.path.exists(py_cmd if os.sep in py_cmd else
-                                     shutil.which(py_cmd) or py_cmd):
-            rc, out = run_cmd([py_cmd, '-c',
-                               'from playwright.sync_api import sync_playwright; '
-                               'import sys; '
-                               'p = sync_playwright().start(); '
-                               'b = p.chromium; sys.exit(0)'], timeout=60)
-            if rc == 0:
-                self._log('✓ Playwright 已就绪, 跳过重装')
-                return
-        if not py_cmd:
+        if isinstance(py_cmd, (list, tuple)):
+            prefix = list(py_cmd)          # 系统 Python 前缀 (已在架构校验中确认)
+        else:
+            ok, _info = verify_venv_python(py_cmd)
+            if not ok:
+                sys_py = find_python()[0]
+                py_cmd = sys_py if sys_py else py_cmd
+            prefix = [py_cmd]
+        if not prefix or not prefix[0]:
             self._log('⚠ 未找到可用 Python, 跳过 Playwright 浏览器安装')
             return
+        rc, _o = run_cmd([*prefix, '-c',
+                          'from playwright.sync_api import sync_playwright; '
+                          'import sys; '
+                          'p = sync_playwright().start(); '
+                          'b = p.chromium; sys.exit(0)'], timeout=60)
+        if rc == 0:
+            self._log('✓ Playwright 已就绪, 跳过重装')
+            return
         self._log('安装 Playwright 浏览器 (可能需要几分钟)...')
-        rc, out = run_cmd([py_cmd, '-m', 'playwright', 'install'], timeout=1800)
-        if rc != 0:
-            self._log('⚠ Playwright 浏览器安装失败 (可稍后手动安装)')
-        else:
+        installed = False
+        for i, host in enumerate(PLAYWRIGHT_DOWNLOAD_HOSTS):
+            env = os.environ.copy()
+            if host:
+                env['PLAYWRIGHT_DOWNLOAD_HOST'] = host
+                self._log(f'  下载镜像 ({i + 1}/{len(PLAYWRIGHT_DOWNLOAD_HOSTS)}): {host}')
+            rc, out = self._run_cmd_env(prefix + ['-m', 'playwright', 'install'],
+                                        env, timeout=1800)
+            if rc == 0:
+                installed = True
+                break
+            short = ' '.join((out or '').split())[-120:]
+            self._log(f'⚠ 下载镜像 {i + 1} 失败: {short}')
+        if installed:
             self._log('✓ Playwright 浏览器安装完成')
+        else:
+            self._log('⚠ Playwright 浏览器安装失败 (可稍后手动安装, 不影响网关启动)')
+
+    def _run_cmd_env(self, cmd, env, timeout=600):
+        """带自定义环境变量运行命令 (供 PLAYWRIGHT_DOWNLOAD_HOST 切换使用)。"""
+        try:
+            flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout, shell=False,
+                               creationflags=flags, env=env)
+            return p.returncode, (p.stdout or '') + (p.stderr or '')
+        except Exception as e:
+            return -1, str(e)
 
     def _find_desktop(self):
         """返回真实桌面目录 (支持 OneDrive 重定向 / 中文系统 / 自定义位置)。

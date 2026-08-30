@@ -243,6 +243,7 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 daemon 白天反�
 
 | 现象 | 排查 |
 |---|---|
+| 安装器报「依赖安装失败: [WinError 2] 系统找不到指定的文件」 | venv 静默损坏（Python 3.13/3.14 已知问题：`venvlauncher.exe` 复制失败时 `python -m venv` 仍返回成功，但 `.venv\Scripts\python.exe` 未生成）。新版安装器会自动校验/重建/修复并兜底直装；旧版安装器可先删除安装目录下的 `.venv` 再重装，或把安装目录加入杀软信任区。若仍失败，看安装目录下 `pip-install-error.log` |
 | TRAE 签到一直 9074 | 检查 `config.json` 的 `device_id` / `x-device-id` 是否为**真实客户端 machineid**（见 §3），占位符/伪造值必 9074 |
 | 网关起不来 | 看 `open_api_err.log`；确认 `start.bat` 已建好 `.venv` 且装了依赖 |
 | 端口被占 | 8000/18787 已在运行则脚本会跳过；用 `netstat -ano \| findstr :8000` 查占用 |

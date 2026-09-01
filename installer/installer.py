@@ -47,11 +47,29 @@ RESOURCES_ZIP = os.path.join(_resource_dir(), 'resources.zip')
 SHELL_CONFIG = os.path.join(_resource_dir(), 'config.shell.json')
 
 
-def run_cmd(cmd, timeout=60, capture=True):
+def run_cmd(cmd, timeout=60, capture=True, encoding=None):
+    """隐藏控制台运行命令, 返回 (returncode, output)。
+
+    encoding=None 时按 locale (VM 常见 GBK); 输出解码失败时回落
+    errors='replace', 防止 UnicodeDecodeError 中断安装流程。
+    """
     try:
-        p = subprocess.run(cmd, capture_output=capture, text=True,
-                           timeout=timeout, shell=False, creationflags=_NO_WINDOW)
+        kw = dict(capture_output=capture, text=True, timeout=timeout,
+                  shell=False, creationflags=_NO_WINDOW)
+        if encoding:
+            kw['encoding'] = encoding
+            kw['errors'] = 'replace'
+        p = subprocess.run(cmd, **kw)
         return p.returncode, (p.stdout or '') + (p.stderr or '')
+    except UnicodeDecodeError:
+        # 输出含非法字节 (编码不匹配) → 按字节回落
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                               shell=False, creationflags=_NO_WINDOW)
+            out = (p.stdout or b'') + (p.stderr or b'')
+            return p.returncode, out.decode('utf-8', errors='replace')
+        except Exception as e:
+            return -1, str(e)
     except Exception as e:
         return -1, str(e)
 
@@ -137,11 +155,23 @@ class InstallerApp:
             self.install_dir.set(os.path.abspath(d))
 
     def _log(self, msg):
-        self.log.configure(state='normal')
-        self.log.insert('end', msg + '\n')
-        self.log.see('end')
-        self.log.configure(state='disabled')
-        self.root.update_idletasks()
+        # 容错: 控制台/PyInstaller 环境编码不定 (UTF-8/GBK), 打印特殊字符
+        # (如 U+FFFD) 时防止 UnicodeEncodeError 中断安装流程
+        try:
+            self.log.configure(state='normal')
+            self.log.insert('end', msg + '\n')
+            self.log.see('end')
+            self.log.configure(state='disabled')
+            self.root.update_idletasks()
+        except Exception:
+            try:
+                self.log.configure(state='normal')
+                self.log.insert('end',
+                                msg.encode('utf-8', errors='replace')
+                                .decode('utf-8', errors='replace') + '\n')
+                self.log.configure(state='disabled')
+            except Exception:
+                pass
 
     def _set_status(self, msg, pct=None):
         self.status.set(msg)
@@ -254,19 +284,32 @@ class InstallerApp:
 
     # ---------------- 辅助函数 ----------------
     def _patch_autostart_bat(self, target):
-        """把 open-ai-autostart.bat 里的旧路径替换为实际安装目录。"""
+        """把 open-ai-autostart.bat 里的旧路径替换为实际安装目录。
+
+        采用**字节级**替换 (不按字符解码), 彻底规避 bat 文件 GBK/UTF-8
+        编码差异导致的 UnicodeDecodeError/UnicodeEncodeError:
+        VM/本机上的 bat 可能是 GBK(ANSI) 或 UTF-8, 用文本模式读会因
+        errors='replace' 产生 U+FFFD, 再以 gbk 写出即报
+        "'gbk' codec can't encode character '\\ufffd'"。
+        """
         bat = os.path.join(target, 'open-ai-autostart.bat')
         if not os.path.exists(bat):
             return
         try:
-            with open(bat, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
-            # 替换旧源码路径 (仅当其中出现 D:\app\dsh_plugin\open-ai 等)
+            with open(bat, 'rb') as f:
+                raw = f.read()
             import re
-            content = re.sub(r'(?i)[a-z]:\\[^\s"]*?open-ai',
-                             target.replace('\\', '\\\\'), content)
-            with open(bat, 'w', encoding='utf-8') as f:
-                f.write(content)
+            # 字节级替换: 匹配任意盘符路径里的 open-ai 段 → 目标安装目录
+            # 用函数式替换 (lambda), 避免 re.sub 把替换串里的 '\' 当转义解析
+            # (target 是 C:\open-ai 这类含反斜杠路径, 直接传字符串会
+            #  "bad escape \o" 或替换错乱)
+            new_raw = re.sub(
+                rb'(?i)[a-z]:\\(?:[^\r\n"]*?\\)*[^\\\r\n"]*open-ai',
+                lambda m: target.encode('utf-8', errors='surrogateescape'),
+                raw)
+            if new_raw != raw:
+                with open(bat, 'wb') as f:
+                    f.write(new_raw)
             self._log('✓ 自启脚本路径已适配安装目录')
         except Exception as e:
             self._log(f'⚠ 自启脚本路径适配失败: {e}')
@@ -399,8 +442,8 @@ class InstallerApp:
             ')\r\n'
             'exit /b\r\n'
         )
-        with open(launcher_bat, 'w', encoding='gbk', newline='\r\n') as f:
-            f.write(bat_content)
+        with open(launcher_bat, 'wb') as f:
+            f.write(bat_content.encode('gbk', errors='replace'))
         self._log(f'✓ 已生成启动器: {os.path.basename(launcher_bat)}')
 
     def _make_shortcut(self, lnk_path, target_exe, args, workdir, desc, icon_path=''):

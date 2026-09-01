@@ -30,6 +30,14 @@ def run_cmd(cmd, timeout=60, capture=True):
         p = subprocess.run(cmd, capture_output=capture, text=True,
                            timeout=timeout, shell=False, creationflags=_NO_WINDOW)
         return p.returncode, (p.stdout or '') + (p.stderr or '')
+    except UnicodeDecodeError:
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                               shell=False, creationflags=_NO_WINDOW)
+            out = (p.stdout or b'') + (p.stderr or b'')
+            return p.returncode, out.decode('utf-8', errors='replace')
+        except Exception as e:
+            return -1, str(e)
     except Exception as e:
         return -1, str(e)
 

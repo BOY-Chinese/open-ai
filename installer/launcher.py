@@ -24,11 +24,23 @@ _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
 def run_cmd(cmd, timeout=60, capture=True):
-    """隐藏控制台运行命令, 返回 (returncode, output)。"""
+    """隐藏控制台运行命令, 返回 (returncode, output)。
+
+    输出解码失败 (VM 控制台编码 GBK/UTF-8 不匹配) 时回落 bytes,
+    防止 UnicodeDecodeError 中断启动流程。
+    """
     try:
         p = subprocess.run(cmd, capture_output=capture, text=True,
                            timeout=timeout, shell=False, creationflags=_NO_WINDOW)
         return p.returncode, (p.stdout or '') + (p.stderr or '')
+    except UnicodeDecodeError:
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                               shell=False, creationflags=_NO_WINDOW)
+            out = (p.stdout or b'') + (p.stderr or b'')
+            return p.returncode, out.decode('utf-8', errors='replace')
+        except Exception as e:
+            return -1, str(e)
     except Exception as e:
         return -1, str(e)
 

@@ -48,7 +48,7 @@ ICON_PATH = os.path.join(BASE, 'pic', 'open-ai.ico')
 VENV_SITE = os.path.join(BASE, '.venv', 'Lib', 'site-packages')
 PTH_FILE = os.path.join(VENV_SITE, 'openai_runtime.pth')
 STAMP_FILE = os.path.join(RUNTIME_DIR, '.build-stamp')
-APP_VERSION = '2.4.0'
+APP_VERSION = '2.5.0'
 
 # 是否打印解释器定位来源 (诊断用; 环境变量 open_ai_verbose_resolve=1 开启)
 _VERBOSE_RESOLVE = os.environ.get('open_ai_verbose_resolve') == '1'

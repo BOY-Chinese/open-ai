@@ -9,12 +9,12 @@ VSVersionInfo(
       StringTable('040904b0', [
         StringStruct('CompanyName', 'open-ai project'),
         StringStruct('FileDescription', 'open-ai'),
-        StringStruct('FileVersion', '2.4.0.0'),
+        StringStruct('FileVersion', '2.5.0.0'),
         StringStruct('InternalName', 'open-ai-launcher'),
         StringStruct('LegalCopyright', 'open-ai project'),
         StringStruct('OriginalFilename', 'open-ai-launcher.exe'),
         StringStruct('ProductName', 'open-ai'),
-        StringStruct('ProductVersion', '2.4.0.0')]),
+        StringStruct('ProductVersion', '2.5.0.0')]),
       VarFileInfo([VarStruct('Translation', [0, 1200])]),
     ])
   ])

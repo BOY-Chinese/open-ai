@@ -326,11 +326,43 @@ async def reload_providers(request: Request):
 
 
 if __name__ == "__main__":
+    import sys
     import uvicorn
+
+    from ipc import HeartbeatClient
+
     print("=" * 60)
     print("  Open-API 聚合网关 (open-ai)")
     print(f"  http://{HOST}:{PORT}/v1/chat/completions")
     print(f"  API Key: {API_KEY}")
     print(f"  Providers: {list(PROVIDERS.keys())}")
     print("=" * 60)
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+
+    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+
+    # ---- Broker 托管模式: IPC 心跳 + 优雅退出协议 ----
+    # 由 app_runtime.py (Broker) 以 --from-broker 启动时启用:
+    #   - 每 10s 向 Broker 心跳 (断管自动重连)
+    #   - 收到 shutdown 指令 → uvicorn 优雅退出 (完成在途请求)
+    heartbeat = None
+    if "--from-broker" in sys.argv:
+        def _on_broker_shutdown(msg):
+            logger.warning("[ipc] 收到 Broker 关闭指令: %s — 优雅退出中",
+                           (msg or {}).get("reason", ""))
+            server.should_exit = True
+        try:
+            heartbeat = HeartbeatClient(role="gateway", port=PORT,
+                                        on_shutdown=_on_broker_shutdown)
+            heartbeat.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ipc] 心跳客户端启动失败 (继续独立运行): %s", e)
+
+    try:
+        server.run()
+    finally:
+        if heartbeat:
+            try:
+                heartbeat.stop(reason="gateway exit")
+            except Exception:
+                pass

@@ -1,13 +1,16 @@
 @echo off
-rem open-ai autostart: start gateway + no-window daemon (self-heal + daily signin)
-rem 隐藏本控制台窗口
+rem open-ai autostart: launch process broker (gateway + trae node + tasks)
+rem v2.4: all child processes are spawned and hosted by the Broker
+rem       (Job Object tree + IPC heartbeat + watchdog respawn).
 if not "%1"=="hidden" (
     start "" /min cmd /c "%~f0" hidden
     exit /b
 )
 cd /d "D:\app\dsh_plugin\open-ai"
-rem start gateway (python + node backends)
-start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "D:\app\dsh_plugin\open-ai\start_hidden.ps1"
-rem start no-window daemon (pythonw, no console popup): self-heal + daily signin
-start "" "D:\app\dsh_plugin\open-ai\.venv\Scripts\pythonw.exe" "D:\app\dsh_plugin\open-ai\daemon.py"
+if not exist "runtime\Scripts\open-ai-daemon.exe" (
+    rem runtime not built yet: build it first (idempotent)
+    ".venv\Scripts\python.exe" procname.py >nul 2>nul
+)
+rem idempotent: bootstrap start returns immediately if Broker already runs
+start "" /b "D:\app\dsh_plugin\open-ai\runtime\Scripts\open-ai-daemon.exe" "D:\app\dsh_plugin\open-ai\bootstrap.py" start
 exit /b 0

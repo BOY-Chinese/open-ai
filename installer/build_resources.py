@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-把 open-ai 项目资源打包成 installer/resources.zip
-==================================================
-生成安装器需要的资源包 (内含全部代码 + trae/lib 依赖, 不含 venv/logs/data)。
+把 open-ai 项目资源打包成 installer/resources.zip —— v2.5 新架构版
+====================================================================
+生成安装器需要的资源包 (内含全部代码 + trae/lib 依赖, 不含 venv/runtime/
+logs/data/config.json)。
 运行: python build_resources.py
 产出: installer/resources.zip
 """
@@ -15,10 +16,11 @@ import zipfile
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_ZIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources.zip')
 
-# 需要打包的顶层文件/目录
+# 需要打包的顶层文件/目录 (v2.5: Broker + 托盘 + procname 品牌化运行时)
 INCLUDE = [
-    'main.py', 'daemon.py', 'watchdog_boot.py', 'anthropic_api.py',
-    'version.py',
+    'main.py', 'daemon.py', 'app_runtime.py', 'ipc.py', 'jobmgmt.py',
+    'procname.py', 'bootstrap.py', 'launcher_main.py', 'watchdog_boot.py',
+    'anthropic_api.py', 'version.py', 'launcher_version.txt',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',
     '账号管理.bat',
@@ -35,7 +37,7 @@ EXTRA_FILES = {
         'open-ai-launcher.exe',
 }
 # 排除项 (相对 project root)
-EXCLUDE_DIRS = {'__pycache__', '.venv', 'logs', 'data', '.git', 'installer'}
+EXCLUDE_DIRS = {'__pycache__', '.venv', 'runtime', 'logs', 'data', '.git', 'installer'}
 EXCLUDE_EXTS = {'.pyc', '.log'}
 EXCLUDE_FILES = {'config.json'}  # 安装器会生成空壳 config, 不打真实配置
 
@@ -79,13 +81,13 @@ def build():
                             zf.write(full, rel)
                             count += 1
                             total_bytes += os.path.getsize(full)
-        # 追加额外图标文件
+        # 追加额外文件
         for src, arcname in EXTRA_FILES.items():
             if os.path.exists(src):
                 zf.write(src, arcname)
                 count += 1
                 total_bytes += os.path.getsize(src)
-                print(f'  [图标] -> {arcname}')
+                print(f'  [附加] -> {arcname}')
     size_mb = os.path.getsize(OUT_ZIP) / 1024 / 1024
     print(f'[完成] 打包 {count} 个文件, {total_bytes/1024/1024:.1f} MB -> {size_mb:.1f} MB zip')
     print(f'  输出: {OUT_ZIP}')

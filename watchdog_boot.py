@@ -1,104 +1,111 @@
 # -*- coding: utf-8 -*-
 """
-open-ai 无窗口守护保活引导 (Watchdog Boot)
-==========================================
-由计划任务 OpenAI-Watchdog 周期性调用 (每 5 分钟), 用 pythonw 运行, 无任何弹窗。
-职责:
-  1. 若后台守护 daemon.py 未在运行, 用 pythonw 拉起它 (无窗口)
-  2. 立即退出
+watchdog_boot.py — 计划任务保活引导 (v2.4)
+============================================
+由计划任务 OpenAI-DaemonBoot 周期性调用 (每 5 分钟), pythonw 无窗口运行。
+职责: 检查 Broker 是否存活, 不在则通过 bootstrap.py 重新拉起。
 
-配合 daemon.py (常驻) + 计划任务, 实现: daemon 崩溃后由本脚本自动重启, 全程无控制台弹窗。
+v2.4 变化: Broker 自身有 root Job KILL_ON_JOB_CLOSE + 指数退避重启,
+本脚本退化为"最后防线" — 只负责 Broker 进程整体消失的场景
+(例如用户在任务管理器里整组结束后想自愈, 或Broker 崩溃后自动复活)。
 """
 import os
+import sys
 import subprocess
 from datetime import datetime
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE, 'logs')
-DATA_DIR = os.path.join(BASE, 'data')
 LOG = os.path.join(LOGS_DIR, 'daemon_boot.log')
 PYW = os.path.join(BASE, '.venv', 'Scripts', 'pythonw.exe')
-DAEMON = os.path.join(BASE, 'daemon.py')
-PIDFILE = os.path.join(DATA_DIR, '.daemon.pid')
-
-
-_SINGLE_MUTEX = 'Global\\open-ai-daemon-mutex'
-
-
-def daemon_single_mutex_taken():
-    """返回 True 表示已有一个 daemon 持有互斥体(即在运行), 用于 watchdog 判定。"""
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        ERROR_ALREADY_EXISTS = 183
-        h = kernel32.CreateMutexW(None, False, _SINGLE_MUTEX)
-        if h:
-            err = kernel32.GetLastError()
-            taken = (err == ERROR_ALREADY_EXISTS)
-            kernel32.CloseHandle(h)
-            return taken
-    except Exception:
-        pass
-    return False
+PY = os.path.join(BASE, '.venv', 'Scripts', 'python.exe')
+BOOTSTRAP = os.path.join(BASE, 'bootstrap.py')
+PIDFILE = os.path.join(BASE, 'data', '.daemon.pid')
+RUNTIME_STATE = os.path.join(BASE, 'data', 'runtime_state.json')
+# GUI 托盘「彻底退出」/ bootstrap stop 时写的抑制标记 (时间戳):
+# 抑制窗口内不复活 Broker, 避免用户刚退出服务又被计划任务拉起。
+SUPPRESS_FLAG = os.path.join(BASE, 'data', '.gui_exit_suppress')
+SUPPRESS_SECONDS = 600
 
 
 def log(msg):
     try:
         os.makedirs(LOGS_DIR, exist_ok=True)
         with open(LOG, 'a', encoding='utf-8') as f:
-            f.write('[%s] %s\n' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg))
+            f.write('[%s] %s\n' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                   msg))
     except Exception:
         pass
 
 
+def suppressed():
+    """最近 10 分钟内有用户主动退出标记 → 不拉起 (防退出后立刻复活)。"""
+    try:
+        with open(SUPPRESS_FLAG, 'r', encoding='utf-8') as f:
+            ts = float(f.read().strip() or 0)
+        return (datetime.now().timestamp() - ts) < SUPPRESS_SECONDS
+    except Exception:
+        return False
+
+
 def pid_alive(pid):
-    """Windows: 判断 pid 进程是否存活"""
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                 int(pid))
         if not h:
-            return False  # 进程不存在或无权限
+            return False
         code = ctypes.c_ulong()
         ok = kernel32.GetExitCodeProcess(h, ctypes.byref(code))
         kernel32.CloseHandle(h)
-        # STILL_ACTIVE = 259
-        return ok != 0 and code.value == 259
+        return ok != 0 and code.value == 259   # STILL_ACTIVE
     except Exception:
-        return True  # 无法判断时保守认为存活
+        return False
 
 
-def daemon_running():
-    # 仅依据 PID 文件判断; 若文件被删或进程消失则视为未运行, 交由 start_daemon 重新拉起
+def broker_alive():
+    """Broker 存活 = 状态文件里的 pid 仍活着。"""
+    try:
+        with open(RUNTIME_STATE, 'r', encoding='utf-8') as f:
+            import json
+            st = json.load(f)
+        pid = st.get('broker_pid')
+        return bool(pid and pid_alive(pid))
+    except Exception:
+        pass
+    # 回退: 旧 pid 文件 (兼容升级中间态)
     try:
         with open(PIDFILE, 'r') as f:
             pid = f.read().strip()
-        if pid and pid_alive(pid):
-            return True
+        return bool(pid and pid_alive(pid))
     except Exception:
-        pass
-    return False
+        return False
 
 
-def start_daemon():
+def start_broker():
+    """通过 bootstrap.py 拉起 Broker (它自带单实例保护, 幂等)。"""
+    exe = PYW if os.path.exists(PYW) else PY
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
     try:
-        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-        proc = subprocess.Popen(
-            [PYW, DAEMON],
-            cwd=BASE,
-            creationflags=flags,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # daemon 会自己刷新 PID 文件, 这里等待片刻不阻塞调用方
-        log('[boot] 已用 pythonw 拉起 daemon (pid=%s)' % proc.pid)
+        subprocess.Popen([exe, BOOTSTRAP, 'start'], cwd=BASE,
+                         creationflags=flags,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL)
+        log('[boot] 已通过 bootstrap.py start 拉起 Broker')
     except Exception as e:
         log('[boot] 拉起失败: %s' % e)
 
 
 if __name__ == '__main__':
-    # 结合 pid 文件 + 互斥体双保险: 任一判定已在运行则不重复拉起
-    if daemon_running() or daemon_single_mutex_taken():
-        pass  # 已在运行
+    if broker_alive():
+        pass  # Broker 在跑, 无事可做
+    elif suppressed():
+        # 用户刚通过托盘「退出」/ bootstrap stop 主动关闭 → 尊重退出意图
+        log('[boot] 近期有主动退出标记, 抑制自动拉起 (%d 分钟内)' %
+            (SUPPRESS_SECONDS // 60))
     else:
-        log('[boot] 检测到 daemon 未运行, 启动它')
-        start_daemon()
+        log('[boot] 检测到 Broker 不在运行, 启动它')
+        start_broker()

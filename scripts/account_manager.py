@@ -35,6 +35,19 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
 OPENAI_VENV_PY = os.path.join(BASE, '..', '.venv', 'Scripts', 'python.exe')
 
+# ---- v2.4 进程品牌化: 短命脚本用 task shim (任务管理器显示 open-ai 品牌) ----
+OPENAI_TASK_SHIM = os.path.join(BASE, '..', 'runtime', 'Scripts',
+                                'open-ai-task.exe')
+
+
+def _script_py():
+    """优先 open-ai-task.exe shim (品牌化), 回退 venv python。"""
+    if os.path.isfile(OPENAI_TASK_SHIM):
+        return OPENAI_TASK_SHIM
+    if os.path.isfile(OPENAI_VENV_PY):
+        return OPENAI_VENV_PY
+    return sys.executable
+
 UA_WB = 'WorkBuddy/5.3.12 WorkBuddy/5.3.12 CLI/2.115.0'
 
 
@@ -423,7 +436,7 @@ def show_workbuddy_accounts():
 # ============ 添加账号 ============
 
 def add_trae():
-    py = OPENAI_VENV_PY if os.path.isfile(OPENAI_VENV_PY) else sys.executable
+    py = _script_py()
     script = os.path.join(BASE, 'login_trae.py')
     print('\n>>> 即将打开 TRAE 网页登录, 请在弹出的浏览器中完成登录 <<<')
     subprocess.run([py, script], cwd=os.path.dirname(BASE))
@@ -431,7 +444,7 @@ def add_trae():
 
 
 def add_workbuddy():
-    py = OPENAI_VENV_PY if os.path.isfile(OPENAI_VENV_PY) else sys.executable
+    py = _script_py()
     script = os.path.join(BASE, 'login_workbuddy.py')
     print('\n>>> 即将打开 WorkBuddy 网页登录, 请在弹出的浏览器中完成登录 <<<')
     subprocess.run([py, script], cwd=os.path.dirname(BASE))
@@ -497,6 +510,57 @@ def refresh():
     print('=' * 62)
 
 
+def show_usage_history():
+    """TRAE 逐笔消耗流水 (网页 dashboard 同款接口, 详见 usage_history.py)。"""
+    py = _script_py()
+    script = os.path.join(BASE, 'usage_history.py')
+    if not os.path.isfile(script):
+        print('未找到 usage_history.py')
+        return
+    days = input('  查询最近几天? (回车=7): ').strip()
+    args = [py, script]
+    if days.isdigit() and int(days) > 0:
+        args += ['--days', days]
+    print()
+    subprocess.run(args, cwd=os.path.dirname(BASE))
+
+
+def show_wb_usage_history():
+    """WorkBuddy 逐笔消耗流水 (官网个人中心同款接口, 详见 wb_usage_history.py)。"""
+    py = _script_py()
+    script = os.path.join(BASE, 'wb_usage_history.py')
+    if not os.path.isfile(script):
+        print('未找到 wb_usage_history.py')
+        return
+    days = input('  查询最近几天? (回车=7): ').strip()
+    args = [py, script]
+    if days.isdigit() and int(days) > 0:
+        args += ['--days', days]
+    print()
+    subprocess.run(args, cwd=os.path.dirname(BASE))
+
+
+def show_local_usage():
+    """查看本地流水库 (daemon 每 30 分钟自动采集的逐笔消耗)。"""
+    py = _script_py()
+    script = os.path.join(BASE, 'usage_collector.py')
+    if not os.path.isfile(script):
+        print('未找到 usage_collector.py')
+        return
+    print('\n  [1] 查看本地流水库')
+    print('  [2] 立即采集一轮')
+    choice = input('  请选择 (回车=1): ').strip() or '1'
+    args = [py, script]
+    if choice == '2':
+        args += ['--collect']
+    else:
+        days = input('  查询最近几天? (回车=7): ').strip()
+        if days.isdigit() and int(days) > 0:
+            args += ['--days', days]
+    print()
+    subprocess.run(args, cwd=os.path.dirname(BASE))
+
+
 def menu():
     print()
     print('  [1] 刷新积分显示')
@@ -504,6 +568,9 @@ def menu():
     print('  [3] 添加 WorkBuddy 账号 (网页登录)')
     print('  [4] 重新连接')
     print('  [5] 模型列表 + 积分倍率')
+    print('  [6] TRAE 逐笔消耗流水 (实时查询)')
+    print('  [7] WorkBuddy 逐笔消耗流水 (实时查询)')
+    print('  [8] 消耗流水本地库 (自动采集汇总)')
     print('  [Q] 退出')
 
 
@@ -528,6 +595,12 @@ def main():
             reconnect_all()
         elif choice == '5':
             show_model_rates()
+        elif choice == '6':
+            show_usage_history()
+        elif choice == '7':
+            show_wb_usage_history()
+        elif choice == '8':
+            show_local_usage()
         else:
             print('  无效选项')
 

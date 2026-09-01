@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-open-ai 一键启动器 (open-ai-launcher.exe)
-==========================================
+open-ai 一键启动器 (open-ai-launcher.exe) —— v2.5 新架构版
+==========================================================
 双击后自动完成"一键启动", 全程不弹任何终端/控制台窗口:
-  1. 后台启动网关 (Node 后端 18787 + Python 网关 8000) —— 复用 start_hidden.ps1, 窗口隐藏
-  2. 打开账号管理图形界面 (gui_account_manager.py, 用 pythonw.exe 无窗口运行)
+  1. 首次运行自动构建品牌化运行时 (runtime/, procname.py)
+  2. 启动后台服务 (bootstrap.py start, 幂等)
+  3. 打开账号管理图形界面 (open-ai-manager.exe / pythonw.exe 无窗口)
 
 exe 放在安装目录根下, 双击即用。自身所在目录即安装目录, 因此兼容
 本机项目目录 与 朋友机器的 C:\\open-ai 安装目录, 无需改任何路径。
@@ -40,27 +41,41 @@ def install_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def start_gateway_hidden(root):
-    """用 PowerShell 隐藏窗口执行 start_hidden.ps1, 后台启动网关 + Node 后端。"""
-    ps1 = os.path.join(root, 'start_hidden.ps1')
-    if not os.path.isfile(ps1):
-        return False, '未找到 start_hidden.ps1'
-    # 隐藏窗口 + 隐藏 PowerShell 控制台
-    rc, out = run_cmd(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                       '-WindowStyle', 'Hidden', '-File', ps1], timeout=300)
-    return rc == 0, out
+def start_services(root):
+    """用 Broker 托管模式启动后台服务 (bootstrap.py start, 幂等)。"""
+    shim = os.path.join(root, 'runtime', 'Scripts', 'open-ai-daemon.exe')
+    py = os.path.join(root, '.venv', 'Scripts', 'python.exe')
+    bootstrap = os.path.join(root, 'bootstrap.py')
+    if os.path.isfile(shim):
+        return run_cmd([shim, bootstrap, 'start'], timeout=300)
+    if os.path.isfile(py):
+        return run_cmd([py, bootstrap, 'start'], timeout=300)
+    return False, '未找到 runtime shim 或 .venv (请先运行 start.bat 完成安装)'
 
 
 def open_account_manager(root):
-    """用 pythonw.exe 打开账号管理 GUI (无控制台窗口)。"""
+    """用品牌化 manager shim (或 pythonw 兜底) 打开账号管理 GUI。"""
+    manager = os.path.join(root, 'runtime', 'Scripts', 'open-ai-manager.exe')
     pyw = os.path.join(root, '.venv', 'Scripts', 'pythonw.exe')
-    if not os.path.isfile(pyw):
-        pyw = 'pythonw.exe'  # 兜底: 用系统 pythonw
     gui = os.path.join(root, 'scripts', 'gui_account_manager.py')
     if not os.path.isfile(gui):
         return False, '未找到 scripts/gui_account_manager.py'
+    # 显式 Tcl/Tk 数据目录 (runtime 内副本), 根治 Store 版 init.tcl 探测失败
+    env = dict(os.environ)
+    tcl = os.path.join(root, 'runtime', 'tcl', 'tcl8.6')
+    tk = os.path.join(root, 'runtime', 'tcl', 'tk8.6')
+    if os.path.isfile(os.path.join(tcl, 'init.tcl')):
+        env['TCL_LIBRARY'] = tcl
+    if os.path.isdir(tk):
+        env['TK_LIBRARY'] = tk
     try:
-        subprocess.Popen([pyw, gui], cwd=os.path.join(root, 'scripts'),
+        if os.path.isfile(manager):
+            exe, args = manager, [gui]
+        elif os.path.isfile(pyw):
+            exe, args = pyw, [gui]
+        else:
+            return False, '未找到 open-ai-manager.exe / pythonw.exe'
+        subprocess.Popen([exe] + args, cwd=root, env=env,
                          creationflags=_NO_WINDOW)
         return True, ''
     except Exception as e:
@@ -70,19 +85,24 @@ def open_account_manager(root):
 def main():
     root = install_dir()
 
-    # 1. 后台启动网关 (隐藏窗口)
-    ok, out = start_gateway_hidden(root)
+    # 1. 首次运行确保 runtime 构建 (品牌化 shim)
+    py = os.path.join(root, '.venv', 'Scripts', 'python.exe')
+    if not os.path.isfile(os.path.join(root, 'runtime', 'Scripts',
+                                       'open-ai-daemon.exe')) and os.path.isfile(py):
+        run_cmd([py, os.path.join(root, 'procname.py')], timeout=300)
+
+    # 2. 后台启动服务 (Broker, 幂等)
+    ok, out = start_services(root)
     if not ok:
-        # 网关启动失败: 写错误日志, 但仍尝试打开账号管理
         try:
             logs = os.path.join(root, 'logs')
             os.makedirs(logs, exist_ok=True)
             with open(os.path.join(logs, 'launcher.err.log'), 'a', encoding='utf-8') as f:
-                f.write('网关启动失败: %s\n' % out[-500:])
+                f.write('服务启动失败: %s\n' % out[-500:])
         except Exception:
             pass
 
-    # 2. 打开账号管理窗口
+    # 3. 打开账号管理窗口 (托盘常驻)
     open_account_manager(root)
 
     return 0

@@ -209,6 +209,41 @@ def renew_trae_tokens(cfg, force=False, device_id=''):
 
 # ================= WorkBuddy 签到 =================
 
+
+
+def today_str():
+    return time.strftime('%Y-%m-%d')
+
+
+def _wb_pack_credited_today(acc, domain, product):
+    """检查该 WB 账号今天是否有入账的资源包 (签到积分到账的真实凭证)。"""
+    headers = {
+        'Accept': 'application/json', 'Content-Type': 'application/json',
+        'Authorization': f"Bearer {acc.get('accessToken', '')}",
+        'X-User-Id': acc.get('userId', ''),
+        'X-Domain': domain, 'X-Product': product,
+        # ⚠️ 不能带 X-Enterprise-Id: 会切到企业视角, 个人资源包被隐藏
+        'User-Agent': UA_WB,
+    }
+    code, raw = post_json('https://copilot.tencent.com/billing/meter/get-user-resource', headers)
+    if code != 200:
+        return True   # 查询失败时保守放行, 不阻断正常流程
+    try:
+        d = json.loads(raw)
+        accounts = d['data']['Response']['Data']['Accounts']
+    except Exception:
+        return True
+    today = time.strftime('%Y-%m-%d')
+    for a in accounts:
+        ct = a.get('CreateTime')
+        try:
+            if time.strftime('%Y-%m-%d', time.localtime(float(ct) / 1000)) == today:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def wb_checkin_one(acc, domain, product):
     uid = acc.get('userId', '?')
     headers = {
@@ -248,7 +283,24 @@ def wb_checkin_one(acc, domain, product):
         streak = (result.get('data') or {}).get('streak_days', '')
         log('WB签到', f'账号{uid} 签到成功! credit={credit} streak={streak}')
     elif c == 10001:
-        log('WB签到', f'账号{uid} 今日已签到(10001)')
+        # ⚠️ 10001 不能盲信为"已签": 实测 0 点跨天边界服务端会误报 10001,
+        # 而实际积分没到账 (当日无入账资源包)。用资源包校验, 无入账则补领一次。
+        if _wb_pack_credited_today(acc, domain, product):
+            log('WB签到', f'账号{uid} 今日已签到(10001, 资源包已入账)')
+        else:
+            log('WB签到', f'账号{uid} 10001 但无入账包(疑似跨天误报), 补领...')
+            time.sleep(3)
+            code2, raw2 = post_json(base + '/billing/meter/daily-checkin', headers)
+            try:
+                r2 = json.loads(raw2)
+            except Exception:
+                r2 = {}
+            if r2.get('code') == 0:
+                credit2 = (r2.get('data') or {}).get('credit', '')
+                log('WB签到', f'账号{uid} 补领成功! credit={credit2}')
+            else:
+                log('WB签到', f'账号{uid} 补领仍失败 code={r2.get("code")} '
+                              f'(若持续, 检查 {today_str()} 资源包是否入账)')
     elif c == 400:
         log('WB签到', f'账号{uid} 今日已签到(HTTP 400/重复领取)')
     else:
@@ -344,6 +396,7 @@ def main():
     force = '--force' in sys.argv
     do_renew = '--no-renew' not in sys.argv
     trae_only = '--trae-only' in sys.argv
+    wb_only = '--wb-only' in sys.argv
     results = []
 
     # 统一配置: open-ai/config.json
@@ -355,6 +408,21 @@ def main():
 
     # 缺失 device_id 的账号自动分配七位随机数并写回 config (多账号各配独立设备)
     ensure_account_device_ids(trae, openai_cfg)
+
+    # --wb-only: 仅供 daemon 白天补签 WorkBuddy (跳过续期与 TRAE)
+    if wb_only:
+        wb = providers.get('workbuddy') or {}
+        wb_accs = wb.get('accounts') or []
+        domain = wb.get('domain', 'www.workbuddy.cn')
+        product = wb.get('product', 'SaaS')
+        log('WB签到', f'--wb-only 补签检查 ({len(wb_accs)} 个账号)')
+        for acc in wb_accs:
+            if not _wb_pack_credited_today(acc, domain, product):
+                wb_checkin_one(acc, domain, product)
+            else:
+                log('WB签到', f"账号{acc.get('userId', '?')} 今日已入账, 跳过")
+        log('WB补签', '本轮补签检查完成')
+        sys.exit(0)
 
     # --trae-only: 仅供 daemon 白天补试 TRAE, 跳过续期与 WB
     if not trae_only:

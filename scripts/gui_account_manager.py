@@ -19,7 +19,24 @@ open-ai 账号管理 - 图形界面版 (Tkinter)
   - 固定与隐藏互相独立, 持久化于 data/model_view_state.json (key: TRAE=config_name,
     WorkBuddy=model_id); 上游更新后新模型正常进入列表, 已消失的 key 自动惰性清理
   - 底部「显示已隐藏模型」勾选框: hidden>0 显示计数; 勾选后隐藏行灰显可恢复
-页面4「操作日志」: 点击该页签才显示操作日志
+页面4「查看积分消耗」(位于 模型列表 与 设置 之间):
+  - 今日情况: 上半部分显示今日获取/消耗积分, 下半部分为逐笔消耗流水
+    (账号+模型+时间+消耗量, 如 "TRAE_7593  GLM-5.3-Flash  2026/08/31 19:53  0.87")
+  - 每周情况: 优先显示本周, 可回看最近 3 周; 上半部分为该周获取/消耗积分,
+    下半部分柱状图显示每天消耗 (红=TRAE 通道, 蓝=WorkBuddy 通道, 悬停显示具体数值,
+    柱顶显示当日合计); 数据源 data/usage_history.db
+  - 流水由 daemon 每 5 分钟自动采集, 本地缓存保留 1 个月
+页面5「操作日志」: 点击该页签才显示操作日志
+
+窗口生命周期 (v2.5, 抖音式托盘应用行为):
+  - 启动时创建系统托盘图标 (scripts/tray_icon.py, 纯 Win32 零依赖)
+  - 点击窗口 X = 最小化到托盘: 隐藏主窗口 (任务栏图标随之消失),
+    后端服务 (Broker/gateway/trae) 继续运行
+  - 左键点击托盘图标: 恢复主窗口并置于前台 (任务栏图标随之恢复);
+    后端离线时自动回填账号/API/模型/积分数据
+  - 托盘右键菜单: 「显示主窗口」/「退出」
+  - 托盘「退出」= 彻底退出: IPC 请求 Broker 优雅关闭全部后端 →
+    写停止标记抑制 watchdog 复活 → 销毁托盘 → 退出进程
 """
 # ---- 必须在 import tkinter 之前设置 AppUserModelID ----
 # 否则 Microsoft Store 版 Python 的 pythonw.exe 任务栏会显示 Python 默认图标
@@ -31,21 +48,48 @@ except Exception:
 
 import json
 import os
+import queue
+import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import queue
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 # ---- 复用控制台版账号管理器的积分查询逻辑 ----
 import account_manager as am
 import api_store
 
+# ---- 系统托盘 (抖音式窗口行为; Windows only, 失败自动降级为普通窗口) ----
+try:
+    import tray_icon
+except ImportError:
+    try:
+        sys.path.insert(0, BASE)          # 直接跑脚本时补 scripts 目录
+        import tray_icon
+    except Exception:
+        tray_icon = None
+
+# ---- IPC 客户端 (托盘「退出」时请求 Broker 优雅关闭后端) ----
+try:
+    import ipc as ipc_mod
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import ipc as ipc_mod
+    except Exception:
+        ipc_mod = None
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 OPENAI_CFG = am.OPENAI_CFG
-VENV_PY = am.OPENAI_VENV_PY if os.path.isfile(am.OPENAI_VENV_PY) else sys.executable
+# v2.4: 登录等短命脚本用 task shim (任务管理器显示 open-ai 品牌而非 python.exe)
+_OPENAI_TASK_SHIM = os.path.join(BASE, '..', 'runtime', 'Scripts',
+                                 'open-ai-task.exe')
+VENV_PY = (_OPENAI_TASK_SHIM if os.path.isfile(_OPENAI_TASK_SHIM)
+           else (am.OPENAI_VENV_PY if os.path.isfile(am.OPENAI_VENV_PY)
+                 else sys.executable))
 
 # ---- 模型列表视图状态 (固定/隐藏) 持久化 ----
 # 存储文件: data/model_view_state.json, 结构 {"pinned": {"trae": [key..], "workbuddy": [key..]},
@@ -54,6 +98,23 @@ VENV_PY = am.OPENAI_VENV_PY if os.path.isfile(am.OPENAI_VENV_PY) else sys.execut
 # 固定与隐藏互相独立; 上游更新后仍存在的 key 自动生效, 已消失的 key 惰性清理。
 MODEL_STATE_PATH = os.path.join(os.path.dirname(BASE), 'data', 'model_view_state.json')
 MODEL_PROVIDERS = ('trae', 'workbuddy')
+
+# ---- 托盘退出状态标记 (抑制 watchdog 复活) ----
+# 彻底退出时写 data/.gui_exit_suppress (内容=时间戳), watchdog_boot.py 每次运行
+# 时检查: 距标记时间 < WATCHDOG_SUPPRESS_SECONDS 则不拉起 Broker (自然过期)。
+ROOT_DIR = os.path.dirname(BASE)
+WATCHDOG_SUPPRESS_FLAG = os.path.join(ROOT_DIR, 'data', '.gui_exit_suppress')
+WATCHDOG_SUPPRESS_SECONDS = 600      # 抑制窗口 10 分钟 (2 个巡检周期 + 富余)
+
+
+def _exit_log(msg):
+    """退出链路诊断日志 (logs/gui_exit.log) —— 退出故障首查此文件。"""
+    try:
+        with open(os.path.join(ROOT_DIR, 'logs', 'gui_exit.log'),
+                  'a', encoding='utf-8') as f:
+            f.write('[%s] %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg))
+    except Exception:
+        pass
 
 
 def load_model_state():
@@ -206,8 +267,7 @@ class AccountManagerApp:
         root.title('open-ai 账号管理')
         root.geometry('760x620')
         root.minsize(600, 480)
-        # 设置窗口图标 (任务栏/标题栏)
-        self._set_icon(root)
+        # (窗口图标在托盘装配段统一设置: _set_icon 同时返回 HWND 供 WM_CLOSE 拦截)
 
         self.busy = False
         self.result_q = queue.Queue()
@@ -216,6 +276,16 @@ class AccountManagerApp:
         self._model_cache = {'trae': None, 'workbuddy': None}  # 最近一次成功拉取的模型行
         self._model_errs = {'trae': None, 'workbuddy': None}
         self._model_rerender_job = None  # 勾选框触发的重渲染防抖
+        # ---- 托盘生命周期状态 (v2.5) ----
+        self.tray = None
+        self._tray_active = False
+        self._exiting = False
+        self._finalized = False
+        self._main_hwnd = None
+        self._last_backend_ok = None
+        self._restore_msg_id = 0
+        # 无托盘降级模式: 窗口 X 无处可"最小化", 退回原生"关闭即退出"行为
+        self._trayless_mode = False
         root.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self._build_ui()
@@ -227,11 +297,416 @@ class AccountManagerApp:
         self.root.after(800, self.on_model_refresh)
         # 回读开机自启状态
         self._refresh_autostart_state()
+        # ---- v2.5 系统托盘: 窗口 X = 隐藏到托盘, 托盘退出 = 彻底退出 ----
+        try:
+            ok_icon, hwnd = self._set_icon(self.root)
+            self._main_hwnd = hwnd
+        except Exception:
+            ok_icon, hwnd = False, None
+        self._init_tray(hwnd if (tray_icon is not None and hwnd) else None)
+        # 托盘事件轮询 (主线程消费队列: 恢复/退出回调 + 退出进度日志)
+        self.root.after(100, self._poll_tray_events)
+        # 启动即最小化: --minimized 或 --tray 参数时直接隐藏到托盘
+        if ('--minimized' in sys.argv or '--tray' in sys.argv) and self._tray_active:
+            self.root.after(200, self.root.withdraw)
+            self._write_log('[托盘] 已以最小化模式启动 (托盘图标恢复界面)')
+        # 后端存活监测 (托盘提示 + 离线自动恢复数据)
+        self.root.after(2000, self._watch_backend)
+        # (无托盘降级模式下) 单实例唤醒请求轮询
+        if not self._tray_active and tray_icon is not None:
+            self._restore_msg_id = tray_icon.restore_msg_id()
+            self.root.after(500, self._poll_restore_requests)
+
+    def _watch_backend(self):
+        """每 3s 探测后端 (托盘提示联动 + 离线时自动回填界面数据)。
+
+        探测放后台线程执行 (connect 超时最长 1.2s), 结果经主线程调度
+        回填, 不阻塞 Tk 事件循环。
+        """
+        def probe():
+            alive = self._backend_alive_fast()
+
+            def apply():
+                try:
+                    was = self._last_backend_ok
+                    if was is False and alive:
+                        self._write_log('[状态] 后端已恢复在线, 刷新界面数据')
+                        self.refresh_account_list()
+                        self.refresh_api_list()
+                        self.on_cred_refresh()
+                    self._last_backend_ok = alive
+                except Exception:
+                    pass
+                self.root.after(3000, self._watch_backend)
+
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=probe, daemon=True,
+                         name='backend-probe').start()
+
+    def _poll_restore_requests(self):
+        """无托盘降级模式下, 轮询单实例恢复请求消息 (500ms)。"""
+        try:
+            if tray_icon.drain_restore_messages(self._restore_msg_id):
+                self._on_tray_restore()
+        except Exception:
+            pass
+        self.root.after(500, self._poll_restore_requests)
 
     def _on_close(self):
-        """窗口关闭: 保存模型视图状态后退出。"""
-        save_model_state(self.model_state)
-        self.root.destroy()
+        """窗口关闭 (X 按钮): 最小化到托盘而非退出。
+
+        抖音式行为 —— 不销毁窗口/不退出进程, 后端服务保持运行:
+          1. 保存模型视图状态 (数据不丢)
+          2. root.withdraw() 隐藏主窗口 → 任务栏图标同步消失
+          3. 托盘图标保留, 左键点击托盘即可恢复 (恢复时任务栏图标回来)
+        彻底退出请走托盘右键菜单「退出」(_on_tray_exit)。
+        """
+        try:
+            save_model_state(self.model_state)
+        except Exception:
+            pass
+        if self._trayless_mode:
+            # 托盘不可用 (初始化失败/非 Windows): 无处可收, 保持旧"关闭即退出"
+            self._trayless_close()
+            return
+        self.root.withdraw()
+
+    def _trayless_close(self):
+        """无托盘降级模式的旧式关闭: 询问是否连后端一起退出。"""
+        try:
+            if messagebox.askyesno(
+                    '退出 open-ai',
+                    '托盘不可用, 窗口关闭后界面将退出。\n\n'
+                    '是否同时停止后端服务 (网关/签到/守护)?\n'
+                    '· 是: 彻底退出 (与托盘「退出」相同)\n'
+                    '· 否: 仅关闭界面, 后端服务继续运行'):
+                threading.Thread(target=self._backend_cleanup_worker,
+                                 daemon=True, name='exit-cleanup').start()
+            else:
+                self.root.destroy()
+        except Exception:
+            self.root.destroy()
+
+    # ================= 托盘生命周期 (v2.5) =================
+
+    def _init_tray(self, hwnd=None):
+        """创建系统托盘图标 (失败时静默降级为普通窗口)。
+
+        v2.5.1 回调通道: 托盘事件放入线程安全队列, 由主线程
+        _poll_tray_events 每 60ms 消费 —— 不再跨线程调用 Tk.after
+        (部分 Tcl 线程配置下跨线程 after 会抛异常, 曾导致托盘回调
+        全部静默失效)。X 按钮关闭走 Tk 原生 WM_DELETE_WINDOW 协议
+        (_on_close), 不再启用 WM_CLOSE 子类化拦截。
+        """
+        if tray_icon is None:
+            self._trayless_mode = True
+            return
+        try:
+            self.tray = tray_icon.TrayIcon(
+                parent=self.root,
+                icon_path=os.path.join(ROOT_DIR, 'pic', 'open-ai.ico'),
+                tooltip='open-ai 网关运行中\n(后端服务常驻, 点此恢复界面)',
+                on_restore=self._on_tray_restore,
+                on_exit=self._on_tray_exit,
+                on_close_request=self._on_close,
+                main_hwnd=hwnd,
+                event_queue=self.result_q)   # 托盘事件 → 主线程队列轮询
+            self.tray.start()
+            self._tray_active = True
+            self.root.after(1500, self._refresh_tray_tooltip)
+        except Exception as e:
+            self.tray = None
+            self._tray_active = False
+            self._trayless_mode = True
+            try:
+                self._write_log(f'[托盘] 初始化失败(降级为普通窗口): {e}')
+            except Exception:
+                pass
+
+    def _poll_tray_events(self):
+        """主线程轮询消费托盘事件队列 ('tray' 标签回调, 每 60ms)。"""
+        try:
+            while True:
+                try:
+                    tag, cb = self.result_q.get_nowait()
+                except queue.Empty:
+                    break
+                if tag == 'tray' and callable(cb):
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+                else:
+                    self._write_log(str(cb))   # 普通日志消息
+        except Exception:
+            pass
+        if self.root and not self._finalized:
+            try:
+                self.root.after(60, self._poll_tray_events)
+            except Exception:
+                pass
+
+    def _refresh_tray_tooltip(self):
+        """托盘悬浮提示反映后端存活状态 (离线时提示点击恢复)。"""
+        if not (self.tray and self._tray_active):
+            return
+        try:
+            tip = ('open-ai 网关运行中\n(后端服务常驻, 点此恢复界面)'
+                   if self._backend_alive_fast()
+                   else 'open-ai 界面已最小化到托盘\n(点击恢复界面)')
+            self.tray.update_tooltip(tip)
+        except Exception:
+            pass
+        self.root.after(5000, self._refresh_tray_tooltip)
+
+    def _on_tray_restore(self):
+        """托盘左键单击 / 菜单「显示主窗口」: 恢复主窗口并置于前台。"""
+        try:
+            root = self.root
+            # 恢复窗口 → 任务栏图标同步回来; 若最小化先还原
+            root.deiconify()
+            try:
+                state = root.state()
+                if state in ('iconic', 'withdrawn'):
+                    root.state('normal')
+            except Exception:
+                pass
+            root.lift()
+            root.focus_force()
+            try:
+                import ctypes
+                hwnd = self._main_hwnd
+                if hwnd:
+                    user32 = ctypes.windll.user32
+                    user32.ShowWindow(hwnd, 9)            # SW_RESTORE
+                    user32.SetForegroundWindow(hwnd)      # 置于前台
+            except Exception:
+                pass
+            self.refresh_account_list()                   # 账号列表即时回填
+            self.refresh_api_list()
+            self.on_cred_refresh()                        # 消耗/积分回填
+            if (self._model_cache.get('trae') or self._model_cache.get('workbuddy')):
+                self._render_model_views()                # 模型列表回填
+        except Exception:
+            pass
+
+    def _on_tray_exit(self):
+        """托盘菜单「退出」: 彻底退出 (先清后端, 再销毁托盘与窗口)。"""
+        if self._exiting:
+            return
+        self._exiting = True
+        try:
+            self._write_log('[退出] 托盘退出触发, 正在彻底退出 ...')
+        except Exception:
+            pass
+        _exit_log('tray exit clicked -> starting cleanup worker')
+        # 后台线程执行清理, 主线程等待结果后收尾 (Tk 界面保持可响应)
+        threading.Thread(target=self._backend_cleanup_worker,
+                         daemon=True, name='exit-cleanup').start()
+
+    def _backend_cleanup_worker(self):
+        """彻底退出: 关闭后端 → 验证 → 强杀兜底 → 抑制标记 (后台线程)。
+
+        目标语义 (与普通桌面应用一致): 托盘「退出」后, 所有 open-ai
+        后台进程 (daemon/gateway/trae/task) 全部消失。四步:
+          1. IPC 请求 Broker 优雅关闭 (给在途请求收尾的机会)
+          2. 轮询等待: 管道消失 + 8000/18787 端口关闭 (优雅退出完成)
+          3. 仍存活 → 强杀兜底: terminate 全部 Job + Broker PID
+             (兼容 Broker 无响应/旧版本/僵死等一切情况)
+          4. 写 watchdog 抑制标记 (防计划任务复活)
+        """
+        confirmed = False
+        try:
+            # 1) IPC 优雅关闭请求
+            ok = False
+            try:
+                c = ipc_mod.PipeClient(timeout=3.0)
+                try:
+                    c.send({'type': 'request-shutdown', 'role': 'gui-tray',
+                            'pid': os.getpid(), 'reason': 'gui tray exit'})
+                    ok = True
+                finally:
+                    c.close()
+            except Exception as e:
+                _exit_log('ipc shutdown request failed: %r' % e)
+                self.result_q.put(f'[退出] IPC 关闭请求失败: {e}')
+            # 2) 等优雅退出: 管道消失 + 端口全关 (最多 ~8s)
+            deadline = time.time() + (8.0 if ok else 0.0)
+            while time.time() < deadline:
+                if self._pipe_gone() and self._all_ports_closed():
+                    confirmed = True
+                    break
+                time.sleep(0.4)
+            if not confirmed and ok:
+                # 再给 2s 余量 (Job 兜底也可能稍慢)
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    if self._pipe_gone() and self._all_ports_closed():
+                        confirmed = True
+                        break
+                    time.sleep(0.4)
+            # 3) 强杀兜底: 还有任何 open-ai 进程残留 → Job/PID 级清零
+            if not confirmed:
+                _exit_log('graceful shutdown incomplete, hard fallback')
+                self.result_q.put('[退出] 优雅退出未完成, 执行强制清理...')
+                self._hard_kill_all()
+            # 4) 写 watchdog 抑制标记 (防计划任务 5 分钟内复活全部进程)
+            self._write_suppress_flag()
+            self.result_q.put('[退出] 后端已%s, 正在销毁托盘并退出...'
+                              % ('优雅关闭' if confirmed else '强制清理完成'))
+        except Exception as e:
+            _exit_log('cleanup worker error: %r' % e)
+            try:
+                self._hard_kill_all()          # 异常路径也保证清零
+                self._write_suppress_flag()
+            except Exception:
+                pass
+        finally:
+            _exit_log('cleanup done (confirmed=%s) -> final exit' % confirmed)
+            self._finalized = True
+            try:
+                self.root.after(0, self._final_exit)
+            except Exception:
+                _exit_log('root.after failed, hard exit')
+                os._exit(0)
+            # 双保险: after 若被吞 (历史跨线程问题), 最多 5s 后强制硬退出
+            time.sleep(5)
+            _exit_log('watchdog: final_exit not ran in 5s, hard exit')
+            os._exit(0)
+
+    def _all_ports_closed(self):
+        """8000/18787 都不再监听 (子进程已全部退出)。"""
+        return not self._backend_alive_fast()
+
+    def _hard_kill_all(self):
+        """强杀兜底: 按 bootstrap stop 语义清零整棵 open-ai 进程树。
+
+        顺序: 全部 leaf/root Job terminate → Broker PID (状态文件) →
+        最后再用端口归属校验 (Job 已覆盖; 此处仅兜底)。
+        """
+        try:
+            if ROOT_DIR not in sys.path:
+                sys.path.insert(0, ROOT_DIR)
+            import jobmgmt
+            killed = []
+            for name in ('open-ai.gateway', 'open-ai.trae', 'open-ai.task',
+                         'open-ai.tree'):
+                try:
+                    j = jobmgmt.open_job(name)
+                    if j:
+                        pids = j.pids()
+                        j.terminate()
+                        j.close()
+                        if pids:
+                            killed.extend(pids)
+                except Exception:
+                    pass
+            # Broker 本体 (root job 已覆盖; 状态文件 PID 再补一刀)
+            try:
+                import json as _json
+                with open(os.path.join(ROOT_DIR, 'data',
+                                       'runtime_state.json'),
+                          encoding='utf-8') as f:
+                    pid = (_json.load(f) or {}).get('broker_pid')
+                if pid and pid not in killed:
+                    killed.append(pid)
+            except Exception:
+                pass
+            time.sleep(0.8)                   # 给内核终止留时间
+            for pid in killed:
+                self._terminate_pid(pid)
+            _exit_log('hard kill done: %s' % killed)
+        except Exception as e:
+            _exit_log('hard kill error: %r' % e)
+
+    @staticmethod
+    def _terminate_pid(pid):
+        """TerminateProcess 单进程 (bootstrap.py 同款实现)。"""
+        try:
+            import ctypes
+            k = ctypes.WinDLL('kernel32')
+            k.OpenProcess.restype = ctypes.c_void_p
+            k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                      ctypes.c_uint32]
+            h = k.OpenProcess(0x0001, False, int(pid))   # PROCESS_TERMINATE
+            if h:
+                k.TerminateProcess(h, 1)
+                k.CloseHandle(h)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _pipe_gone(self):
+        """判断 Broker IPC 管道是否已消失 (优雅退出完成信号)。"""
+        try:
+            c = ipc_mod.PipeClient(timeout=1.0)
+            c.close()
+            return False
+        except Exception:
+            return True
+
+    def _backend_alive_fast(self):
+        """快速探测后端是否在线 (TCP connect, 0.6s 超时)。"""
+        for port in (8000, 18787):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.6)
+            try:
+                s.connect(('127.0.0.1', port))
+                return True
+            except Exception:
+                pass
+            finally:
+                s.close()
+        return False
+
+    def _write_suppress_flag(self):
+        """写 watchdog 抑制标记: 防止计划任务在退出后立刻复活 Broker。"""
+        try:
+            os.makedirs(os.path.dirname(WATCHDOG_SUPPRESS_FLAG), exist_ok=True)
+            with open(WATCHDOG_SUPPRESS_FLAG, 'w', encoding='utf-8') as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+
+    @staticmethod
+    def suppress_watchdog():
+        """供 watchdog_boot.py 判断: 最近是否有 GUI 主动退出的抑制标记。"""
+        try:
+            with open(WATCHDOG_SUPPRESS_FLAG, 'r', encoding='utf-8') as f:
+                ts = float(f.read().strip() or 0)
+            return (time.time() - ts) < WATCHDOG_SUPPRESS_SECONDS
+        except Exception:
+            return False
+
+    def _final_exit(self):
+        """彻底退出收尾 (Tk 主线程): 销毁托盘 → 销毁窗口 → 结束进程。"""
+        _exit_log('final exit begin')
+        self._finalized = True
+        try:
+            if self.tray:
+                self.tray.destroy()               # 销毁托盘图标
+                self.tray = None
+        except Exception:
+            pass
+        try:
+            self._write_log('[退出] 再见。')
+            save_model_state(self.model_state)
+        except Exception:
+            pass
+        try:
+            self.root.destroy()                    # 销毁主窗口
+        except Exception:
+            pass
+        _exit_log('final exit complete, os._exit(0)')
+        try:
+            os._exit(0)                             # 确保托盘线程不阻塞进程
+        except Exception:
+            pass
 
     def _set_icon(self, root):
         """设置窗口/任务栏图标为软件 logo (多层兜底)。
@@ -241,10 +716,13 @@ class AccountManagerApp:
         不够, 还要设窗口类图标 (SetClassLongPtrW) 并给窗口本身显式绑定
         AppUserModelID (SHGetPropertyStoreForWindow + SetValue), Explorer
         才会改用窗口自己的图标渲染任务栏按钮。
+        返回: (图标设置成功与否, 顶层窗口 HWND 或 None)。HWND 供托盘
+        组件做 WM_CLOSE 子类化拦截 (X 按钮 → 隐藏到托盘)。
         """
         ico_path = os.path.join(os.path.dirname(BASE), 'pic', 'open-ai.ico')
         if not os.path.exists(ico_path):
-            return
+            return False, None
+        hwnd = None
         try:
             root.iconbitmap(default=ico_path)
         except Exception:
@@ -271,7 +749,6 @@ class AccountManagerApp:
             root.update_idletasks()
             # tkinter 顶层窗口 HWND = GetParent(root.winfo_id())
             hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
-
             # 1) 给顶层窗口显式绑定 AppUserModelID (任务栏按窗口 AUMID 归组)
             #    无快捷方式时 Explorer 回落用窗口自身图标而非 exe 图标
             try:
@@ -356,8 +833,9 @@ class AccountManagerApp:
                     user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, hicon16)
             except Exception:
                 pass
+            return True, hwnd
         except Exception:
-            pass
+            return False, None
 
     # ---------- 界面搭建 ----------
     def _build_ui(self):
@@ -482,19 +960,382 @@ class AccountManagerApp:
             bg='#f0f0f0', activebackground='#f0f0f0')
         self.chk_show_hidden.pack(side='right', padx=5)
 
+        # ---- 页面: 查看积分消耗 (位于 模型列表 与 设置 之间) ----
+        page_cred = ttk.Frame(self.notebook)
+        self.notebook.add(page_cred, text='查看积分消耗')
+        self._build_credits_page(page_cred, pad)
+
         # ---- 页面4: 设置 ----
         page_set = ttk.Frame(self.notebook)
         self.notebook.add(page_set, text='设置')
 
         self._build_settings_page(page_set, pad)
 
-        # ---- 页面4: 操作日志 ----
+        # ---- 页面: 操作日志 ----
         page_log = ttk.Frame(self.notebook)
         self.notebook.add(page_log, text='操作日志')
         self.log = scrolledtext.ScrolledText(page_log, wrap='word',
                                              state='disabled', font=('Consolas', 9))
         self.log.pack(fill='both', expand=True, **pad)
+
         self.refresh_api_list()
+
+    # ---------- 查看积分消耗页 ----------
+    # 数据源: data/usage_history.db (daemon 每 5 分钟自动采集, 缓存保留 1 个月)
+    #   usage 表: 逐笔消耗 (platform/uid/entry_id/ts/model/credits/...)
+    #   gain  表: 每账号每日获取积分 (签到等, platform/uid/day/amount)
+
+    CRED_REFRESH_MS = 5 * 60 * 1000   # 流水数据每 5 分钟自动刷新一次
+    BAR_RED = '#e05555'               # 柱状图: TRAE 通道 (红)
+    BAR_BLUE = '#4a7fe0'              # 柱状图: WorkBuddy 通道 (蓝)
+
+    def _build_credits_page(self, page, pad):
+        # 顶部: 视图切换 + 状态提示
+        top = ttk.Frame(page)
+        top.pack(fill='x', **pad)
+        self.cred_view_var = tk.StringVar(value='today')
+        ttk.Radiobutton(top, text='今日情况', value='today',
+                        variable=self.cred_view_var,
+                        command=self.on_cred_view_change).pack(side='left')
+        ttk.Radiobutton(top, text='每周情况', value='week',
+                        variable=self.cred_view_var,
+                        command=self.on_cred_view_change).pack(side='left', padx=(10, 0))
+        self.cred_status_var = tk.StringVar(value='')
+        ttk.Label(top, textvariable=self.cred_status_var,
+                  foreground='#888888').pack(side='right')
+        # 每周模式: 周切换 (优先显示本周, 可回看最近 3 周)
+        self.cred_week_frame = ttk.Frame(top)
+        ttk.Button(self.cred_week_frame, text='◀ 上一周',
+                   command=lambda: self.on_cred_week_shift(-1)).pack(side='left', padx=(20, 2))
+        self.cred_week_label_var = tk.StringVar(value='')
+        ttk.Label(self.cred_week_frame, textvariable=self.cred_week_label_var,
+                  font=('Microsoft YaHei UI', 10, 'bold')).pack(side='left', padx=4)
+        ttk.Button(self.cred_week_frame, text='下一周 ▶',
+                   command=lambda: self.on_cred_week_shift(1)).pack(side='left', padx=2)
+
+        # 上半部分: 获取积分 / 消耗积分 两块汇总
+        summary = ttk.Frame(page)
+        summary.pack(fill='x', **pad)
+        self.cred_gain_frame = ttk.LabelFrame(summary, text='今日获取积分')
+        self.cred_gain_frame.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        self.cred_gain_var = tk.StringVar(value='--')
+        ttk.Label(self.cred_gain_frame, textvariable=self.cred_gain_var,
+                  font=('Microsoft YaHei UI', 22, 'bold'),
+                  foreground='#2e8b57').pack(padx=12, pady=8)
+        self.cred_use_frame = ttk.LabelFrame(summary, text='今日消耗积分')
+        self.cred_use_frame.pack(side='left', fill='x', expand=True, padx=(6, 0))
+        self.cred_use_var = tk.StringVar(value='--')
+        ttk.Label(self.cred_use_frame, textvariable=self.cred_use_var,
+                  font=('Microsoft YaHei UI', 22, 'bold'),
+                  foreground='#c0392b').pack(padx=12, pady=8)
+
+        # 下半部分:
+        #   今日模式 → 流水列表 (账号+模型+时间+消耗量)
+        #   每周模式 → 柱状图 (每天消耗, 红=TRAE 蓝=WorkBuddy)
+        self.cred_list_frame = ttk.LabelFrame(page, text='积分消耗流水')
+        self.cred_list_frame.pack(fill='both', expand=True)   # 今日模式默认显示
+        cols = ('account', 'model', 'time', 'amount')
+        self.tree_cred = ttk.Treeview(self.cred_list_frame, columns=cols,
+                                      show='headings', height=13)
+        for col, text, width, anchor in (
+                ('account', '账号', 160, 'w'),
+                ('model', '模型', 180, 'w'),
+                ('time', '时间', 170, 'center'),
+                ('amount', '消耗量', 120, 'e')):
+            self.tree_cred.heading(col, text=text)
+            self.tree_cred.column(col, width=width, anchor=anchor)
+        vsb = ttk.Scrollbar(self.cred_list_frame, orient='vertical', command=self.tree_cred.yview)
+        self.tree_cred.configure(yscrollcommand=vsb.set)
+        self.tree_cred.pack(side='left', fill='both', expand=True, padx=(4, 0), pady=4)
+        vsb.pack(side='left', fill='y', pady=4)
+
+        self.cred_chart_frame = ttk.LabelFrame(page, text='本周每日消耗 (红=TRAE 通道, 蓝=WorkBuddy 通道)')
+        self.cred_canvas = tk.Canvas(self.cred_chart_frame, height=300, bg='white',
+                                     highlightthickness=0)
+        self.cred_canvas.pack(fill='both', expand=True, padx=4, pady=4)
+        # 柱状图 tooltip (悬停红/蓝段显示具体积分)
+        self.cred_tip = tk.Toplevel(self.root)
+        self.cred_tip.withdraw()
+        self.cred_tip.overrideredirect(True)
+        self.cred_tip_lbl = tk.Label(self.cred_tip, text='', bg='#ffffe0',
+                                     relief='solid', borderwidth=1,
+                                     font=('Microsoft YaHei UI', 9))
+        self.cred_tip_lbl.pack()
+        self.cred_canvas.bind('<Motion>', self.on_cred_chart_motion)
+        self.cred_canvas.bind('<Leave>', lambda e: self.cred_tip.withdraw())
+        # 柱状图命中区域 (画图时记录)
+        self._cred_bars = []   # [(x1,y1,x2,y2, platform, amount, day)]
+        # 周偏移: 0=本周, -1=上周, -2=上上周 (最多回看 3 周)
+        self.cred_week_offset = 0
+
+        # 立即刷新一次 + 每 5 分钟定时自动刷新
+        self.on_cred_refresh()
+        self.root.after(self.CRED_REFRESH_MS, self._cred_auto_refresh)
+
+    def _cred_auto_refresh(self):
+        try:
+            self.on_cred_refresh()
+        except Exception:
+            pass
+        self.root.after(self.CRED_REFRESH_MS, self._cred_auto_refresh)
+
+    # ---- 数据查询 (本地缓存库) ----
+
+    def _cred_db(self):
+        # GUI 的 BASE 是 scripts/ 目录, 数据在项目根 data/ 下
+        db = os.path.join(os.path.dirname(BASE), 'data', 'usage_history.db')
+        if not os.path.isfile(db):
+            return None
+        return sqlite3.connect(db)
+
+    def _cred_week_range(self, offset_weeks=0):
+        """返回某周 (周一起始) 的 (周一, 周日) 日期串. offset_weeks 为负表示过去周。"""
+        import datetime
+        today = datetime.date.today()
+        monday = today - datetime.timedelta(days=today.weekday()) + datetime.timedelta(weeks=offset_weeks)
+        sunday = monday + datetime.timedelta(days=6)
+        return monday.strftime('%Y-%m-%d'), sunday.strftime('%Y-%m-%d')
+
+    def _cred_gain_sum(self, start_day, end_day):
+        """某日期段 (闭区间) 获取积分合计。无缓存库返回 None。"""
+        conn = self._cred_db()
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                'SELECT COALESCE(SUM(amount),0) FROM gain WHERE day >= ? AND day <= ?',
+                (start_day, end_day)).fetchone()
+            return float(row[0] or 0)
+        finally:
+            conn.close()
+
+    def _cred_usage_sum(self, start_day, end_day):
+        """某日期段 (闭区间) 消耗积分合计. 返回 {'trae': x, 'workbuddy': y}。无缓存库返回 None。"""
+        conn = self._cred_db()
+        if conn is None:
+            return None
+        t0 = int(time.mktime(time.strptime(start_day, '%Y-%m-%d')))
+        t1 = int(time.mktime(time.strptime(end_day, '%Y-%m-%d'))) + 86399
+        try:
+            rows = conn.execute(
+                'SELECT platform, COALESCE(SUM(credits),0) FROM usage '
+                'WHERE ts >= ? AND ts <= ? GROUP BY platform', (t0, t1)).fetchall()
+            out = {'trae': 0.0, 'workbuddy': 0.0}
+            for plat, total in rows:
+                if plat in out:
+                    out[plat] = float(total or 0)
+            return out
+        finally:
+            conn.close()
+
+    def _cred_usage_rows(self, start_day, end_day, limit=2000):
+        """某日期段逐笔消耗流水 (新→旧)。返回 [(账号, 模型, 时间串, 消耗量)]。"""
+        conn = self._cred_db()
+        if conn is None:
+            return []
+        t0 = int(time.mktime(time.strptime(start_day, '%Y-%m-%d')))
+        t1 = int(time.mktime(time.strptime(end_day, '%Y-%m-%d'))) + 86399
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT platform, uid, model, ts, credits FROM usage '
+                'WHERE ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?',
+                (t0, t1, limit)).fetchall()
+            out = []
+            for r in rows:
+                acct = f"{'TRAE' if r['platform'] == 'trae' else 'WB'}_{r['uid'][-4:]}"
+                t = time.strftime('%Y/%m/%d %H:%M', time.localtime(r['ts']))
+                out.append((acct, r['model'] or '-', t, float(r['credits'] or 0)))
+            return out
+        finally:
+            conn.close()
+
+    # ---- 事件处理 ----
+
+    def on_cred_view_change(self):
+        today_mode = self.cred_view_var.get() == 'today'
+        self.cred_week_frame.pack_forget()
+        if not today_mode:
+            self.cred_week_frame.pack(side='left')
+        self.cred_list_frame.pack_forget()
+        self.cred_chart_frame.pack_forget()
+        if today_mode:
+            self.cred_list_frame.pack(fill='both', expand=True)
+        else:
+            self.cred_chart_frame.pack(fill='both', expand=True)
+        self.on_cred_refresh()
+
+    def on_cred_week_shift(self, delta):
+        # 允许回看最近 3 周 (offset ∈ [-2, 0])
+        self.cred_week_offset = max(-2, min(0, self.cred_week_offset + delta))
+        self.on_cred_refresh()
+
+    def on_cred_refresh(self):
+        if not hasattr(self, 'cred_gain_var'):
+            return
+        try:
+            if self.cred_view_var.get() == 'today':
+                self._cred_refresh_today()
+            else:
+                self._cred_refresh_week()
+        except Exception as e:
+            self.cred_status_var.set(f'刷新失败: {e}')
+
+    def _cred_refresh_today(self):
+        import datetime
+        day = datetime.date.today().strftime('%Y-%m-%d')
+        # 从每周模式切回时复位汇总框标题 (bug1: 之前会残留"本周")
+        self.cred_gain_frame.configure(text='今日获取积分')
+        self.cred_use_frame.configure(text='今日消耗积分')
+        gain = self._cred_gain_sum(day, day)
+        use = self._cred_usage_sum(day, day)
+        if gain is None or use is None:
+            self.cred_status_var.set('本地缓存尚未生成 (daemon 每 5 分钟自动采集)')
+            self.cred_gain_var.set('--')
+            self.cred_use_var.set('--')
+        else:
+            self.cred_status_var.set(time.strftime('更新于 %H:%M:%S'))
+            self.cred_gain_var.set(f'{gain:.0f}')
+            self.cred_use_var.set(f"{use['trae'] + use['workbuddy']:.2f}")
+        # 流水列表
+        rows = self._cred_usage_rows(day, day)
+        self.tree_cred.delete(*self.tree_cred.get_children())
+        for acct, model, t, amount in rows:
+            self.tree_cred.insert('', 'end', values=(acct, model, t, f'{amount:.2f}'))
+
+    def _cred_refresh_week(self):
+        start_day, end_day = self._cred_week_range(self.cred_week_offset)
+        import datetime
+        monday = datetime.date(*[int(x) for x in start_day.split('-')])
+        sunday = datetime.date(*[int(x) for x in end_day.split('-')])
+        self.cred_week_label_var.set('本周' if self.cred_week_offset == 0
+                                     else f"{monday.strftime('%m/%d')} - {sunday.strftime('%m/%d')}")
+        gain = self._cred_gain_sum(start_day, end_day)
+        use = self._cred_usage_sum(start_day, end_day)
+        if gain is None or use is None:
+            self.cred_status_var.set('本地缓存尚未生成')
+            self.cred_gain_var.set('--')
+            self.cred_use_var.set('--')
+            return
+        self.cred_status_var.set(time.strftime('更新于 %H:%M:%S'))
+        self.cred_gain_var.set(f'{gain:.0f}')
+        self.cred_use_var.set(f"{use['trae'] + use['workbuddy']:.2f}")
+        # 汇总框标题: 本周显示"本周", 回看历史周显示日期范围
+        if self.cred_week_offset == 0:
+            g_title, u_title = '本周获取积分', '本周消耗积分'
+        else:
+            rng = f'({start_day[5:].replace("-", "/")} ~ {end_day[5:].replace("-", "/")})'
+            g_title, u_title = f'获取积分 {rng}', f'消耗积分 {rng}'
+        self.cred_gain_frame.configure(text=g_title)
+        self.cred_use_frame.configure(text=u_title)
+        self._cred_draw_chart(start_day, end_day)
+
+    def _cred_draw_chart(self, start_day, end_day):
+        """绘制本周柱状图: 每天一根柱, 红=TRAE 蓝=WorkBuddy 叠放, 柱顶显示当日合计。"""
+        import datetime
+        canvas = self.cred_canvas
+        canvas.delete('all')
+        self._cred_bars = []
+        # 查询该周每天两通道消耗
+        per_day = {}
+        conn = self._cred_db()
+        if conn is not None:
+            t0 = int(time.mktime(time.strptime(start_day, '%Y-%m-%d')))
+            t1 = int(time.mktime(time.strptime(end_day, '%Y-%m-%d'))) + 86399
+            try:
+                for plat, day, total in conn.execute(
+                        "SELECT platform, date(ts, 'unixepoch', 'localtime') AS d, "
+                        "COALESCE(SUM(credits),0) FROM usage "
+                        'WHERE ts >= ? AND ts <= ? GROUP BY platform, d', (t0, t1)):
+                    per_day.setdefault(day, {'trae': 0.0, 'workbuddy': 0.0})
+                    if plat in per_day[day]:
+                        per_day[day][plat] = float(total or 0)
+            finally:
+                conn.close()
+        days = []
+        d0 = datetime.date(*[int(x) for x in start_day.split('-')])
+        for i in range(7):
+            key = (d0 + datetime.timedelta(days=i)).strftime('%Y-%m-%d')
+            days.append((key, per_day.get(key, {'trae': 0.0, 'workbuddy': 0.0})))
+        # 布局
+        canvas.update_idletasks()
+        w = max(canvas.winfo_width(), 700)
+        h = max(canvas.winfo_height(), 260)
+        canvas.configure(width=w, height=h)
+        left, right, top, bottom = 56, 16, 36, 34
+        plot_w, plot_h = w - left - right, h - top - bottom
+        max_val = max(1.0, max(v['trae'] + v['workbuddy'] for _k, v in days))
+        for i in range(5):
+            val = max_val * i / 4
+            y = bottom + plot_h - plot_h * i / 4
+            canvas.create_line(left, y, left + plot_w, y, fill='#e0e0e0')
+            canvas.create_text(left - 6, y, text=f'{val:.0f}', anchor='e',
+                               font=('Microsoft YaHei UI', 8), fill='#888888')
+        slot = plot_w / 7
+        bar_w = min(64, slot * 0.5)
+        today_str = datetime.date.today().strftime('%Y-%m-%d')
+        for i, (key, v) in enumerate(days):
+            cx = left + slot * i + slot / 2
+            total = v['trae'] + v['workbuddy']
+            h_red = plot_h * (v['trae'] / max_val)
+            h_blue = plot_h * (v['workbuddy'] / max_val)
+            x1, x2 = cx - bar_w / 2, cx + bar_w / 2
+            yb_base = bottom + plot_h
+            if total > 0:
+                yb_top = yb_base - h_blue
+                yr_top = yb_top - h_red
+                if v['workbuddy'] > 0:
+                    canvas.create_rectangle(x1, yb_top, x2, yb_base, fill=self.BAR_BLUE,
+                                            outline='', tags=('bar',))
+                    self._cred_bars.append((x1, yb_top, x2, yb_base, 'workbuddy', v['workbuddy'], key))
+                if v['trae'] > 0:
+                    canvas.create_rectangle(x1, yr_top, x2, yb_top, fill=self.BAR_RED,
+                                            outline='', tags=('bar',))
+                    self._cred_bars.append((x1, yr_top, x2, yb_top, 'trae', v['trae'], key))
+                canvas.create_text(cx, yr_top - 9, text=f'{total:.1f}',
+                                   font=('Microsoft YaHei UI', 9, 'bold'), fill='#333333')
+            else:
+                canvas.create_line(x1, yb_base, x2, yb_base, fill='#cccccc')
+                canvas.create_text(cx, yb_base - 9, text='0', font=('Microsoft YaHei UI', 8),
+                                   fill='#aaaaaa')
+            # 横坐标: 日期 + 星期 (今天红色高亮)
+            d = datetime.date(*[int(x) for x in key.split('-')])
+            label = d.strftime('%m/%d')
+            wd = '一二三四五六日'[d.weekday()]
+            hot = '#c0392b' if key == today_str else '#555555'
+            canvas.create_text(cx, bottom + plot_h + 8, text=label,
+                               font=('Microsoft YaHei UI', 9), fill=hot)
+            canvas.create_text(cx, bottom + plot_h + 22, text=wd,
+                               font=('Microsoft YaHei UI', 8),
+                               fill='#c0392b' if key == today_str else '#999999')
+        # 图例
+        lx = left + 4
+        canvas.create_rectangle(lx, 8, lx + 12, 20, fill=self.BAR_RED, outline='')
+        canvas.create_text(lx + 17, 14, text='TRAE 通道', anchor='w',
+                           font=('Microsoft YaHei UI', 8), fill='#555555')
+        lx2 = lx + 100
+        canvas.create_rectangle(lx2, 8, lx2 + 12, 20, fill=self.BAR_BLUE, outline='')
+        canvas.create_text(lx2 + 17, 14, text='WorkBuddy 通道', anchor='w',
+                           font=('Microsoft YaHei UI', 8), fill='#555555')
+
+    def on_cred_chart_motion(self, event):
+        """柱状图悬停: 红/蓝段显示对应通道的具体积分消耗。"""
+        hit = None
+        for (x1, y1, x2, y2, plat, amount, day) in getattr(self, '_cred_bars', []):
+            if x1 - 2 <= event.x <= x2 + 2 and y1 - 2 <= event.y <= y2 + 2:
+                hit = (plat, amount, day)
+                break
+        if hit is None:
+            self.cred_tip.withdraw()
+            return
+        plat, amount, day = hit
+        name = 'TRAE 通道' if plat == 'trae' else 'WorkBuddy 通道'
+        self.cred_tip_lbl.configure(text=f'{day}\n{name}: {amount:.2f} 积分')
+        self.cred_tip.deiconify()
+        try:
+            self.cred_tip.geometry(f'+{event.x_root + 12}+{event.y_root + 12}')
+        except Exception:
+            pass
 
     # ---------- 设置页 ----------
     def _build_settings_page(self, page, pad):
@@ -701,9 +1542,11 @@ class AccountManagerApp:
         try:
             import subprocess as sp
             # --dir 传入当前安装目录: 安装器预填路径, 且保留该目录已有 config.json
+            # BREAKAWAY: 安装器须在 GUI 退出后继续运行 (不进 open-ai.gui Job)
             sp.Popen([dest, '--dir', os.path.dirname(BASE)],
                      cwd=os.path.dirname(dest),
-                     creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0))
+                     creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0)
+                     | CREATE_BREAKAWAY_FROM_JOB)
             messagebox.showinfo(
                 '一键更新',
                 f'安装包 {tag} 已下载并启动安装程序。\n\n'
@@ -878,9 +1721,11 @@ class AccountManagerApp:
             return
         try:
             # 以独立进程启动 uninstall.exe (GUI 已确认, 传 --silent 免二次询问)
+            # BREAKAWAY: 卸载器须在 GUI 退出后继续运行 (不进 open-ai.gui Job)
             sp.Popen([uninstall_exe, '--silent'],
                      cwd=os.path.dirname(BASE),
-                     creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0))
+                     creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0)
+                     | CREATE_BREAKAWAY_FROM_JOB)
         except Exception as e:
             messagebox.showerror('一键卸载', f'卸载程序启动失败: {e}')
             return
@@ -1180,10 +2025,20 @@ class AccountManagerApp:
             b.configure(state='disabled' if busy else 'normal')
 
     def _poll_result_q(self):
+        """操作日志队列消费 (与 _poll_tray_events 共用 result_q,
+        但只处理字符串; 托盘回调由 _poll_tray_events 负责, 按类型分流)。"""
+        drained = False
         try:
             while True:
-                msg = self.result_q.get_nowait()
-                self._write_log(msg)
+                item = self.result_q.get_nowait()
+                if isinstance(item, tuple) and item and item[0] == 'tray':
+                    # 托盘回调事件: 让给 _poll_tray_events (重排回队列尾部)
+                    self.result_q.put(item)
+                    if drained:
+                        time.sleep(0.01)
+                    break        # 不在日志循环里执行托盘回调
+                self._write_log(str(item))
+                drained = True
         except queue.Empty:
             pass
         self.root.after(100, self._poll_result_q)
@@ -1210,10 +2065,11 @@ class AccountManagerApp:
         """后台运行 login_*.py 并实时显示输出 (隐藏控制台窗口)。"""
         self._write_log(title)
         try:
+            # DETACHED_PROCESS: 无控制台 → 不产生 conhost.exe
             p = subprocess.Popen([py, script], cwd=os.path.dirname(BASE),
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, encoding='utf-8', errors='replace',
-                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                                 creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0x8))
             for line in p.stdout:
                 self.result_q.put(line.rstrip())
             p.wait()
@@ -1639,11 +2495,78 @@ def _set_windows_app_id():
         pass
 
 
+# ---------------------------------------------------------------------------
+# 单实例互斥 (v2.5, 配合托盘): 已有实例在跑 → 唤醒其主窗口 → 本实例退出
+# ---------------------------------------------------------------------------
+GUI_MUTEX = 'Local\\open-ai.gui.mutex'
+
+
+def acquire_gui_mutex():
+    """获取 GUI 单实例互斥锁 (named mutex)。返回 (成功否, mutex 句柄)。"""
+    try:
+        import ctypes
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        k.CreateMutexW.restype = ctypes.c_void_p
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.c_wchar_p]
+        h = k.CreateMutexW(None, False, GUI_MUTEX)
+        if h and ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
+            return False, None
+        return True, h
+    except Exception:
+        return True, None      # mutex 不可用 (非 Windows/异常) → 放行
+
+
+def release_gui_mutex(h):
+    try:
+        import ctypes
+        if h:
+            ctypes.windll.kernel32.ReleaseMutex(h)
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
+
+# ---- v2.4 进程管理: GUI 自身的 Job 托管 ----
+# GUI 进程自指派到 open-ai.gui Job (KILL_ON_JOB_CLOSE): 之后 spawn 的登录脚本等
+# 子进程自动入树, GUI 退出(含崩溃) → 内核级清理全部子进程, 不留孤儿。
+# 安装器/卸载器必须脱链 (CREATE_BREAKAWAY_FROM_JOB), 才能在 GUI 退出后继续运行。
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_GUI_JOB = None
+
+
+def _attach_gui_job():
+    global _GUI_JOB
+    try:
+        if os.name != 'nt':
+            return
+        sys.path.insert(0, os.path.dirname(BASE))
+        import jobmgmt
+        _GUI_JOB = jobmgmt.Job('open-ai.gui', kill_on_close=True,
+                               breakaway_ok=True)
+        _GUI_JOB.assign(os.getpid())
+    except Exception:
+        _GUI_JOB = None    # Job 不可用时降级为普通运行, 不阻塞界面
+
+
 def main():
+    # ---- 单实例互斥最先执行: 已有实例 (哪怕隐藏在托盘) → 唤醒其主窗口后退出 ----
+    ok, mutex_h = acquire_gui_mutex()
+    if not ok:
+        try:
+            if tray_icon is not None:
+                tray_icon.request_running_instance_restore()
+        except Exception:
+            pass
+        release_gui_mutex(mutex_h)
+        return 0
     _set_windows_app_id()
+    _attach_gui_job()
     root = tk.Tk()
     app = AccountManagerApp(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        release_gui_mutex(mutex_h)
 
 
 if __name__ == '__main__':

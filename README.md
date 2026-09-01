@@ -11,7 +11,7 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 | 依赖 | 版本要求 | 说明 |
 |---|---|---|
 | **操作系统** | Windows 10/11 | 网关用 `pythonw.exe` 无窗口运行、依赖 Windows 计划任务与启动文件夹；WSL2 镜像网络下可在 WSL 侧访问 `127.0.0.1` |
-| **Python** | **3.10+**（实测 3.13.14） | 用于 `main.py` 网关与 `daemon.py` 守护；`start.bat` 首次运行会自动建 `.venv` 并装依赖 |
+| **Python** | **3.10+**（实测 3.13.14） | 用于 `main.py` 网关与 Broker（`app_runtime.py`）；`start.bat` 首次运行会自动建 `.venv` 并装依赖 |
 | **Node.js** | 任意较新版本（实测 v24.15.0） | 仅 Trae 本地后端 `trae/server.js` 需要；**缺失时 WorkBuddy 网关仍可用**，仅 Trae 通道禁用 |
 | **Python 包** | 见 `requirements.txt` | `fastapi>=0.110`、`uvicorn[standard]>=0.29`、`httpx>=0.27`、`playwright>=1.44` |
 | **Playwright 浏览器** | 首次需安装 | `playwright` 用于 Trae 后端驱动，**装好依赖后还需** `playwright install`（代码用到其 driver） |
@@ -35,35 +35,87 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 
 ---
 
-## 1. 架构
+## 1. 架构（v2.4 进程管理重构）
+
+> v2.4 重写了进程管理：所有子进程由唯一的 **Broker 主进程**通过 **Windows Job Object**
+> 统一创建与托管，配合命名管道 IPC 心跳与优雅退出协议，从操作系统层面杜绝孤儿进程。
+> 每个进程在任务管理器里都是独立的 open-ai 品牌 exe（名称/图标/文件描述），
+> 且为**单进程**（不再有 python3.13.exe 子进程污染）。
 
 ```
-                  ┌─────────────────────────────────────────────┐
-   客户端 ───────▶ │  main.py  (FastAPI 网关, 监听 :8000)         │
-   (CC Switch /   │   - /v1/chat/completions  (OpenAI 协议)      │
-    Claude Code / │   - /v1/messages          (Anthropic 协议)   │
-    OpenAI 工具)   │   - /v1/models                              │
-                  └───────┬───────────────────────┬─────────────┘
-                          │ 路由                    │
-                  ┌───────▼────────┐      ┌────────▼────────┐
-                  │ WorkBuddy      │      │ Trae Node 后端   │
-                  │ (腾讯网关)      │      │ server.js :18787 │
-                  │ copilot.tencent│      │ (本地代理, 积分)  │
-                  └────────────────┘      └─────────────────┘
+                        bootstrap.py (open-ai.exe)   ← 统一 CLI: start/stop/status/doctor
+                               │ spawn (DETACHED, 幂等)
+                               ▼
+              open-ai-daemon.exe  (Broker = 主进程, app_runtime.py)
+              ├─ 单实例锁 (mutex + PID 文件双判)
+              ├─ Job Object 树 (KILL_ON_JOB_CLOSE):
+              │    root "open-ai.tree"  ← Broker 自指派; 崩溃/被杀 → 整树清零
+              │      ├─ leaf "open-ai.gateway"  (内存限额)
+              │      ├─ leaf "open-ai.trae"
+              │      └─ leaf "open-ai.task"     (内存限额)
+              ├─ IPC 服务端 \\.\pipe\open-ai.broker (心跳/指令/优雅退出)
+              ├─ 监督循环 (5s): 心跳超时→判僵死→重启; 退出→指数退避重启
+              │    (30s→1m→2m→4m→8m→15m 封顶, 稳定 5 分钟后重置)
+              └─ 定时任务: 每日签到 / TRAE 9074 补试 / 5 分钟流水采集
+                               │ Job 内创建 (零竞态自动入树)
+              ┌────────────────┼─────────────────┐
+              ▼                ▼                 ▼
+   open-ai-gateway.exe  open-ai-trae.exe  open-ai-task.exe (短命)
+   main.py :8000        trae/server.js     signin/usage 脚本
+   (心跳 10s + 优雅退出)  :18787 (同协议)
 
-   daemon.py  (pythonw 无窗口后台守护)
-     - 每 60s 自愈: 网关/Node 掉线自动拉起
-     - 每日签到 + TRAE 9074 繁忙时持续补试
-   watchdog_boot.py (每 5 分钟被计划任务调用, 保 daemon 存活)
+   watchdog_boot.py (计划任务每 5 分钟) → bootstrap.py start (最后防线)
 ```
+
+### 关键保证
+| 场景 | 行为 |
+|---|---|
+| 子进程崩溃 | Broker 监督循环检测（退出码/心跳超时）→ 指数退避自动重启 |
+| Broker 被杀/崩溃 | root Job 句柄随进程关闭 → `KILL_ON_JOB_CLOSE` 内核级终止全部子进程，**零孤儿** |
+| 任务管理器一键关闭 | 结束 `open-ai-daemon.exe` 即全树退出；或 `bootstrap.py stop` 优雅关闭 |
+| 优雅退出 | `bootstrap.py stop` → IPC 广播 shutdown → 子进程自行清理退出 → Job 兜底 |
+| 开机自启后重复点击 | `bootstrap.py start` 幂等（单实例锁），已在跑直接返回 |
+
+### 系统托盘与窗口生命周期（v2.5, 抖音式托盘应用行为）
+图形界面（`账号管理.bat`）关闭 X **不再退出程序**，最小化到系统托盘；后端服务常驻：
+
+| 操作 | 行为 |
+|---|---|
+| 启动 GUI | 自动创建托盘图标（右下角，open-ai logo） |
+| 点击窗口 **X** | 隐藏主窗口（**任务栏图标同步消失**），托盘图标保留，网关/签到/守护继续运行 |
+| **左键点击托盘图标** | 恢复主窗口并置于前台（任务栏图标恢复），自动回填账号/积分/模型数据 |
+| 托盘**右键 → 显示主窗口** | 同左键单击 |
+| 托盘**右键 → 退出** | **彻底退出**：IPC 通知 Broker 优雅关闭全部后端 → 写 watchdog 抑制标记（10 分钟内计划任务不复活）→ 销毁托盘 → 销毁窗口 → 结束进程 |
+| 重复双击 `账号管理.bat` | 不开第二个实例，直接把已运行实例（哪怕藏在托盘）的窗口带回前台 |
+| 后端意外恢复在线 | 界面每 3s 探测，恢复后自动刷新账号/API/积分/模型数据 |
+
+托盘实现为纯 Win32（`scripts/tray_icon.py`，`Shell_NotifyIcon` + 主窗口 WM_CLOSE
+子类化，零第三方依赖）；托盘初始化失败时自动降级为普通窗口（关闭时询问是否连后端
+一起退出）。`bootstrap.py stop` 同样写入抑制标记 —— 计划任务不会"越停越起"。
+
+**托盘右键菜单是可扩展功能模块**（`MenuItem` 声明式列表，`tray_icon.py` 模块头
+有完整示例）：支持任意深度子菜单、勾选（checkbox）、灰显、动态文字/状态
+（label/checked/enabled/visible 均可传 callable，每次右键实时求值）、顶层默认
+加粗项。GUI 侧扩展只需在构造 `TrayIcon` 时传 `menu=[...]` 或运行期
+`tray.menu.append(MenuItem(...))`。托盘故障日志见 `logs/tray_icon.err.log`。
 
 ### 进程
-| 进程 | 端口 | 说明 |
+| 进程（任务管理器映像名） | 端口 | 说明 |
 |---|---|---|
-| `main.py` (FastAPI) | **8000** | 聚合网关，对外提供 OpenAI / Anthropic 兼容接口 |
-| `trae/server.js` (Node) | **18787** | Trae 内嵌本地代理（积分/Work 通道） |
-| `daemon.py` (pythonw) | 无 | 无窗口后台守护：自愈 + 每日签到 |
-| `watchdog_boot.py` (pythonw) | 无 | 由计划任务周期性拉起 daemon（防 daemon 崩溃） |
+| `open-ai-daemon.exe` | 无 | **Broker 主进程**：Job 托管 + IPC 服务端 + 监督重启 + 签到/流水调度 |
+| `open-ai-gateway.exe` | **8000** | 聚合网关（main.py），OpenAI / Anthropic 兼容接口 |
+| `open-ai-trae.exe` | **18787** | Trae Node 后端（server.js，积分/Work 通道） |
+| `open-ai-task.exe` | 无 | 短命脚本宿主（签到/流水采集/登录脚本），跑完即退 |
+| `open-ai-manager.exe` | 无 | 图形界面（账号管理），自建 `open-ai.gui` Job：登录脚本自动入树、GUI 退出即清理；安装/卸载器显式脱链 |
+| `open-ai.exe` | 无 | 引导/控制 CLI（bootstrap.py） |
+| `watchdog_boot.py` | 无 | 计划任务兜底保活（委托 bootstrap） |
+
+所有品牌化 exe 位于 `runtime\Scripts\`，由 `procname.py` 从真实解释器根复制并注入图标/版本信息生成（逐 shim 印章增量重建，只重建缺失/变更的，不触碰运行中被占用的文件）。解释器根按 `venv 反推 → Appx 查询 → WindowsApps/Program Files 目录探测 → py launcher` 多级定位，**Store 版与 python.org 版双兼容**：Store 版（WindowsApps，DLL 受 ACL 限制）自动复制扩展 DLLs 并注册 `.pth`；org 版（Program Files）直接加载系统 DLLs，跳过该步。仅核心 DLL（`python3xx.dll`/`vcruntime*.dll`，按版本动态发现）两种来源都复制到 shim 同目录。
+
+**任务管理器视角**：open-ai 全部进程以品牌化名称+图标出现在**后台进程**分组
+（`open-ai` / `open-ai gateway :8000` / `open-ai trae :18787`，一目了然）。
+停止服务用 `bootstrap.py stop`（优雅），或结束 `open-ai-daemon.exe` 进程
+（root Job `KILL_ON_JOB_CLOSE` 内核级级联清空全树，零孤儿）。
 
 ---
 
@@ -71,37 +123,51 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 
 ```
 open-ai/
-├── main.py                 # FastAPI 网关入口
-├── daemon.py               # 无窗口后台守护 (自愈 + 签到)
-├── watchdog_boot.py        # daemon 存活保活 (被计划任务调用)
+├── main.py                 # FastAPI 网关入口 (--from-broker 启用心跳/优雅退出)
+├── daemon.py               # Broker 薄入口 (兼容旧调用; 实际逻辑在 app_runtime.py)
+├── app_runtime.py          # ★ Broker: Job 树/IPC 服务端/监督循环/定时任务
+├── bootstrap.py            # ★ 统一控制 CLI: start/stop/restart/status/doctor
+├── procname.py             # ★ 进程品牌注册表 + runtime 构建工厂 (图标/版本注入)
+├── ipc.py                  # ★ 命名管道 IPC 协议 (帧编解码/心跳客户端/会话)
+├── jobmgmt.py              # ★ Windows Job Object 封装 (KILL_ON_CLOSE/配额/枚举)
+├── watchdog_boot.py        # 计划任务兜底保活 (委托 bootstrap; 尊重退出抑制标记)
 ├── version.py              # ★ 版本号定义 (APP_VERSION, 设置页显示/一键更新比较用)
 ├── anthropic_api.py        # Anthropic 协议 ↔ OpenAI 协议转换
-├── config.json             # ★ 核心配置 (见 §3)
-├── config.json.bak-*       # 配置备份 (勿用含占位符 device_id 的旧版覆盖!)
+├── config.json             # ★ 核心配置 (含 runtime 节: 心跳/退避/内存限额)
 ├── MEMORY.md               # 关键事实记忆 (device_id 约束等, 打包必读)
 ├── 账号管理.bat            # ★ 图形界面入口 (账号/API管理/设置/日志)
-├── start.bat               # 一键启动 (建 venv / 装依赖 / 拉起网关)
-├── start_hidden.ps1        # 隐藏窗口启动网关 + 签到 (供开机自启调用)
+├── start.bat               # 一键启动 (建 venv / 装依赖 / 构建 runtime / 起 Broker)
+├── start_hidden.ps1        # 隐藏窗口启动 (供开机自启调用, 委托 bootstrap)
 ├── open-ai-autostart.bat   # 开机自启入口 (放启动文件夹)
+├── runtime/                # ★ v2.4 进程管理运行时 (procname.py 自动构建)
+│   ├── pyvenv.cfg          #   home = Store Python 包目录
+│   ├── Lib/site-packages   #   junction → .venv 的 site-packages
+│   ├── DLLs/               #   Store 包 DLLs 副本 (WindowsApps ACL 所需)
+│   └── Scripts/            #   open-ai-*.exe 品牌化进程 + python313.dll 等
 ├── providers/
 │   ├── __init__.py         # Provider 注册表 + 模型路由
 │   ├── workbuddy.py        # WorkBuddy (腾讯/混元) provider
 │   ├── base.py             # Provider 基类
 │   └── trae.py             # Trae provider (路由到本地 Node 后端)
 ├── trae/
-│   └── server.js           # Trae 内嵌 Node 后端 (:18787)
+│   └── server.js           # Trae 内嵌 Node 后端 (:18787, 含 Broker IPC 客户端)
 ├── scripts/
-│   ├── gui_account_manager.py  # ★ 图形界面主程序 (账号/API管理/设置/日志)
+│   ├── gui_account_manager.py  # ★ 图形界面主程序 (账号/API管理/设置/日志; 托盘生命周期)
+│   ├── tray_icon.py        # ★ 系统托盘组件 (纯 Win32: 托盘图标/X拦截/右键菜单)
 │   ├── api_store.py        # API 密钥存储管理 (create/rename/delete)
 │   ├── signin_all.py       # 统一签到脚本 (TRAE + WorkBuddy + token 续期)
 │   ├── account_manager.py  # 控制台版账号管理 (积分查询等, GUI 复用其逻辑)
+│   ├── usage_history.py    # ★ TRAE 逐笔积分消耗流水 (网页 dashboard 同款接口逆向)
+│   ├── wb_usage_history.py # ★ WorkBuddy 逐笔消耗流水 (官网个人中心同款接口逆向)
+│   ├── usage_collector.py  # ★ 逐笔流水自动采集 + 本地 SQLite 流水库 (Broker 调度)
 │   ├── login_trae.py       # 登录/添加 Trae 账号
 │   └── login_workbuddy.py  # 登录/添加 WorkBuddy 账号
 ├── tests/                  # 单元测试 (unittest, 无第三方依赖)
 │   ├── test_api_store.py       # API 密钥管理逻辑测试
-│   └── test_account_parse.py   # 账号解析逻辑测试
-├── logs/  (*.log)          # ★ 全部运行日志集中于此 (daemon/signin/open_api/server)
-├── data/  (状态文件)       # ★ 运行状态 (PID/签到状态, 不入库)
+│   ├── test_account_parse.py   # 账号解析逻辑测试
+│   └── test_procman.py         # ★ v2.4 进程管理测试 (Job/IPC/runtime)
+├── logs/  (*.log)          # ★ 运行日志 (broker/gateway_*/trae_*/signin/daemon_boot)
+├── data/  (状态文件)       # ★ 运行状态 (runtime_state.json/PID/签到状态)
 └── .venv/                  # Python 虚拟环境
 ```
 
@@ -174,28 +240,37 @@ open-ai/
 
 ### 开发/手动启动
 ```bat
-start.bat        # 首次会建 .venv 并装依赖, 然后拉起 Node 后端(18787) + 网关(8000)
+start.bat        # 首次建 .venv 装依赖 + 构建品牌化进程 (runtime/), 然后启动 Broker
+```
+
+### 控制命令（bootstrap.py / open-ai.exe）
+所有进程生命周期统一走 `bootstrap.py`（品牌化入口 `runtime\Scripts\open-ai.exe`）：
+```bat
+.venv\Scripts\python.exe bootstrap.py start     # 启动 (幂等, 已在跑直接返回)
+.venv\Scripts\python.exe bootstrap.py stop      # 优雅停止 (IPC 广播 → Job 兜底)
+.venv\Scripts\python.exe bootstrap.py restart   # 重启
+.venv\Scripts\python.exe bootstrap.py status    # 各角色 PID/心跳/存活
+.venv\Scripts\python.exe bootstrap.py doctor    # 诊断: shim/Job/端口/管道/进程树
 ```
 
 ### 生产/无窗口常驻（推荐）
-网关与守护都由 `open-ai-autostart.bat` 以隐藏窗口拉起（不弹窗）：
+`open-ai-autostart.bat` 以隐藏窗口拉起 Broker（不弹窗），由 Broker 统一托管网关/Node/任务：
 - 手动：`open-ai-autostart.bat`
 - 开机自启：GUI「设置」页勾选「开机自动运行」（把 `open-ai-autostart.bat` 复制到启动文件夹）
-
-`open-ai-autostart.bat` 会启动：
-1. `start_hidden.ps1` → 拉起网关(8000) + Node 后端(18787)
-2. `daemon.py`（pythonw 无窗口）→ 自愈 + 每日签到
 
 ### 卸载
 GUI「设置」页点「一键卸载」，或运行安装目录下的 `uninstall.exe`：停止全部进程、
 移除开机自启/计划任务/桌面快捷方式，并彻底删除插件目录（含配置与账号）。
 
-### 守护与保活
-- **`daemon.py`**：`pythonw.exe` 运行（无控制台窗口）。每 60s 检查 8000/18787，掉线则用
-  `start_hidden.ps1` 隐藏拉起；每天执行签到，TRAE 遇 9074 繁忙时每 30 分钟自动补试。
-- **`watchdog_boot.py`**：由 Windows 计划任务 `OpenAI-DaemonBoot`（每 5 分钟）用 `pythonw`
-  调用，检查 daemon 是否存活，死了就拉起。全程无窗口。
-- 旧方案（`watchdog.ps1` / `watchdog_check.ps1`）已移除，请勿恢复。
+### 守护与保活（v2.4 三层）
+1. **Broker 监督循环**（`app_runtime.py`）：每 5s 巡检 gateway/trae —— 进程退出或心跳
+   超时（45s）→ 指数退避自动重启（30s→1m→2m→4m→8m→15m 封顶，稳定运行 5 分钟后重置）。
+   子进程崩溃自动恢复，无需人工干预。
+2. **Job Object 兜底**（`jobmgmt.py`）：root Job `KILL_ON_JOB_CLOSE` —— Broker 无论因何
+   退出（被任务管理器结束/崩溃/断电恢复失败），内核自动终止整棵进程树，**绝不产生孤儿**。
+3. **计划任务兜底**（`watchdog_boot.py`）：`OpenAI-DaemonBoot`（每 5 分钟）检查 Broker
+   存活，不在则委托 `bootstrap.py start` 拉起。全程无窗口。
+- 旧方案（`watchdog.ps1` / `watchdog_check.ps1` / daemon 端口探测自愈）已移除，请勿恢复。
 
 ---
 
@@ -219,15 +294,85 @@ GUI「设置」页点「一键卸载」，或运行安装目录下的 `uninstall
 
 ---
 
-## 6. 签到
+## 6. 逐笔消耗流水（TRAE + WorkBuddy）
+
+`scripts/usage_history.py` 复用 config 里已抓取的 TRAE token + device_id，直接调用
+官网 dashboard（`www.trae.cn/dashboard` 的 Usage details 模块）同款接口，拉取**逐笔**
+积分消耗记录（时间 / 模型 / 积分 / token 数 / 会话 / 输入预览）：
+
+```bash
+python scripts/usage_history.py                  # 最近 7 天, 所有账号
+python scripts/usage_history.py --days 30        # 最近 30 天
+python scripts/usage_history.py --uid 319013     # 只查指定账号 (uid 前缀)
+python scripts/usage_history.py --pages 2        # 只拉前 2 页 (每页 50 条)
+python scripts/usage_history.py --csv out.csv    # 导出 CSV (多账号自动加 uid 后缀)
+python scripts/usage_history.py --json           # 输出原始 JSON
+```
+
+也可在 `账号管理.bat` → `[6] TRAE 逐笔消耗流水` 调用。
+
+> 接口要点（前端 JS 逆向确认）：`POST api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session`，
+> 鉴权 `Authorization: Cloud-IDE-JWT <token>` + `x-device-id`；
+> `usage_type` 固定传 `[7]`（credits 计费，数组）；`page_size` ≤ 50，否则 400；
+> token 过期返回 401，先用 `signin_all.py` 或「重新连接」续期。
+
+### WorkBuddy 逐笔消耗流水
+
+`scripts/wb_usage_history.py` 复用 config 里的 WorkBuddy accessToken，调用官网
+个人中心（`www.codebuddy.cn/profile` →「套餐与用量」）同款接口，拉取**逐笔**消耗记录
+（时间 / 模型 / 客户端 / 积分 / 输入预览），也支持按天汇总：
+
+```bash
+python scripts/wb_usage_history.py               # 最近 7 天逐笔, 所有账号
+python scripts/wb_usage_history.py --days 30     # 最近 30 天
+python scripts/wb_usage_history.py --daily       # 按天汇总视图
+python scripts/wb_usage_history.py --uid a95fdb  # 只查指定账号 (userId 前缀)
+python scripts/wb_usage_history.py --csv out.csv # 导出 CSV
+```
+
+也可在 `账号管理.bat` → `[7] WorkBuddy 逐笔消耗流水` 调用。
+
+> 接口要点（前端 JS 逆向确认）：`POST copilot.tencent.com/billing/meter/get-user-request-usage`
+>（逐笔）/ `get-user-daily-usage`（按天），鉴权 `Authorization: Bearer <accessToken>` +
+> `X-User-Id`；**必须带 `X-Enterprise-Id` 头**（个人账号传自己的 userId，否则 400）；
+> 逐笔接口支持 v1 页码式（`pageNum/pageSize`）与 v2 游标式（`version:2` + `pageToken`）。
+
+### 自动采集（打包分发用，零操作）
+
+逐笔流水**不需要**手动查询——Broker 每 **5 分钟**自动增量采集两平台流水（消耗 + 签到
+获取），累积存入本地缓存库 `data/usage_history.db`（SQLite，按 平台+账号+流水号 去重，
+**缓存保留 1 个月**）。用户装好软件后（`start.bat` 或开机自启）Broker 常驻后台，
+自动积累历史，无感。
+
+- 采集器：`scripts/usage_collector.py`（`--collect` 立即一轮 / `--collect-loop` 独立常驻 / 无参数查看本地库）
+- Broker 挂载：`app_runtime.py` → `TaskScheduler.run_collect()`（与监督/签到同循环，5 分钟一轮）
+- **GUI 查看**：`账号管理.bat` →「查看积分消耗」页签（模型列表与设置之间）：
+  - **今日情况**：上半部分显示今日获取/消耗积分；下半部分为逐笔消耗流水
+    （格式：账号 + 模型 + 时间 + 消耗量，如 `TRAE_7593  GLM-5.3-Flash  2026/08/31 19:53  0.87`）
+  - **每周情况**：优先显示本周，可回看最近 3 周；上半部分为该周获取/消耗积分；
+    下半部分柱状图显示每天消耗——横坐标为日期，纵坐标为积分消耗量，
+    **柱子由红（TRAE 通道）蓝（WorkBuddy 通道）两段叠放组成**，
+    鼠标悬停红/蓝段显示对应通道的具体消耗数值，柱顶显示当日合计
+  - 页面数据每 5 分钟自动刷新（与采集节奏一致）
+
+手动查看本地库示例：
+
+```bash
+python scripts/usage_collector.py                # 本地库最近 7 天 (默认)
+python scripts/usage_collector.py --days 30      # 最近 30 天
+python scripts/usage_collector.py --platform trae --uid 319013
+python scripts/usage_collector.py --csv out.csv  # 导出 CSV
+python scripts/usage_collector.py --collect      # 不等 Broker, 立即采集一轮
+```
+
+## 7. 签到
 
 统一脚本 `scripts/signin_all.py`：
-
 ```bash
 python scripts/signin_all.py            # 完整: token 续期 + WorkBuddy 签到 + TRAE 签到
 python scripts/signin_all.py --no-renew # 只签到, 不续期 token
 python scripts/signin_all.py --force    # 强制续期 (忽略剩余时间)
-python scripts/signin_all.py --trae-only# 只补试 TRAE (供 daemon 白天反复调用)
+python scripts/signin_all.py --trae-only# 只补试 TRAE (供 Broker 白天反复调用)
 ```
 
 - **WorkBuddy 签到**：调用 `daily-checkin`，返回 `code:0`（成功）/ `10001`（今日已签），领取每日积分。
@@ -239,27 +384,32 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 daemon 白天反�
 
 ---
 
-## 7. 排错
+## 8. 排错
 
 | 现象 | 排查 |
 |---|---|
 | TRAE 签到一直 9074 | 检查 `config.json` 的 `device_id` / `x-device-id` 是否为**真实客户端 machineid**（见 §3），占位符/伪造值必 9074 |
-| 网关起不来 | 看 `open_api_err.log`；确认 `start.bat` 已建好 `.venv` 且装了依赖 |
-| 端口被占 | 8000/18787 已在运行则脚本会跳过；用 `netstat -ano \| findstr :8000` 查占用 |
+| 网关起不来 | 看 `logs\gateway_err.log`；确认 `start.bat` 已建好 `.venv` 且装了依赖；`bootstrap.py doctor` 全量诊断 |
+| 端口被占 | `bootstrap.py doctor` 显示端口占用；8000/18787 被**非 open-ai** 进程占用时 Broker 会反复重启该角色（看 `logs\broker.log`） |
 | 开机没自启 | 确认启动文件夹里有 `open-ai-autostart.bat`（在 账号管理.bat 设置页勾选「开机自动运行」） |
-| daemon 没在跑 | 计划任务 `OpenAI-DaemonBoot` 每 5 分钟会通过 `watchdog_boot.py` 拉起；也可手动 `pythonw daemon.py` |
+| Broker/服务没在跑 | 先 `bootstrap.py status` / `doctor`；计划任务 `OpenAI-DaemonBoot` 每 5 分钟兜底拉起；手动 `bootstrap.py start` |
+| 想彻底关掉所有进程 | 托盘右键「退出」（GUI 内一键）；或 `bootstrap.py stop`（优雅，二者均抑制 watchdog 复活 10 分钟）；或任务管理器结束 `open-ai-daemon.exe`（Job Object 连带终止全部子进程） |
+| runtime 构建失败 | 删除 `runtime\` 目录后重新运行 `start.bat`（自动重建）；解释器需为 Store Python 3.13 或 python.org 3.10+（任选其一） |
 
 ---
 
-## 8. 关键文件速查
+## 9. 关键文件速查
 
 | 我想… | 看/改 |
 |---|---|
 | 管理账号/积分/API/自启/卸载 | `账号管理.bat`（GUI）→ `scripts/gui_account_manager.py` |
+| 窗口 X 后找不到界面了 | 没退出，最小化到了**系统托盘**（右下角 open-ai 图标）→ 左键点击即恢复 |
+| 托盘图标行为异常 | `scripts/tray_icon.py`（纯 Win32 实现；初始化失败会自动降级为普通窗口，见 `logs\gui_account_manager.err.log`；菜单/托盘故障见 `logs\tray_icon.err.log`） |
+| 托盘「退出」没退出 | 看 `logs\gui_exit.log`（退出链路逐步诊断）与 `logs\broker.log`（应出现 `gui-shutdown`）；退出流程有多重兜底（IPC→Job 清理→抑制标记→5s 看门狗硬退出），正常必退 |
 | 管理 API 密钥 | GUI「API管理」页 → `scripts/api_store.py` |
 | 换模型/加别名 | `config.json` → `providers.workbuddy.models` |
 | 修签到失败(9074) | `config.json` → `providers.trae.device_id` / `headers.x-device-id`（填真实 machineid） |
 | 懂 device_id 约束 | `MEMORY.md` |
-| 调守护节奏 | `daemon.py`（`CHECK_INTERVAL` / `TRAE_RETRY_INTERVAL`） |
+| 调守护节奏/内存限额 | `config.json` → `runtime` 节；`app_runtime.py`（`CHECK_INTERVAL` / `BACKOFF_STEPS`） |
 | 加 Trae 账号 | 账号管理GUI 或 `scripts/login_trae.py` |
 | 加 WorkBuddy 账号 | 账号管理GUI 或 `scripts/login_workbuddy.py` |

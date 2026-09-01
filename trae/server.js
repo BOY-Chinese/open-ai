@@ -13,10 +13,14 @@
 'use strict';
 
 const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { randomUUID } = require('crypto');
+
+// IPC 常量 (Broker 托管模式; 详细协议见 ../ipc.py 头注释)
+const PIPE_NAME = '\\\\.\\pipe\\open-ai.broker';
 
 // ======================= 配置加载 (open-ai/config.json -> providers.trae) =======================
 const OPENAI_CFG_PATH = path.join(__dirname, '..', 'config.json');
@@ -683,6 +687,71 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = CFG.port || 18787;
 const HOST = CFG.listen || '127.0.0.1';
+
+// ======================= Broker 托管模式: IPC 心跳 + 优雅退出 =======================
+// 由 Broker (app_runtime.py, 进程名 open-ai-daemon.exe) 启动时通过
+// OPEN_AI_FROM_BROKER=1 启用: 连接 \\.\pipe\open-ai.broker, 10s 一跳,
+// 收到 shutdown 指令后停止接受新连接并退出。管道不可用时静默独立运行。
+const HEARTBEAT_MS = 10000;
+let hbConn = null;
+let hbStopped = false;
+
+function pipeSend(obj) {
+  if (!hbConn) return false;
+  try { hbConn.write(Buffer.from(obj)); return true; }
+  catch (_) { try { hbConn.destroy(); } catch (_) {} hbConn = null; return false; }
+}
+
+function pipeRecv() {
+  if (!hbConn) return null;
+  if (hbConn._rbuf === undefined) hbConn._rbuf = Buffer.alloc(0);
+  if (hbConn._rbuf.length < 4) return null;
+  const len = hbConn._rbuf.readUInt32LE(0);
+  if (len > 65536) { try { hbConn.destroy(); } catch (_) {} hbConn = null; return null; }
+  if (hbConn._rbuf.length < 4 + len) return null;
+  const payload = hbConn._rbuf.slice(4, 4 + len);
+  hbConn._rbuf = hbConn._rbuf.slice(4 + len);
+  try { return JSON.parse(payload.toString('utf-8')); } catch (_) { return null; }
+}
+
+function connectBroker() {
+  // Windows 命名管道: 直接传字符串路径 (不能用 { pipe: ... } 选项形式)
+  hbConn = net.connect(PIPE_NAME, () => {
+    pipeSend(frame({ type: 'hello', role: 'trae', pid: process.pid, port: PORT }));
+  });
+  hbConn.on('data', (chunk) => {
+    if (hbConn && hbConn._rbuf !== undefined) {
+      hbConn._rbuf = Buffer.concat([hbConn._rbuf, chunk]);
+    }
+    for (;;) {
+      const msg = pipeRecv();
+      if (!msg) break;
+      if (msg.type === 'shutdown') {
+        console.log('[ipc] 收到 Broker 关闭指令:', msg.reason || '');
+        gracefulExit('broker-shutdown');
+      } else if (msg.type === 'welcome') {
+        console.log('[ipc] 已向 Broker 注册 (trae)');
+      }
+    }
+  });
+  hbConn.on('error', () => { try { hbConn.destroy(); } catch (_) {} hbConn = null; });
+  hbConn.on('close', () => { hbConn = null; });
+}
+
+function frame(obj) {
+  const payload = Buffer.from(JSON.stringify(obj), 'utf-8');
+  const head = Buffer.alloc(4);
+  head.writeUInt32LE(payload.length, 0);
+  return Buffer.concat([head, payload]);
+}
+
+function gracefulExit(reason) {
+  hbStopped = true;
+  try { server.close(() => process.exit(0)); } catch (_) { process.exit(0); }
+  // 兜底: server.close 等待在途连接, 5s 强退
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`Trae DeepSeek Proxy API (open-ai 内嵌) 已启动: http://${HOST}:${PORT}`);
   console.log(`  POST /v1/chat/completions  (OpenAI 兼容, 流式 + tools/function calling)`);
@@ -697,4 +766,19 @@ server.listen(PORT, HOST, () => {
   setTimeout(() => { refreshModels(true).catch(() => {}); }, 2000);
   setInterval(() => { refreshModels(false).catch(() => {}); }, MODEL_REFRESH_INTERVAL);
   console.log(`[动态模型] 每日自动刷新已启用 (每 ${MODEL_REFRESH_INTERVAL / 1000 / 3600} 小时)`);
+  // ---- Broker 托管 ----
+  if (process.env.OPEN_AI_FROM_BROKER === '1') {
+    setInterval(() => {
+      try {
+        if (hbStopped) return;
+        if (!hbConn) connectBroker();
+        else pipeSend(frame({ type: 'heartbeat', role: 'trae', pid: process.pid, ts: Date.now() / 1000 }));
+      } catch (e) {
+        console.error('[ipc] 心跳异常 (不影响服务):', e.message);
+        try { if (hbConn) hbConn.destroy(); } catch (_) {}
+        hbConn = null;
+      }
+    }, HEARTBEAT_MS);
+    console.log('[ipc] Broker 托管模式已启用 (心跳 %ds)', HEARTBEAT_MS / 1000);
+  }
 });

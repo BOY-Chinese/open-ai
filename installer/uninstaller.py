@@ -1,210 +1,150 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-open-ai 独立卸载程序 (uninstall.exe)
-=====================================
-简洁可靠的卸载程序:
-  1. 显示确认界面 (记录安装位置)
-  2. 停止网关/daemon/Node 进程, 清理开机自启/计划任务/桌面快捷方式
-  3. 同步删除安装目录 (除自身外), 删除失败如实提示
-  4. 自身 (uninstall.exe) 通过 TEMP 副本延迟删除, 不留残留
+open-ai 卸载程序 (uninstall.exe) —— v2.5 新架构版
+==================================================
+职责:
+  1. 停止全部 open-ai 进程 (Broker/gateway/trae/品牌化 shim/Node)
+  2. 清理开机自启 / 计划任务 / 桌面快捷方式
+  3. 删除安装目录 (含 config.json 等全部数据, 不可恢复)
 
-打包: python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+打包: python -m PyInstaller --noconfirm --clean --onefile --windowed ^
         --name "uninstall" --icon "ico/open-ai.ico" uninstaller.py
 产出: dist/uninstall.exe
 """
+import ctypes
 import os
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk, messagebox
 
-APP_NAME = 'open-ai'
+_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
-def run_cmd(cmd, timeout=120, capture=True):
-    """隐藏控制台运行命令, 返回 (returncode, output)。"""
+def run_cmd(cmd, timeout=60, capture=True):
     try:
-        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
         p = subprocess.run(cmd, capture_output=capture, text=True,
-                           timeout=timeout, shell=False, creationflags=flags)
+                           timeout=timeout, shell=False, creationflags=_NO_WINDOW)
         return p.returncode, (p.stdout or '') + (p.stderr or '')
     except Exception as e:
         return -1, str(e)
 
 
-def get_install_dir():
-    """uninstall.exe 所在目录 = 安装目录。"""
-    return os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False)
-                                           else __file__))
+def _pid_alive(pid):
+    try:
+        k = ctypes.WinDLL('kernel32')
+        k.OpenProcess.restype = ctypes.c_void_p
+        k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if h:
+            k.CloseHandle(h)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 class UninstallerApp:
-    def __init__(self, root):
+    def __init__(self, root, target):
         self.root = root
-        self.target = get_install_dir()
-        self.silent = '--silent' in sys.argv
+        self.target = target
         root.title('卸载 open-ai')
-        root.geometry('440x300')
+        root.geometry('520x300')
         root.resizable(False, False)
-        # 图标
         try:
-            ico = os.path.join(self.target, 'pic', 'open-ai.ico')
-            if os.path.exists(ico):
-                root.iconbitmap(ico)
+            root.iconbitmap(default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                 'ico', 'open-ai.ico'))
         except Exception:
             pass
 
-        # 标题
-        ttk.Label(root, text='open-ai 卸载程序', font=('Microsoft YaHei UI', 14, 'bold')) \
-            .pack(pady=(18, 6))
-        ttk.Label(root, text=f'安装位置: {self.target}', foreground='#666666',
-                  wraplength=400).pack(pady=(0, 12))
+        ttk.Label(root, text='正在卸载 open-ai...',
+                  font=('Microsoft YaHei UI', 12, 'bold')).pack(pady=(16, 4))
+        self.status = tk.StringVar(value='准备中...')
+        ttk.Label(root, textvariable=self.status,
+                  foreground='#666666').pack(pady=(0, 8))
+        self.pbar = ttk.Progressbar(root, length=420, mode='determinate')
+        self.pbar.pack(pady=8)
+        self.log = tk.Text(root, height=8, state='disabled',
+                           font=('Consolas', 9))
+        self.log.pack(fill='both', expand=True, padx=16, pady=(0, 16))
 
-        # 状态区
-        self.status = tk.StringVar(value='就绪')
-        ttk.Label(root, textvariable=self.status, foreground='#333333').pack(pady=6)
-
-        # 进度条
-        self.pbar = ttk.Progressbar(root, mode='indeterminate')
-        self.pbar.pack(fill='x', padx=30, pady=6)
-
-        # 日志区
-        self.log_text = tk.Text(root, height=6, state='disabled',
-                                font=('Consolas', 9), bg='#ffffff', fg='#374151',
-                                relief='flat', borderwidth=1)
-        self.log_text.pack(fill='both', expand=True, padx=20, pady=8)
-
-        # 按钮
-        btn_frame = ttk.Frame(root)
-        btn_frame.pack(pady=6)
-        self.btn_uninstall = ttk.Button(btn_frame, text='卸载', command=self._start)
-        self.btn_uninstall.pack(side='left', padx=6)
-        ttk.Button(btn_frame, text='取消', command=root.destroy).pack(side='left', padx=6)
-
-        if self.silent:
-            # GUI 已确认, 自动开始
-            self.root.after(300, self._start)
-
-    def _log(self, msg):
-        self.log_text.configure(state='normal')
-        self.log_text.insert('end', msg + '\n')
-        self.log_text.see('end')
-        self.log_text.configure(state='disabled')
-        self.root.update_idletasks()
-
-    def _start(self):
-        if not self.silent:
-            if not messagebox.askyesno(
-                    '确认卸载',
-                    f'确定要卸载 open-ai 吗？\n\n安装位置: {self.target}\n\n'
-                    '将删除：\n· 全部插件文件\n· 配置、账号与 API 密钥\n'
-                    '· 开机自启、计划任务、桌面快捷方式\n\n此操作不可恢复！'):
-                return
-        self.btn_uninstall.configure(state='disabled')
-        self.pbar.start(12)
         threading.Thread(target=self._worker, daemon=True).start()
 
+    def _log(self, msg):
+        self.log.configure(state='normal')
+        self.log.insert('end', msg + '\n')
+        self.log.see('end')
+        self.log.configure(state='disabled')
+
+    def _set_status(self, msg, pct=None):
+        self.status.set(msg)
+        if pct is not None:
+            self.pbar['value'] = pct
+        self.root.update_idletasks()
+
     def _worker(self):
+        ok = False
         try:
-            self._log('正在停止进程...')
+            self._set_status('停止全部 open-ai 进程...', 10)
             self._stop_processes()
-            self._log('等待进程完全退出...')
-            self._wait_processes_gone()
-            self._log('正在清理开机自启与快捷方式...')
+            self._set_status('清理自启 / 计划任务 / 快捷方式...', 30)
             self._cleanup_shortcuts_and_autostart()
-            self._log('正在删除安装目录...')
-            residual = self._delete_directory()
-            self.pbar.stop()
-            if residual:
-                self.status.set('未完全卸载')
-                self._log('⚠ 有文件删除失败:')
-                for r in residual:
-                    self._log(f'  - {r}')
-                self.root.after(0, lambda: messagebox.showwarning(
-                    '未完全卸载',
-                    '部分文件删除失败(可能正被其他程序占用)。\n'
-                    '请关闭 open-ai 相关窗口后重试，或手动删除剩余目录。'))
-                return
-            self._log('卸载完成！')
-            self.status.set('卸载完成')
-            self.root.after(0, self._show_done)
+            self._set_status('删除安装目录...', 60)
+            ok = self._delete_directory()
         except Exception as e:
-            self.pbar.stop()
-            self.status.set('卸载失败')
-            self._log(f'错误: {e}')
-            self.root.after(0, lambda: messagebox.showerror('卸载失败', str(e)))
-
-    def _show_done(self):
-        if self.silent:
-            # 静默模式 (GUI 调用): 直接退出, 让延迟删除脚本尽快清掉 uninstall.exe 自身
-            self.root.destroy()
-            return
-        messagebox.showinfo('卸载完成', 'open-ai 已成功卸载！\n本窗口即将关闭。')
-        self.root.destroy()
-
-    def _matching_process_names(self):
-        """列出仍以安装目录为命令行运行的 python/node/launcher 进程描述。"""
-        try:
-            esc = self.target.replace('\\', '\\\\').replace("'", "''")
-            code, out = run_cmd([
-                'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                '-Command',
-                (f"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-                 f"Where-Object {{ ($_.Name -match 'pythonw?\\.exe' -or $_.Name -match '^node\\.exe$' "
-                 f"-or $_.Name -match '^open-ai-launcher\\.exe$') "
-                 f"-and $_.CommandLine -match [regex]::Escape('{esc}') }} | "
-                 f"ForEach-Object {{ \"$($_.Name)#$($_.ProcessId)\" }}")
-            ], timeout=30)
-            return [x.strip() for x in (out or '').splitlines() if x.strip()]
-        except Exception:
-            return []
-
-    def _wait_processes_gone(self, timeout=15):
-        """轮询等待安装目录相关进程真正退出 (Stop-Process 后 exe 释放句柄需要时间)。
-        这是 .venv 目录删不掉的主因: 命令下发后进程还没退出, 文件仍被占用。"""
-        import time
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            left = self._matching_process_names()
-            if not left:
-                time.sleep(1)  # 再缓冲 1s, 等 Windows 释放文件句柄
-                return
-            time.sleep(0.5)
-        # 超时则再强杀一轮并等待
-        self._stop_processes()
+            self._log(f'卸载异常: {e}')
+        finally:
+            self.root.after(0, lambda: self._finish(ok))
 
     def _stop_processes(self):
-        """停止匹配安装目录的 python/node 进程, 并释放网关/Node 端口。"""
+        """停止安装目录相关的全部 open-ai 进程 (品牌化 shim + python/node)。"""
         try:
             esc = self.target.replace('\\', '\\\\').replace("'", "''")
             run_cmd([
                 'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-Command',
                 (f"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-                 f"Where-Object {{ ($_.Name -match 'pythonw?\\.exe' -or $_.Name -match '^node\\.exe$' "
-                 f"-or $_.Name -match '^open-ai-launcher\\.exe$') "
-                 f"-and $_.CommandLine -match [regex]::Escape('{esc}') }} | "
+                 f"Where-Object {{ $_.CommandLine -match [regex]::Escape('{esc}') "
+                 f"-and ($_.Name -match '^(open-ai|python|pythonw|node)\\.exe$' "
+                 f"-or $_.Name -match '^open-ai-') }} | "
                  f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}")
             ], timeout=60)
         except Exception:
             pass
+        # Job Object 兜底: 终止 open-ai 的 root/leaf jobs (整树清零)
+        try:
+            root = self.target
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            import jobmgmt
+            for name in ('open-ai.gateway', 'open-ai.trae', 'open-ai.task',
+                         'open-ai.tree'):
+                try:
+                    j = jobmgmt.open_job(name)
+                    if j:
+                        j.terminate()
+                        j.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 端口兜底
         for port in (8000, 18787):
             run_cmd([
                 'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                 '-Command',
-                (f"Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue "
-                 f"| ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}")
+                (f"Get-NetTCPConnection -State Listen -LocalPort {port} "
+                 f"-ErrorAction SilentlyContinue "
+                 f"| ForEach-Object {{ Stop-Process -Id $_.OwningProcess "
+                 f"-Force -ErrorAction SilentlyContinue }}")
             ], timeout=30)
-        # 等句柄释放, 避免删除时文件被占用
-        import time
         time.sleep(2)
 
     def _cleanup_shortcuts_and_autostart(self):
-        """清理开机自启文件、桌面快捷方式、计划任务。"""
-        # 自启文件 + 桌面快捷方式
         ps = (
             "$startup = [Environment]::GetFolderPath('Startup'); "
             "$autostart = Join-Path $startup 'open-ai-autostart.bat'; "
@@ -214,107 +154,56 @@ class UninstallerApp:
             "  $p = Join-Path $desktop $lnk; if (Test-Path $p) { Remove-Item $p -Force } }; "
             "foreach ($task in @('OpenAI-Watchdog','OpenAI-DaemonBoot')) { "
             "  $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; "
-            "  if ($t) { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue } }"
+            "  if ($t) { Unregister-ScheduledTask -TaskName $task -Confirm:$false "
+            "  -ErrorAction SilentlyContinue } }"
         )
         run_cmd(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                  '-Command', ps], timeout=60)
-        # 计划任务兜底: 用 schtasks 命令行再删一次
         for task in ('OpenAI-Watchdog', 'OpenAI-DaemonBoot'):
             run_cmd(['schtasks', '/delete', '/tn', task, '/f'], timeout=30)
 
     def _delete_directory(self):
-        """同步删除安装目录(除自身外), 返回残留文件列表(空=全部删除成功)。
-
-        自身 uninstall.exe 通过 TEMP 副本延迟删除, 不留残留:
-        - 先带重试删除其余文件 (瞬时占用最多再等 10s 重试)
-        - 仍失败的项写进延迟脚本兜底再删 (等自身完全退出后)
-        - 延迟脚本用重试循环等自身退出后再删自身 + 整目录, 直到成功
-        """
-        if not os.path.isdir(self.target):
-            return []
-        self_exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
-        errors = []
-        # 1) 同步删除目录内所有项 (跳过自身), 失败项带重试 (进程退出/句柄释放竞态)
-        for name in sorted(os.listdir(self.target)):
-            p = os.path.join(self.target, name)
-            if os.path.normcase(p) == os.path.normcase(self_exe):
-                continue
-            ok = False
-            last_err = ''
-            for attempt in range(4):  # 首次 + 3 次重试, 共约 10s
-                try:
-                    if os.path.isdir(p) and not os.path.islink(p):
-                        shutil.rmtree(p, ignore_errors=False)
-                    else:
-                        os.remove(p)
-                    ok = True
-                    break
-                except Exception as e:
-                    last_err = str(e)
-                    import time
-                    time.sleep(2.5)
-            if not ok:
-                errors.append(f'{name}: {last_err}')
-        # 2) 部署延迟删除脚本: 等自身退出后重试删除自身 + 清理残留/空目录
+        """删除安装目录, 返回成功与否。"""
         try:
-            ps_script = os.path.join(os.environ.get('TEMP', '.'),
-                                     f'openai_del_{os.getpid()}.ps1')
-            # 延迟脚本: 先等 uninstall 进程退出 (最多 30s), 再循环重试删除
-            # 失败项/自身/整目录 (每 2s 一轮, 最多 60s), 应对未释放的文件占用
-            leftover = [os.path.join(self.target, e.split(':', 1)[0]) for e in errors]
-            leftover_lines = '\n'.join(
-                f"  Remove-Item -LiteralPath '{p}' -Recurse -Force -ErrorAction SilentlyContinue"
-                for p in leftover)
-            del_script = (
-                f"$self='{self_exe}'\n"
-                f"$dir='{self.target}'\n"
-                f"$me=$PID\n"
-                # 等待 uninstall 进程退出 (自身除外), 最多 30s
-                f"for ($i=0; $i -lt 15; $i++) {{\n"
-                f"  $p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-                f"Where-Object {{ $_.Name -match 'uninstall.*\\.exe$' -and $_.ProcessId -ne $me }}\n"
-                f"  if (-not $p) {{ break }}\n"
-                f"  Start-Sleep -Seconds 2\n"
-                f"}}\n"
-                # 循环重试删除, 直到目录消失 (最长 60s)
-                f"for ($i=0; $i -lt 30; $i++) {{\n"
-                f"{leftover_lines}\n"
-                f"  if (Test-Path $self) {{ Remove-Item -LiteralPath $self -Force -ErrorAction SilentlyContinue }}\n"
-                f"  if (Test-Path $dir) {{ Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }}\n"
-                f"  if (-not (Test-Path $dir)) {{ break }}\n"
-                f"  Start-Sleep -Seconds 2\n"
-                f"}}\n"
-                # 兜底: 清掉可能残留的空目录 (.venv/logs 等)
-                f"if (Test-Path $dir) {{\n"
-                f"  Get-ChildItem -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue | "
-                f"Sort-Object {{ $_.FullName.Length }} -Descending | "
-                f"Where-Object {{ $_.PSIsContainer -and -not (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue) }} | "
-                f"Remove-Item -Force -ErrorAction SilentlyContinue\n"
-                f"  if (-not (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {{ "
-                f"Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue }}\n"
-                f"}}\n"
-                f"Remove-Item -LiteralPath '{ps_script}' -Force -ErrorAction SilentlyContinue\n"
-            )
-            with open(ps_script, 'w', encoding='utf-8') as f:
-                f.write(del_script)
-            subprocess.Popen([
-                'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                '-File', ps_script
-            ], cwd=os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'System32'),
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        except Exception as e:
-            errors.append(f'自身删除脚本: {e}')
-        return errors
+            if os.path.exists(self.target):
+                shutil.rmtree(self.target, ignore_errors=False)
+            return not os.path.exists(self.target)
+        except Exception:
+            return False
+
+    def _finish(self, ok):
+        if ok:
+            self._log('✓ 卸载完成')
+            messagebox.showinfo('卸载完成',
+                                'open-ai 已彻底卸载。\n\n'
+                                '（本卸载程序正在退出...）')
+        else:
+            self._log('✗ 部分文件被占用, 卸载未完全成功')
+            messagebox.showerror(
+                '卸载未完全',
+                '部分文件被占用 (可能仍有进程在运行)。\n'
+                '请关闭相关程序后重试, 或手动删除安装目录。')
+        self.root.destroy()
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--silent':
+        # 静默卸载 (GUI 设置页调用): 不弹确认, 直接停进程+删目录
+        root = os.path.dirname(os.path.abspath(sys.executable))
+        app = UninstallerApp.__new__(UninstallerApp)
+        try:
+            app._stop_processes()
+            app._cleanup_shortcuts_and_autostart()
+            app._delete_directory()
+        except Exception:
+            pass
+        return 0
+    target = os.path.dirname(os.path.abspath(sys.executable))
     root = tk.Tk()
-    app = UninstallerApp(root)
+    UninstallerApp(root, target)
     root.mainloop()
+    return 0
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception:
-        pass
+    sys.exit(main())

@@ -5,4 +5,4 @@
 GUI「设置」页显示该版本号, 「一键更新」据此与 GitHub 最新 release 比较决定是否更新。
 """
 
-APP_VERSION = 'v2.3'
+APP_VERSION = 'v2.4'

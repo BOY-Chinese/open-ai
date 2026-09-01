@@ -70,5 +70,13 @@
     }
   },
   "api_key_name": "",
-  "api_keys": []
+  "api_keys": [],
+  "runtime": {
+    "heartbeat_interval": 10,
+    "check_interval": 5,
+    "backoff_steps": [30, 60, 120, 240, 480, 900],
+    "root_memory_mb": 3072,
+    "leaf_memory_mb": {"gateway": 1024, "task": 1024},
+    "graceful_timeout": 15
+  }
 }

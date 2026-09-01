@@ -1,100 +1,85 @@
 @echo off
-rem ÓÃ GBK ´úÂëÒ³, Æ¥Åä±¾½Å±¾±àÂë, ±ÜÃâ±»Íâ²ã chcp 65001 ¸ÉÈÅµ¼ÖÂÖÐÎÄÂÒÂë/ÉÁÍË
-chcp 936 >nul
-rem =====================================================
-rem open-ai Ò»¼ü°²×°°ü ¹¹½¨½Å±¾ (Windows + PyInstaller)
-rem =====================================================
-rem Ç°ÖÃ: ÒÑ°²×° Python 3.10+ ²¢¼ÓÈë PATH (½Å±¾»á×Ô¶¯×° pyinstaller + ÒÀÀµ)
-rem ÓÃ·¨: Ë«»÷ÔËÐÐ±¾½Å±¾ (»òÓÉ¸ùÄ¿Â¼ Ò»¼ü¹¹½¨.bat µ÷ÓÃ)
-rem ²ú³ö: dist\open-ai-installer.exe + dist\uninstall.exe + ×Ô¶¯¸´ÖÆµ½×ÀÃæ
-rem ÈÕÖ¾: installer\build_installer.log
-rem =====================================================
+rem open-ai ä¸€é”®å®‰è£…åŒ… æž„å»ºè„šæœ¬ (Windows + PyInstaller) â€” v2.5 æ–°æž¶æž„
+rem å‰ç½®: å·²å®‰è£… Python 3.10+ å¹¶åŠ å…¥ PATH (è„šæœ¬è‡ªåŠ¨è£… pyinstaller + ä¾èµ–)
+rem ç”¨æ³•: åŒå‡»æœ¬è„šæœ¬ (æˆ–æ ¹ç›®å½• ä¸€é”®æž„å»º.bat)
+rem äº§å‡º: dist\open-ai-installer.exe (+ uninstall.exe + open-ai-launcher.exe)
+rem æ—¥å¿—: installer\build_installer.log
 setlocal
 cd /d "%~dp0"
 set LOGFILE=%~dp0build_installer.log
 echo [%date% %time%] ==== open-ai installer build start ==== > "%LOGFILE%"
 
 echo ====================================================
-echo  open-ai Ò»¼ü°²×°°ü ¹¹½¨
+echo  open-ai ä¸€é”®å®‰è£…åŒ… æž„å»º
 echo ====================================================
 
-rem ---- 0. ÕÒ python + pyinstaller + ÒÀÀµ ----
+rem ---- 0. å‡†å¤‡ python + pyinstaller ----
 set PY=python
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] Î´ÕÒµ½ python, ÇëÏÈ°²×° Python 3.10+
+    echo [ERROR] æœªæ‰¾åˆ° python, è¯·å…ˆå®‰è£… Python 3.10+
     goto :err
 )
 %PY% --version >> "%LOGFILE%" 2>&1
-rem ¼ì²é/°²×° pyinstaller
 %PY% -m pip show pyinstaller >nul 2>nul
 if errorlevel 1 (
-    echo [INFO] °²×° pyinstaller...
+    echo [INFO] å®‰è£… pyinstaller...
     %PY% -m pip install pyinstaller -q >> "%LOGFILE%" 2>&1
     if errorlevel 1 goto :err
 )
-rem ²¹Æë pyinstaller µÄ Windows ÒÀÀµ (pefile / pywin32-ctypes), È±Ê§»á±¨ ModuleNotFoundError
 %PY% -m pip show pefile >nul 2>nul
 if errorlevel 1 (
-    echo [INFO] °²×° pefile...
+    echo [INFO] å®‰è£… pefile...
     %PY% -m pip install pefile -q >> "%LOGFILE%" 2>&1
 )
 %PY% -m pip show pywin32-ctypes >nul 2>nul
 if errorlevel 1 (
-    echo [INFO] °²×° pywin32-ctypes...
+    echo [INFO] å®‰è£… pywin32-ctypes...
     %PY% -m pip install pywin32-ctypes -q >> "%LOGFILE%" 2>&1
 )
 
-rem ---- 1. ÏÈ¹¹½¨ uninstall.exe (¶ÀÁ¢Ð¶ÔØ³ÌÐò) ----
+rem ---- 1. æž„å»º uninstall.exe ----
 echo.
-echo [1/5] ¹¹½¨ uninstall.exe (¶ÀÁ¢Ð¶ÔØ³ÌÐò)...
+echo [1/5] æž„å»º uninstall.exe...
 if exist "ico\open-ai.ico" (
     %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
-        --name "uninstall" ^
-        --icon "ico\open-ai.ico" ^
-        uninstaller.py >> "%LOGFILE%" 2>&1
+        --name "uninstall" --icon "ico\open-ai.ico" uninstaller.py >> "%LOGFILE%" 2>&1
 ) else (
     %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
-        --name "uninstall" ^
-        uninstaller.py >> "%LOGFILE%" 2>&1
+        --name "uninstall" uninstaller.py >> "%LOGFILE%" 2>&1
 )
 if errorlevel 1 goto :err
-rem °Ñ uninstall.exe ¿½µ½ installer Ä¿Â¼, ¹©×ÊÔ´´ò°ü
 copy /y "dist\uninstall.exe" "uninstall.exe" >nul
 if errorlevel 1 goto :err
-echo [OK] uninstall.exe ÒÑÉú³É
+echo [OK] uninstall.exe
 
-rem ---- 1b. ¹¹½¨ open-ai-launcher.exe (Ò»¼üÆô¶¯Æ÷, ÎÞ´°¿Ú) ----
+rem ---- 1b. æž„å»º open-ai-launcher.exe ----
 echo.
-echo [1b] ¹¹½¨ open-ai-launcher.exe (Ò»¼üÆô¶¯Æ÷, ÎÞ´°¿Ú)...
+echo [1b] æž„å»º open-ai-launcher.exe...
 if exist "ico\open-ai.ico" (
     %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
-        --name "open-ai-launcher" ^
-        --icon "ico\open-ai.ico" ^
-        launcher.py >> "%LOGFILE%" 2>&1
+        --name "open-ai-launcher" --icon "ico\open-ai.ico" launcher.py >> "%LOGFILE%" 2>&1
 ) else (
     %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
-        --name "open-ai-launcher" ^
-        launcher.py >> "%LOGFILE%" 2>&1
+        --name "open-ai-launcher" launcher.py >> "%LOGFILE%" 2>&1
 )
 if errorlevel 1 goto :err
 copy /y "dist\open-ai-launcher.exe" "open-ai-launcher.exe" >nul
 if errorlevel 1 goto :err
-echo [OK] open-ai-launcher.exe ÒÑÉú³É
+echo [OK] open-ai-launcher.exe
 
-rem ---- 2. ´ò°ü×ÊÔ´ zip (º¬ uninstall.exe + launcher) ----
+rem ---- 2. æ‰“åŒ…èµ„æº zip ----
 echo.
-echo [2/6] ´ò°ü open-ai ×ÊÔ´...
+echo [2/5] æ‰“åŒ… open-ai èµ„æº...
 python build_resources.py >> "%LOGFILE%" 2>&1
 if errorlevel 1 goto :err
 
-rem ---- 3. ¹¹½¨°²×°Æ÷ exe ----
+rem ---- 3. æž„å»ºå®‰è£…å™¨ exe ----
 echo.
-echo [3/6] PyInstaller ´ò°ü°²×°Æ÷ exe...
+echo [3/5] PyInstaller æž„å»ºå®‰è£…å™¨ exe...
 if exist "ico\open-ai.ico" (
     %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
-        --name "open-ai-installer" ^
-        --icon "ico\open-ai.ico" ^
+        --name "open-ai-installer" --icon "ico\open-ai.ico" ^
         --add-data "resources.zip;." ^
         --add-data "config.shell.json;." ^
         --add-data "ico\open-ai.ico;ico" ^
@@ -108,40 +93,33 @@ if exist "ico\open-ai.ico" (
 )
 if errorlevel 1 goto :err
 
-rem ---- 4. ¸´ÖÆµ½×ÀÃæ ----
+rem ---- 4. å¤åˆ¶åˆ°æ¡Œé¢ ----
 echo.
-echo [4/6] ¸´ÖÆ°²×°°üµ½×ÀÃæ...
+echo [4/5] å¤åˆ¶å®‰è£…åŒ…åˆ°æ¡Œé¢...
 set DESKTOP=%USERPROFILE%\Desktop
 if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\Desktop
-if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\×ÀÃæ
-if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\×ÀÃæ
+if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\æ¡Œé¢
+if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\æ¡Œé¢
 copy /y "dist\open-ai-installer.exe" "%DESKTOP%\open-ai-installer.exe" >nul
 if errorlevel 1 (
-    echo [WARN] ¸´ÖÆµ½×ÀÃæÊ§°Ü, °²×°°üÔÚ dist\ Ä¿Â¼
+    echo [WARN] å¤åˆ¶åˆ°æ¡Œé¢å¤±è´¥, å®‰è£…åŒ…åœ¨ dist\ ç›®å½•
 ) else (
-    echo [OK] ÒÑ¸´ÖÆµ½×ÀÃæ: %DESKTOP%\open-ai-installer.exe
+    echo [OK] å®‰è£…åŒ…å·²å¤åˆ¶åˆ°æ¡Œé¢: %DESKTOP%\open-ai-installer.exe
 )
 
-rem ---- 5. Íê³É ----
+rem ---- 5. æ”¶å°¾ ----
 echo.
-echo [5/6] ¹¹½¨Íê³É!
 echo ====================================================
-echo  °²×°°ü:   %DESKTOP%\open-ai-installer.exe
-echo  Ð¶ÔØ³ÌÐò: dist\uninstall.exe (»áËæ°²×°°üÄÚÖÃ)
-echo  ÏêÏ¸ÈÕÖ¾: build_installer.log
-echo  (Èô×ÀÃæÃ»ÓÐ, ÔÚ dist\open-ai-installer.exe)
+echo  [å®Œæˆ] æž„å»ºç»“æžœ:
+echo    - installer\dist\open-ai-installer.exe  (å®‰è£…åŒ…)
+echo    - installer\dist\uninstall.exe         (å¸è½½ç¨‹åº)
+echo    - installer\dist\open-ai-launcher.exe  (ä¸€é”®å¯åŠ¨å™¨)
+echo    è¯¦ç»†æ—¥å¿—: installer\build_installer.log
 echo ====================================================
-dir "dist\open-ai-installer.exe" "dist\uninstall.exe" | findstr "exe"
 pause
-goto :eof
-
+exit /b 0
 :err
 echo.
-echo [ERROR] ¹¹½¨Ê§°Ü, Çë²é¿´ build_installer.log
-echo [%time%] ==== BUILD FAILED ==== >> "%LOGFILE%"
-echo.
-echo ===== ×î½üÈÕÖ¾ =====
-type "%LOGFILE%"
-echo ====================
+echo [ERROR] æž„å»ºå¤±è´¥, è¯·æŸ¥çœ‹æ—¥å¿—: installer\build_installer.log
 pause
 exit /b 1

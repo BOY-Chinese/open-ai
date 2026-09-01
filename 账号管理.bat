@@ -1,9 +1,17 @@
 @echo off
-rem open-ai 账号管理 - 图形界面版 (账号 / API管理 / 设置 / 操作日志)
+rem open-ai GUI - account manager (v2.4: branded single-process runtime)
 cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
-    echo [ERROR] 未找到虚拟环境, 请先运行 start.bat
+if not exist ".venv\Scripts\pythonw.exe" (
+    echo [ERROR] venv not found. Run start.bat first.
     pause
     exit /b 1
 )
-start "" ".venv\Scripts\pythonw.exe" scripts\gui_account_manager.py
+rem prefer branded shim (open-ai-manager.exe); build on first use
+if not exist "runtime\Scripts\open-ai-manager.exe" (
+    ".venv\Scripts\python.exe" procname.py >nul 2>nul
+)
+if exist "runtime\Scripts\open-ai-manager.exe" (
+    start "" "runtime\Scripts\open-ai-manager.exe" scripts\gui_account_manager.py
+) else (
+    start "" ".venv\Scripts\pythonw.exe" scripts\gui_account_manager.py
+)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-open-ai 一键启动器 (open-ai-launcher.exe) —— v2.5 新架构版
+open-ai 一键启动器 (open-ai-launcher.exe) —— v2.4 新架构版
 ==========================================================
 双击后自动完成"一键启动", 全程不弹任何终端/控制台窗口:
   1. 首次运行自动构建品牌化运行时 (runtime/, procname.py)

@@ -54,9 +54,9 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 
 ---
 
-## 1. 架构（v2.5 进程管理重构）
+## 1. 架构（v2.4 进程管理重构）
 
-> v2.5 重写了进程管理：所有子进程由唯一的 **Broker 主进程**通过 **Windows Job Object**
+> v2.4 重写了进程管理：所有子进程由唯一的 **Broker 主进程**通过 **Windows Job Object**
 > 统一创建与托管，配合命名管道 IPC 心跳与优雅退出协议，从操作系统层面杜绝孤儿进程。
 > 每个进程在任务管理器里都是独立的 open-ai 品牌 exe（名称/图标/文件描述），
 > 且为**单进程**（不再有 python3.13.exe 子进程污染）。
@@ -95,7 +95,7 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 | 优雅退出 | `bootstrap.py stop` → IPC 广播 shutdown → 子进程自行清理退出 → Job 兜底 |
 | 开机自启后重复点击 | `bootstrap.py start` 幂等（单实例锁），已在跑直接返回 |
 
-### 系统托盘与窗口生命周期（v2.5, 抖音式托盘应用行为）
+### 系统托盘与窗口生命周期（v2.4, 抖音式托盘应用行为）
 图形界面（`账号管理.bat`）关闭 X **不再退出程序**，最小化到系统托盘；后端服务常驻：
 
 | 操作 | 行为 |
@@ -158,7 +158,7 @@ open-ai/
 ├── start.bat               # 一键启动 (建 venv / 装依赖 / 构建 runtime / 起 Broker)
 ├── start_hidden.ps1        # 隐藏窗口启动 (供开机自启调用, 委托 bootstrap)
 ├── open-ai-autostart.bat   # 开机自启入口 (GUI 自启用隐藏 open-ai-autostart.vbs 调 start_hidden.ps1)
-├── runtime/                # ★ v2.5 进程管理运行时 (procname.py 自动构建)
+├── runtime/                # ★ v2.4 进程管理运行时 (procname.py 自动构建)
 │   ├── pyvenv.cfg          #   home = Store Python 包目录
 │   ├── Lib/site-packages   #   junction → .venv 的 site-packages
 │   ├── DLLs/               #   Store 包 DLLs 副本 (WindowsApps ACL 所需)
@@ -184,7 +184,7 @@ open-ai/
 ├── tests/                  # 单元测试 (unittest, 无第三方依赖)
 │   ├── test_api_store.py       # API 密钥管理逻辑测试
 │   ├── test_account_parse.py   # 账号解析逻辑测试
-│   └── test_procman.py         # ★ v2.5 进程管理测试 (Job/IPC/runtime)
+│   └── test_procman.py         # ★ v2.4 进程管理测试 (Job/IPC/runtime)
 ├── logs/  (*.log)          # ★ 运行日志 (broker/gateway_*/trae_*/signin/daemon_boot)
 ├── data/  (状态文件)       # ★ 运行状态 (runtime_state.json/PID/签到状态)
 └── .venv/                  # Python 虚拟环境
@@ -287,7 +287,7 @@ GUI「设置」页点「一键卸载」，或运行安装目录下的 `uninstall
 GUI 内一键卸载以**普通进程直接启动** `uninstall.exe`（免 UAC 弹窗，卸载器已不带
 管理员清单）；手动双击 `uninstall.exe` 同样直接运行。
 
-### 守护与保活（v2.5 三层）
+### 守护与保活（v2.4 三层）
 1. **Broker 监督循环**（`app_runtime.py`）：每 5s 巡检 gateway/trae —— 进程退出或心跳
    超时（45s）→ 指数退避自动重启（30s→1m→2m→4m→8m→15m 封顶，稳定运行 5 分钟后重置）。
    子进程崩溃自动恢复，无需人工干预。

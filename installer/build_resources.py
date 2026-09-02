@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-把 open-ai 项目资源打包成 installer/resources.zip —— v2.5 新架构版
+把 open-ai 项目资源打包成 installer/resources.zip —— v2.4 新架构版
 ====================================================================
 生成安装器需要的资源包 (内含全部代码 + trae/lib 依赖, 不含 venv/runtime/
 logs/data/config.json)。
@@ -16,7 +16,7 @@ import zipfile
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_ZIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources.zip')
 
-# 需要打包的顶层文件/目录 (v2.5: Broker + 托盘 + procname 品牌化运行时)
+# 需要打包的顶层文件/目录 (v2.4: Broker + 托盘 + procname 品牌化运行时)
 INCLUDE = [
     'main.py', 'daemon.py', 'app_runtime.py', 'ipc.py', 'jobmgmt.py',
     'procname.py', 'bootstrap.py', 'launcher_main.py', 'watchdog_boot.py',

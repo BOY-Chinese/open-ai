@@ -1,5 +1,5 @@
 @echo off
-rem open-ai 一键安装包 构建脚本 (Windows + PyInstaller) — v2.5 新架构
+rem open-ai 一键安装包 构建脚本 (Windows + PyInstaller) — v2.4 新架构
 rem 前置: 已安装 Python 3.10+ 并加入 PATH (脚本自动装 pyinstaller + 依赖)
 rem 用法: 双击本脚本 (或根目录 一键构建.bat)
 rem 产出: dist\open-ai-installer-dev.exe (+ uninstall.exe + open-ai-launcher.exe)

@@ -528,10 +528,21 @@ class InstallerApp:
         startup = os.path.join(os.environ.get('APPDATA', ''),
                                'Microsoft', 'Windows', 'Start Menu',
                                'Programs', 'Startup')
-        src = os.path.join(target, 'open-ai-autostart.bat')
-        if os.path.exists(src) and os.path.isdir(startup):
-            shutil.copy(src, os.path.join(startup, 'open-ai-autostart.bat'))
-            self._log('✓ 已配置开机自启')
+        # 用隐藏 VBS 调 start_hidden.ps1 (WindowStyle=0): 开机无控制台窗口、无报错。
+        # 不用 open-ai-autostart.bat 直接进启动文件夹 (bat 会闪现 cmd 控制台)。
+        self._log('配置开机自启 (隐藏启动, 无控制台窗口)...')
+        if os.path.isdir(startup):
+            ps1 = os.path.join(target, 'start_hidden.ps1')
+            vbs = ('Set sh = CreateObject("WScript.Shell")\r\n'
+                   'sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass '
+                   '-WindowStyle Hidden -File ""' + ps1 + '""", 0, False\r\n')
+            try:
+                with open(os.path.join(startup, 'open-ai-autostart.vbs'),
+                          'w', encoding='gbk', newline='') as f:
+                    f.write(vbs)
+                self._log('✓ 已配置开机自启')
+            except Exception as e:
+                self._log(f'⚠ 开机自启配置失败: {e}')
         else:
             self._log('⚠ 开机自启配置失败 (启动文件夹不可用)')
 

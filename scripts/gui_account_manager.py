@@ -28,7 +28,7 @@ open-ai 账号管理 - 图形界面版 (Tkinter)
   - 流水由 daemon 每 5 分钟自动采集, 本地缓存保留 1 个月
 页面5「操作日志」: 点击该页签才显示操作日志
 
-窗口生命周期 (v2.5, 抖音式托盘应用行为):
+窗口生命周期 (v2.4, 抖音式托盘应用行为):
   - 启动时创建系统托盘图标 (scripts/tray_icon.py, 纯 Win32 零依赖)
   - 点击窗口 X = 最小化到托盘: 隐藏主窗口 (任务栏图标随之消失),
     后端服务 (Broker/gateway/trae) 继续运行
@@ -276,7 +276,7 @@ class AccountManagerApp:
         self._model_cache = {'trae': None, 'workbuddy': None}  # 最近一次成功拉取的模型行
         self._model_errs = {'trae': None, 'workbuddy': None}
         self._model_rerender_job = None  # 勾选框触发的重渲染防抖
-        # ---- 托盘生命周期状态 (v2.5) ----
+        # ---- 托盘生命周期状态 (v2.4) ----
         self.tray = None
         self._tray_active = False
         self._exiting = False
@@ -297,7 +297,7 @@ class AccountManagerApp:
         self.root.after(800, self.on_model_refresh)
         # 回读开机自启状态
         self._refresh_autostart_state()
-        # ---- v2.5 系统托盘: 窗口 X = 隐藏到托盘, 托盘退出 = 彻底退出 ----
+        # ---- v2.4 系统托盘: 窗口 X = 隐藏到托盘, 托盘退出 = 彻底退出 ----
         try:
             ok_icon, hwnd = self._set_icon(self.root)
             self._main_hwnd = hwnd
@@ -391,12 +391,12 @@ class AccountManagerApp:
         except Exception:
             self.root.destroy()
 
-    # ================= 托盘生命周期 (v2.5) =================
+    # ================= 托盘生命周期 (v2.4) =================
 
     def _init_tray(self, hwnd=None):
         """创建系统托盘图标 (失败时静默降级为普通窗口)。
 
-        v2.5.1 回调通道: 托盘事件放入线程安全队列, 由主线程
+        v2.4.1 回调通道: 托盘事件放入线程安全队列, 由主线程
         _poll_tray_events 每 60ms 消费 —— 不再跨线程调用 Tk.after
         (部分 Tcl 线程配置下跨线程 after 会抛异常, 曾导致托盘回调
         全部静默失效)。X 按钮关闭走 Tk 原生 WM_DELETE_WINDOW 协议
@@ -1384,30 +1384,56 @@ class AccountManagerApp:
 
     # ---------- 版本与一键更新 ----------
     UPDATE_REPO_API = 'https://api.github.com/repos/BOY-Chinese/open-ai/releases/latest'
-    UPDATE_ASSET_KEYWORD = 'installer'  # release 资产名关键字 (open-ai-installer.exe)
 
     @staticmethod
-    def _current_version():
-        """当前版本号 (根目录 version.py 的 APP_VERSION, 读取失败回退未知)。
-        GUI 以 scripts/gui_account_manager.py 启动时根目录不在 sys.path, 需按路径加载。"""
+    def _version_mod():
+        """读取根目录 version.py 模块 (含 APP_VERSION / UPDATE_CHANNEL)。
+
+        GUI 以 scripts/gui_account_manager.py 启动时根目录不在 sys.path, 需按路径加载。
+        返回模块对象; 任一方式失败返回 None。"""
         try:
-            from version import APP_VERSION
-            return APP_VERSION
+            import version as _v
+            return _v
         except Exception:
             pass
         try:
             import importlib.util
-            p = os.path.join(os.path.dirname(BASE), 'version.py')
+            p = os.path.join(ROOT_DIR, 'version.py')
             spec = importlib.util.spec_from_file_location('openai_version', p)
             m = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(m)
-            return m.APP_VERSION
+            return m
         except Exception:
-            return '(未知)'
+            return None
+
+    @staticmethod
+    def _read_version(name, default):
+        """读取根目录 version.py 的指定字段 (如 APP_VERSION / UPDATE_CHANNEL), 失败回退 default。"""
+        m = AccountManagerApp._version_mod()
+        if m is not None:
+            return getattr(m, name, default)
+        return default
+
+    @staticmethod
+    def _current_version():
+        """当前版本号 (根目录 version.py 的 APP_VERSION, 读取失败回退未知)。"""
+        v = AccountManagerApp._read_version('APP_VERSION', '')
+        return v or '(未知)'
+
+    @staticmethod
+    def _update_asset_keyword():
+        """「一键更新」匹配 GitHub Release 资产的文件名关键词。
+
+        读取 version.UPDATE_CHANNEL: dev 通道 → 精确匹配文件名含 "dev" 的资产
+        (open-ai-installer-dev.exe)。老版本 version.py 无 UPDATE_CHANNEL 时兜底归为
+        dev 通道 (向后兼容必需)。本函数仅处理 dev 通道逻辑, 不含 portable 通道匹配。
+        """
+        ch = (AccountManagerApp._read_version('UPDATE_CHANNEL', '') or '').strip()
+        return ch.lower() if ch else 'dev'
 
     @staticmethod
     def _version_tuple(v):
-        """'v2.3.1' -> (2, 3, 1), 便于比较。"""
+        """'v2.3.1' / 'v2.4-dev' / 'portable-v2.4' -> (2, 3, 1) / (2, 4), 便于比较。"""
         import re
         nums = re.findall(r'\d+', str(v or ''))
         return tuple(int(n) for n in nums) if nums else (0,)
@@ -1430,8 +1456,9 @@ class AccountManagerApp:
                     rel = json.load(resp)
                 tag = rel.get('tag_name') or ''
                 asset_url, asset_name = '', ''
+                asset_keyword = AccountManagerApp._update_asset_keyword()
                 for a in rel.get('assets') or []:
-                    if self.UPDATE_ASSET_KEYWORD in (a.get('name') or '').lower():
+                    if asset_keyword in (a.get('name') or '').lower():
                         asset_url = a.get('browser_download_url') or ''
                         asset_name = a.get('name') or ''
                         break
@@ -1539,23 +1566,31 @@ class AccountManagerApp:
             messagebox.showerror('一键更新', '网络环境错误，无法下载！')
             return
         self._write_log(f'[更新] 下载完成: {dest} ({os.path.getsize(dest)} bytes), 启动安装程序…')
-        try:
-            import subprocess as sp
-            # --dir 传入当前安装目录: 安装器预填路径, 且保留该目录已有 config.json
-            # BREAKAWAY: 安装器须在 GUI 退出后继续运行 (不进 open-ai.gui Job)
-            sp.Popen([dest, '--dir', os.path.dirname(BASE)],
-                     cwd=os.path.dirname(dest),
-                     creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0)
-                     | CREATE_BREAKAWAY_FROM_JOB)
-            messagebox.showinfo(
-                '一键更新',
-                f'安装包 {tag} 已下载并启动安装程序。\n\n'
-                f'按安装向导完成后, 重新打开「账号管理」即可。')
-            self._write_log('[更新] 安装程序已启动')
-        except Exception as e:
-            self._write_log(f'[更新] 安装程序启动失败: {e}')
-            messagebox.showerror('一键更新',
-                                 f'安装程序启动失败:\n{e}')
+        # 安装程序 (open-ai-installer.exe) 要求管理员权限 → ShellExecute runas
+        # 弹 UAC (与双击一致); 普通 Popen 会报 WinError 740 (权限不足)。
+        # 提权进程由 AppInfo 服务创建, 不进 open-ai.gui Job, 无需 BREAKAWAY。
+        ok, err = self._elevated_start(
+            dest, ['--dir', os.path.dirname(BASE)], os.path.dirname(dest))
+        if not ok:
+            # 兜底: GUI 本身已提权运行时直接 Popen 也能成功
+            try:
+                import subprocess as sp
+                sp.Popen([dest, '--dir', os.path.dirname(BASE)],
+                         cwd=os.path.dirname(dest),
+                         creationflags=getattr(sp, 'CREATE_NO_WINDOW', 0)
+                         | CREATE_BREAKAWAY_FROM_JOB)
+            except Exception as e:
+                self._write_log(f'[更新] 安装程序启动失败: {err}; {e}')
+                messagebox.showerror(
+                    '一键更新',
+                    f'安装程序未能启动 (需要管理员授权)。\n{err}\n\n'
+                    f'安装包已下载至:\n{dest}\n可手动右键「以管理员身份运行」。\n{e}')
+                return
+        messagebox.showinfo(
+            '一键更新',
+            f'安装包 {tag} 已下载并启动安装程序。\n\n'
+            f'按安装向导完成后, 重新打开「账号管理」即可。')
+        self._write_log('[更新] 安装程序已启动')
 
     def _autostart_chk_colors(self, checked):
         """返回选中/未选中时钩子的颜色配置 (钩子画在方框内)。
@@ -1659,30 +1694,42 @@ class AccountManagerApp:
                                 'Start Menu', 'Programs', 'Startup')
         return None
 
+    def _autostart_vbs_script(self):
+        """开机自启用隐藏 VBS 内容: 以 WindowStyle=0 调用 start_hidden.ps1 (无任何控制台窗口)。
+
+        之前直接把 open-ai-autostart.bat 拷到启动文件夹 → 开机时 cmd 控制台闪现,
+        且 Broker 未就绪时会显示误导性的「未运行」; 改用 VBS 隐藏启动, 彻底无终端窗口、
+        无报错。若安装路径含中文/空格, VBS 以 GBK 写入, WScript 正常读取。
+        """
+        ps1 = os.path.join(os.path.dirname(BASE), 'start_hidden.ps1')
+        return (
+            'Set sh = CreateObject("WScript.Shell")\r\n'
+            'sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass '
+            '-WindowStyle Hidden -File ""' + ps1 + '""", 0, False\r\n')
+
     def _autostart_src(self):
+        # 保留 bat 引用 (兼容旧版清理与手动入口), 但开机自启改用隐藏 VBS
         return os.path.join(os.path.dirname(BASE), 'open-ai-autostart.bat')
 
     def _autostart_dst(self):
         sd = self._startup_dir()
-        return os.path.join(sd, 'open-ai-autostart.bat') if sd else None
+        return os.path.join(sd, 'open-ai-autostart.vbs') if sd else None
 
     def _read_autostart_status(self):
-        """直接检查启动文件夹里是否存在自启文件。"""
+        """直接检查启动文件夹里是否存在自启文件 (VBS)。"""
         dst = self._autostart_dst()
         return bool(dst) and os.path.isfile(dst)
 
     def _set_autostart(self, enable):
-        """启用/关闭开机自启。返回 (成功否, 消息)。"""
-        import shutil
-        src = self._autostart_src()
+        """启用/关闭开机自启 (隐藏 VBS, 无控制台)。返回 (成功否, 消息)。"""
         dst = self._autostart_dst()
         if not dst:
             return False, '无法定位启动文件夹'
         try:
             if enable:
-                if not os.path.isfile(src):
-                    return False, '找不到 open-ai-autostart.bat'
-                shutil.copy2(src, dst)
+                vbs = self._autostart_vbs_script()
+                with open(dst, 'w', encoding='gbk', newline='') as f:
+                    f.write(vbs)
                 return True, '已写入启动文件夹'
             else:
                 if os.path.isfile(dst):
@@ -1698,6 +1745,56 @@ class AccountManagerApp:
             self.root.after(0, lambda: self._set_autostart_display(status))
         threading.Thread(target=work, daemon=True).start()
 
+    @staticmethod
+    def _elevated_start(exe, args=None, workdir=None):
+        """以管理员权限启动 exe (ShellExecute 'runas' 触发 UAC 提权)。
+
+        返回 (True, '') 或 (False, 原因)。
+        uninstall.exe / open-ai-installer.exe 均以 --uac-admin 打包
+        (requireAdministrator 清单)。普通 Popen/CreateProcess 从未提权
+        进程启动它们必报 WinError 740「请求的操作需要提升」→ 表现为
+        莫名其妙的『权限不足』弹窗; 双击运行走 Explorer 的提权流程
+        所以正常。此处用 ShellExecuteW 复刻双击语义, 两种入口行为一致。
+
+        成功判据: 返回值 > 32 视为启动成功; 但需排除 ERROR_CANCELLED(1223) ——
+        用户在 UAC 弹窗点『否』时 ShellExecute 返回 1223 (也 > 32), 旧代码将其误判为
+        成功, 表现为『点了没反应 / 只退出了界面』。此处显式排除, 授权被拒时如实报错。
+        """
+        try:
+            import ctypes
+            import subprocess as _sp
+            sh = ctypes.windll.shell32.ShellExecuteW
+            sh.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                           ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+            sh.restype = ctypes.c_void_p
+            ret = int(sh(None, 'runas', exe, _sp.list2cmdline(list(args or [])),
+                         workdir, 1))  # SW_SHOWNORMAL
+        except Exception as e:
+            return False, str(e)
+        # >32 = 成功启动; 1223 = ERROR_CANCELLED (用户取消 UAC/授权被拒) → 排除。
+        # <=32 = 错误码 (0=内存不足 2=文件未找到 5=拒绝访问/策略禁止 ...)。
+        if ret > 32 and ret != 1223:
+            return True, ''
+        return False, f'ShellExecute 错误码 {ret} (管理员授权被取消或被拒绝)'
+
+    def _find_uninstall_exe(self):
+        """定位独立卸载程序 uninstall.exe, 找不到返回 ''。
+
+        正常 uninstall.exe 与安装根 (ROOT_DIR) 同级; 个别部署下 GUI 可能从
+        runtime/Scripts 子目录启动 (ROOT_DIR 落到子目录), 此处向上回溯到
+        真正的安装根再定位, 避免『点了一键卸载却找不到/仅退出界面』。
+        """
+        p = os.path.abspath(ROOT_DIR)
+        for _ in range(4):
+            cand = os.path.join(p, 'uninstall.exe')
+            if os.path.isfile(cand):
+                return cand
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        return ''
+
     def _on_uninstall(self):
         """一键卸载 (彻底删除): 调用独立的 uninstall.exe。"""
         if not messagebox.askyesno(
@@ -1711,11 +1808,13 @@ class AccountManagerApp:
                 '此操作不可恢复！'):
             return
 
-        # 调用安装目录内的独立卸载程序 uninstall.exe
+        # 调用安装目录内的独立卸载程序 uninstall.exe (向上回溯定位安装根;
+        # 个别部署下 GUI 可能从 runtime/Scripts 子目录启动)。
+        # 卸载器已改为去掉 --uac-admin 打包, 普通 Popen 直接启动即可, 不弹 UAC 窗口。
         self._write_log('正在启动卸载程序 (uninstall.exe) ...')
         import subprocess as sp
-        uninstall_exe = os.path.join(os.path.dirname(BASE), 'uninstall.exe')
-        if not os.path.exists(uninstall_exe):
+        uninstall_exe = self._find_uninstall_exe()
+        if not uninstall_exe:
             messagebox.showerror('一键卸载',
                                  '未找到 uninstall.exe\n卸载程序缺失, 无法自动卸载。')
             return
@@ -2496,7 +2595,7 @@ def _set_windows_app_id():
 
 
 # ---------------------------------------------------------------------------
-# 单实例互斥 (v2.5, 配合托盘): 已有实例在跑 → 唤醒其主窗口 → 本实例退出
+# 单实例互斥 (v2.4, 配合托盘): 已有实例在跑 → 唤醒其主窗口 → 本实例退出
 # ---------------------------------------------------------------------------
 GUI_MUTEX = 'Local\\open-ai.gui.mutex'
 

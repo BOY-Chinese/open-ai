@@ -9,12 +9,15 @@ open-ai 独立卸载程序 (uninstall.exe) —— 参考 2.3 版可靠卸载逻�
   1. 显示确认界面 (记录安装位置)
   2. 停止网关/daemon/Node/品牌化 shim 进程, 清理开机自启/计划任务/桌面快捷方式
   3. 轮询等待进程真正退出 (防 .venv 目录被占用删不掉)
-  4. 同步删除安装目录 (除自身外), 删除失败如实提示
+  4. 同步删除安装目录 (除自身及其依赖目录外), 删除失败如实提示
   5. 自身 (uninstall.exe) 通过 TEMP 副本延迟删除, 不留残留
 
-打包: python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+打包 (onedir: 无 _MEI 临时目录 → 根治退出时
+"Failed to remove temporary directory" 弹窗; 且启动更快; 不带 --uac-admin, GUI「一键卸载」以普通进程启动即免 UAC):
+  python -m PyInstaller --noconfirm --clean --noupx --windowed ^
+        --contents-directory "uninstall_internal" ^
         --name "uninstall" --icon "ico/open-ai.ico" uninstaller.py
-产出: dist/uninstall.exe
+产出: dist/uninstall/  (uninstall.exe + uninstall_internal/)
 """
 import os
 import shutil
@@ -256,6 +259,8 @@ class UninstallerApp:
             "$startup = [Environment]::GetFolderPath('Startup'); "
             "$autostart = Join-Path $startup 'open-ai-autostart.bat'; "
             "if (Test-Path $autostart) { Remove-Item $autostart -Force }; "
+            "$autostart2 = Join-Path $startup 'open-ai-autostart.vbs'; "
+            "if (Test-Path $autostart2) { Remove-Item $autostart2 -Force }; "
             "$desktop = [Environment]::GetFolderPath('Desktop'); "
             "foreach ($lnk in @('open-ai.lnk','open-ai 账号管理.lnk','open-ai 启动网关.lnk')) { "
             "  $p = Join-Path $desktop $lnk; if (Test-Path $p) { Remove-Item $p -Force } }; "
@@ -281,11 +286,25 @@ class UninstallerApp:
         if not os.path.isdir(self.target):
             return []
         self_exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+        # onedir 打包 (PyInstaller ≥6): 自身依赖目录 (uninstall_internal/) 与 exe
+        # 同级, 运行期间其内 DLL/python DLL 被本进程映射占用, 同步删除必失败。
+        # 同步阶段跳过它, 交给延迟脚本在自身完全退出后清理 (整目录递归删除已覆盖)。
+        self_internal = ''
+        if getattr(sys, 'frozen', False):
+            meipass = getattr(sys, '_MEIPASS', '')
+            if meipass and os.path.isdir(meipass):
+                # onefile: _MEIPASS 在 %TEMP%\_MEIxxxx (不在安装目录内, 无需跳过)
+                # onedir : _MEIPASS = <安装目录>\uninstall_internal
+                if os.path.dirname(os.path.normpath(meipass)) == \
+                        os.path.dirname(os.path.normpath(self_exe)):
+                    self_internal = os.path.normpath(meipass)
         errors = []
-        # 1) 同步删除目录内所有项 (跳过自身), 失败项带重试
+        # 1) 同步删除目录内所有项 (跳过自身与自身依赖目录), 失败项带重试
         for name in sorted(os.listdir(self.target)):
             p = os.path.join(self.target, name)
             if os.path.normcase(p) == os.path.normcase(self_exe):
+                continue
+            if self_internal and os.path.normcase(p) == os.path.normcase(self_internal):
                 continue
             ok = False
             last_err = ''
@@ -308,6 +327,8 @@ class UninstallerApp:
             ps_script = os.path.join(os.environ.get('TEMP', '.'),
                                      f'openai_del_{os.getpid()}.ps1')
             leftover = [os.path.join(self.target, e.split(':', 1)[0]) for e in errors]
+            if self_internal:
+                leftover.append(self_internal)
             leftover_lines = '\n'.join(
                 f"  Remove-Item -LiteralPath '{p}' -Recurse -Force -ErrorAction SilentlyContinue"
                 for p in leftover)

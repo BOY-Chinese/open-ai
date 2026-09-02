@@ -4,6 +4,25 @@
 OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼容接口（`/v1/messages`），
 供 Claude Code、CC Switch、OpenAI 客户端等任意兼容工具统一调用。
 
+> **当前版本: v2.4**（`version.py` 单源定义 `APP_VERSION` / `UPDATE_CHANNEL`）
+> - **dev 版**（开源/开发者版）: `APP_VERSION='v2.4-dev'`、通道 `dev`，需自备 Python 3.10+ 运行环境；
+> - **portable 版**（普通用户版）: `APP_VERSION='portable-v2.4'`、通道 `portable`，安装包内建运行时，
+>   对电脑运行环境要求大大降低。
+> 两个通道互不干扰，「一键更新」按 `UPDATE_CHANNEL` 在 GitHub Release Assets 中精确匹配对应安装包
+> （dev → `open-ai-installer-dev.exe`；portable → `open-ai-installer-portable.exe`）。
+
+## v2.4 更新内容
+
+1. **查看积分消耗**：新增积分消耗页，可查看当天积分消耗与近 3 周逐日消耗（柱状图），
+   **每 5 分钟自动更新**（与 Broker 采集节奏一致）。
+2. **后端进程统一托管**：open-ai 全部后端进程（网关/Node/任务）全部被纳入
+   `open-ai-daemon`（Broker）这个**父进程**统一托管（Windows Job Object 进程树），
+   停止/退出即整树退出，不再产生孤儿进程。
+3. **系统托盘管理**：open-ai 加入系统托盘，可在托盘**一键退出**全部运行中的进程
+   （窗口 X 最小化到托盘，托盘右键退出）。
+4. **发布 portable 版**：发布面向普通用户的 **portable 版**，对电脑运行环境要求大大降低
+   （无需自装 Python/Node，安装包内建运行时）；同时依旧保留开源 **dev 版**。
+
 ---
 
 ## 0. 环境要求
@@ -138,7 +157,7 @@ open-ai/
 ├── 账号管理.bat            # ★ 图形界面入口 (账号/API管理/设置/日志)
 ├── start.bat               # 一键启动 (建 venv / 装依赖 / 构建 runtime / 起 Broker)
 ├── start_hidden.ps1        # 隐藏窗口启动 (供开机自启调用, 委托 bootstrap)
-├── open-ai-autostart.bat   # 开机自启入口 (放启动文件夹)
+├── open-ai-autostart.bat   # 开机自启入口 (GUI 自启用隐藏 open-ai-autostart.vbs 调 start_hidden.ps1)
 ├── runtime/                # ★ v2.5 进程管理运行时 (procname.py 自动构建)
 │   ├── pyvenv.cfg          #   home = Store Python 包目录
 │   ├── Lib/site-packages   #   junction → .venv 的 site-packages
@@ -234,7 +253,9 @@ open-ai/
   上游为同一模型返回的多个内部功能配置（refactor_* 管道、*_advisor* 变体等）已按
   展示名+上游 id 归并去重，列表不再出现完全相同的重复行
 - **设置**：开机自动运行开关、一键卸载；显示当前版本号（根目录 `version.py`），
-  「一键更新」检查并跳转 GitHub 最新 release（`BOY-Chinese/open-ai/releases`），
+  「一键更新」按 `UPDATE_CHANNEL` 在 GitHub Release Assets 中精确匹配对应通道安装包
+  （dev → `open-ai-installer-dev.exe`；portable → `open-ai-installer-portable.exe`；仓库
+  `BOY-Chinese/open-ai/releases`），
   确认后自动下载安装包并启动安装，网络异常时提示「网络环境错误，无法下载！」
 - **操作日志**：查看后台操作输出
 
@@ -256,11 +277,15 @@ start.bat        # 首次建 .venv 装依赖 + 构建品牌化进程 (runtime/),
 ### 生产/无窗口常驻（推荐）
 `open-ai-autostart.bat` 以隐藏窗口拉起 Broker（不弹窗），由 Broker 统一托管网关/Node/任务：
 - 手动：`open-ai-autostart.bat`
-- 开机自启：GUI「设置」页勾选「开机自动运行」（把 `open-ai-autostart.bat` 复制到启动文件夹）
+- 开机自启：GUI「设置」页勾选「开机自动运行」（向启动文件夹写入隐藏启动脚本
+  `open-ai-autostart.vbs`，以无窗口方式调用 `start_hidden.ps1` 拉起 Broker —— **开机无任何
+  控制台窗口/报错闪现**，卸载时自动清理 `.vbs`/`.bat`/计划任务）
 
 ### 卸载
 GUI「设置」页点「一键卸载」，或运行安装目录下的 `uninstall.exe`：停止全部进程、
 移除开机自启/计划任务/桌面快捷方式，并彻底删除插件目录（含配置与账号）。
+GUI 内一键卸载以**普通进程直接启动** `uninstall.exe`（免 UAC 弹窗，卸载器已不带
+管理员清单）；手动双击 `uninstall.exe` 同样直接运行。
 
 ### 守护与保活（v2.5 三层）
 1. **Broker 监督循环**（`app_runtime.py`）：每 5s 巡检 gateway/trae —— 进程退出或心跳
@@ -391,10 +416,12 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 Broker 白天反�
 | TRAE 签到一直 9074 | 检查 `config.json` 的 `device_id` / `x-device-id` 是否为**真实客户端 machineid**（见 §3），占位符/伪造值必 9074 |
 | 网关起不来 | 看 `logs\gateway_err.log`；确认 `start.bat` 已建好 `.venv` 且装了依赖；`bootstrap.py doctor` 全量诊断 |
 | 端口被占 | `bootstrap.py doctor` 显示端口占用；8000/18787 被**非 open-ai** 进程占用时 Broker 会反复重启该角色（看 `logs\broker.log`） |
-| 开机没自启 | 确认启动文件夹里有 `open-ai-autostart.bat`（在 账号管理.bat 设置页勾选「开机自动运行」） |
+| 开机没自启 | 确认启动文件夹里有 `open-ai-autostart.vbs`（在 账号管理.bat 设置页勾选「开机自动运行」） |
 | Broker/服务没在跑 | 先 `bootstrap.py status` / `doctor`；计划任务 `OpenAI-DaemonBoot` 每 5 分钟兜底拉起；手动 `bootstrap.py start` |
 | 想彻底关掉所有进程 | 托盘右键「退出」（GUI 内一键）；或 `bootstrap.py stop`（优雅，二者均抑制 watchdog 复活 10 分钟）；或任务管理器结束 `open-ai-daemon.exe`（Job Object 连带终止全部子进程） |
 | runtime 构建失败 | 删除 `runtime\` 目录后重新运行 `start.bat`（自动重建）；解释器需为 Store Python 3.13 或 python.org 3.10+（任选其一） |
+| 开机自启弹控制台/报「daemon 未运行」 | v2.4 已修复：开机自启改为隐藏 VBS（无窗口）调用 `start_hidden.ps1`；若仍弹旧版残留的启动项/计划任务，用「一键卸载」清理后重装即可 |
+| 启动/卸载时弹 "Failed to remove temporary directory: ...\_MEIxxxxxx" | 已修复（launcher/uninstaller 改 PyInstaller onedir 打包，不再解压 `%TEMP%` 临时目录；onefile 引导器在 VM/杀软锁定文件时无法清理才会弹此框） |
 
 ---
 

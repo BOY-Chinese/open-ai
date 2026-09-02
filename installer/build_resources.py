@@ -26,15 +26,17 @@ INCLUDE = [
     '账号管理.bat',
     'providers', 'scripts', 'trae', 'tests', 'pic',
 ]
-# 额外文件 (来自 installer/ 目录, 打进资源包)
-# 注: pic/open-ai.ico 已随 pic/ 目录遍历自动包含, 无需重复
-EXTRA_FILES = {
-    # 独立卸载程序 (由 build_exe.bat 先生成 installer/uninstall.exe, 再打进资源)
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uninstall.exe'):
-        'uninstall.exe',
-    # 一键启动器 (由 build_exe.bat 先生成 installer/open-ai-launcher.exe, 再打进资源)
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'open-ai-launcher.exe'):
-        'open-ai-launcher.exe',
+# 额外目录 (来自 installer/dist/, PyInstaller onedir 产物):
+#   键 = 源目录; 值 = zip 内基准路径 ('' = 装到安装根)。
+# onedir 布局: uninstall.exe + uninstall_internal/、open-ai-launcher.exe +
+# launcher_internal/, exe 位于安装根, 依赖目录随资源包一起解压到安装根。
+# (onefile 打包退出时 bootloader 清理 %TEMP%\_MEI 失败会弹
+#  "Failed to remove temporary directory" 警告框, onedir 无临时目录, 根治。)
+EXTRA_DIRS = {
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dist', 'uninstall'):
+        '',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dist', 'open-ai-launcher'):
+        '',
 }
 # 排除项 (相对 project root)
 EXCLUDE_DIRS = {'__pycache__', '.venv', 'runtime', 'logs', 'data', '.git', 'installer'}
@@ -81,13 +83,28 @@ def build():
                             zf.write(full, rel)
                             count += 1
                             total_bytes += os.path.getsize(full)
-        # 追加额外文件
-        for src, arcname in EXTRA_FILES.items():
-            if os.path.exists(src):
-                zf.write(src, arcname)
-                count += 1
-                total_bytes += os.path.getsize(src)
-                print(f'  [附加] -> {arcname}')
+        # 追加额外目录 (onedir exe + 依赖目录, 递归打包)
+        for src_dir, base in EXTRA_DIRS.items():
+            if not os.path.isdir(src_dir):
+                print(f'[错误] 缺少 onedir 产物目录: {src_dir}')
+                print('       请先运行 build_exe.bat 生成 PyInstaller 产物。')
+                sys.exit(1)
+            if not any(should_include(os.path.relpath(os.path.join(r, f), src_dir).replace('\\', '/'))
+                       for r, _, fs in os.walk(src_dir) for f in fs):
+                print(f'[警告] {src_dir} 为空, 未打包任何内容')
+                continue
+            packed = 0
+            for root, dirs, files in os.walk(src_dir):
+                for f in files:
+                    full = os.path.join(root, f)
+                    rel = os.path.relpath(full, src_dir).replace('\\', '/')
+                    arcname = f'{base}/{rel}'.lstrip('/') if base else rel
+                    if should_include(arcname):
+                        zf.write(full, arcname)
+                        count += 1
+                        total_bytes += os.path.getsize(full)
+                        packed += 1
+            print(f'  [附加] {os.path.basename(src_dir)}/ -> {base or "(安装根)"} ({packed} 个文件)')
     size_mb = os.path.getsize(OUT_ZIP) / 1024 / 1024
     print(f'[完成] 打包 {count} 个文件, {total_bytes/1024/1024:.1f} MB -> {size_mb:.1f} MB zip')
     print(f'  输出: {OUT_ZIP}')

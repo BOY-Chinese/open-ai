@@ -413,6 +413,8 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 Broker 白天反�
 
 | 现象 | 排查 |
 |---|---|
+| 安装器报「依赖安装失败: [WinError 2] 系统找不到指定的文件」 | venv 静默损坏（Python 3.13/3.14 已知问题：`venvlauncher.exe` 复制失败时 `python -m venv` 仍返回成功，但 `.venv\Scripts\python.exe` 未生成）。新版安装器会自动校验/重建/修复并兜底直装；旧版安装器可先删除安装目录下的 `.venv` 再重装，或把安装目录加入杀软信任区。若仍失败，看安装目录下 `pip-install-error.log` |
+| 安装器报「No matching distribution found for playwright (from versions: none)」，但其他包正常 | ① Python 非 64 位（playwright 只发 win_amd64 wheel，ARM64/32 位 Python 全部被过滤）→ 新版安装器已自动检测并补装 64 位 Python 3.12；② 镜像源对该包解析异常/pip 本地缓存污染 → 新版安装器已自动切换多镜像源（清华→阿里云→腾讯云→官方）并禁用本地缓存。旧版安装器手动处理：`python -c "import platform,struct;print(platform.machine(),struct.calcsize('P')*8)"` 确认是 `AMD64 64`，不是则改装 64 位 Python；架构无误则在 pip 命令后加 `--no-cache-dir -i https://mirrors.aliyun.com/pypi/simple` |
 | TRAE 签到一直 9074 | 检查 `config.json` 的 `device_id` / `x-device-id` 是否为**真实客户端 machineid**（见 §3），占位符/伪造值必 9074 |
 | 网关起不来 | 看 `logs\gateway_err.log`；确认 `start.bat` 已建好 `.venv` 且装了依赖；`bootstrap.py doctor` 全量诊断 |
 | 端口被占 | `bootstrap.py doctor` 显示端口占用；8000/18787 被**非 open-ai** 进程占用时 Broker 会反复重启该角色（看 `logs\broker.log`） |

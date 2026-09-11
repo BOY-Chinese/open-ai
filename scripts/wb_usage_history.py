@@ -52,6 +52,28 @@ PAGE_SIZE = 100
 MAX_PAGES = 100          # 安全上限
 UA_WB = 'WorkBuddy/5.3.12 WorkBuddy/5.3.12 CLI/2.115.0'
 
+# ---- WorkBuddy 系平台规格 (国内 / 国际) ----
+# 接口路径**完全一致**, 只差 host 与 X-Product-Code ——
+# 国际版必须带 `X-Product-Code: workbuddy-ai` (实测确认)。
+WB_PLATFORMS = {
+    'workbuddy': {'provider': 'workbuddy', 'host': 'https://copilot.tencent.com',
+                  'domain': 'www.workbuddy.cn', 'product': 'SaaS',
+                  'label': 'WorkBuddy'},
+    'workbuddy_intl': {'provider': 'workbuddy_intl', 'host': 'https://www.workbuddy.ai',
+                       'domain': 'www.workbuddy.ai', 'product': 'workbuddy-ai',
+                       'label': 'WorkBuddy 国际'},
+}
+# 当前生效平台 (由 --platform 设置); 默认国内版, 保持旧行为不变
+PLATFORM = 'workbuddy'
+
+
+def cur_spec():
+    return WB_PLATFORMS[PLATFORM]
+
+
+def cur_host():
+    return cur_spec()['host']
+
 
 def ts():
     return time.strftime('%Y-%m-%d %H:%M:%S')
@@ -62,10 +84,14 @@ def log(msg):
 
 
 def load_wb_cfg():
+    """按当前平台读取账号与 (domain, product)。"""
+    spec = cur_spec()
     with open(OPENAI_CFG, encoding='utf-8') as f:
         cfg = json.load(f)
-    wb = (cfg.get('providers') or {}).get('workbuddy') or {}
-    return wb.get('accounts') or [], wb.get('domain', 'www.workbuddy.cn'), wb.get('product', 'SaaS')
+    wb = (cfg.get('providers') or {}).get(spec['provider']) or {}
+    return (wb.get('accounts') or [],
+            wb.get('domain', spec['domain']),
+            wb.get('product', spec['product']))
 
 
 def post_json(url, headers, body, timeout=25):
@@ -81,7 +107,7 @@ def post_json(url, headers, body, timeout=25):
 
 
 def make_headers(acc, domain, product):
-    return {
+    headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
         'Authorization': f"Bearer {acc.get('accessToken', '')}",
@@ -92,13 +118,17 @@ def make_headers(acc, domain, product):
         'User-Agent': UA_WB,
         'Accept-Language': 'zh',
     }
+    # 国际版额外要求产品编码
+    if '.ai' in cur_host():
+        headers['X-Product-Code'] = product
+    return headers
 
 
 def fetch_page(headers, start, end, page_num, page_size=PAGE_SIZE):
     """v1 页码式拉一页逐笔流水. 返回 (total, items, err)。"""
     body = {'startTime': f'{start} 00:00:00', 'endTime': f'{end} 23:59:59',
             'pageNum': page_num, 'pageSize': page_size}
-    code, raw = post_json(HOST + REQ_URL, headers, body)
+    code, raw = post_json(cur_host() + REQ_URL, headers, body)
     if code == 401 or code == 403:
         return None, None, f'token 无效或无权限 ({code}), 请重新登录'
     if code != 200:
@@ -120,7 +150,7 @@ def fetch_all(headers, start, end, max_pages=MAX_PAGES):
         body = {'startTime': f'{start} 00:00:00', 'endTime': f'{end} 23:59:59',
                 'timezone': 'Asia/Shanghai', 'pageSize': PAGE_SIZE,
                 'version': 2, 'pageToken': token}
-        code, raw = post_json(HOST + REQ_URL, headers, body)
+        code, raw = post_json(cur_host() + REQ_URL, headers, body)
         if code != 200:
             err = f'HTTP {code}: {raw[:120]}'
             break
@@ -145,7 +175,7 @@ def fetch_daily(headers, start, end):
     """按天汇总. 返回 ({date: credit}, err)。"""
     body = {'startTime': f'{start} 00:00:00', 'endTime': f'{end} 23:59:59',
             'pageNum': 1, 'pageSize': 366}
-    code, raw = post_json(HOST + DAILY_URL, headers, body)
+    code, raw = post_json(cur_host() + DAILY_URL, headers, body)
     if code != 200:
         return None, f'HTTP {code}: {raw[:120]}'
     try:
@@ -235,7 +265,10 @@ def csv_export(rows, path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='WorkBuddy 逐笔积分消耗流水查询')
+    global PLATFORM
+    ap = argparse.ArgumentParser(description='WorkBuddy 逐笔积分消耗流水查询 (国内 / 国际)')
+    ap.add_argument('--platform', choices=list(WB_PLATFORMS), default='workbuddy',
+                    help='平台: workbuddy(国内, 默认) / workbuddy_intl(国际)')
     ap.add_argument('--days', type=int, default=7, help='查询最近 N 天 (默认 7)')
     ap.add_argument('--uid', help='只查指定 userId 前缀的账号')
     ap.add_argument('--daily', action='store_true', help='按天汇总视图')
@@ -243,6 +276,7 @@ def main():
     ap.add_argument('--json', action='store_true', help='输出原始 JSON')
     ap.add_argument('--csv', metavar='PATH', help='导出 CSV 到指定路径')
     args = ap.parse_args()
+    PLATFORM = args.platform
 
     try:
         accounts, domain, product = load_wb_cfg()
@@ -255,10 +289,11 @@ def main():
             log(f'未找到 userId 前缀为 {args.uid} 的账号')
             return 1
     if not accounts:
-        log('无 WorkBuddy 账号, 请先用 账号管理.bat 添加')
+        log(f"无 {cur_spec()['label']} 账号, 请先用 账号管理.bat 添加")
         return 1
 
-    log(f'=== WorkBuddy 逐笔消耗流水 (最近 {args.days} 天{" | 按天汇总" if args.daily else ""}) ===')
+    log(f"=== {cur_spec()['label']} 逐笔消耗流水 "
+        f"(最近 {args.days} 天{' | 按天汇总' if args.daily else ''}) ===")
     exit_code = 0
     json_dump = {}
     for i, acc in enumerate(accounts, 1):

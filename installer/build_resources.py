@@ -16,11 +16,11 @@ import zipfile
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_ZIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources.zip')
 
-# 需要打包的顶层文件/目录 (v2.4: Broker + 托盘 + procname 品牌化运行时)
+# 需要打包的顶层文件/目录 (v3.0: Broker + 托盘 + procname 品牌化运行时 + 桌面端)
 INCLUDE = [
     'main.py', 'daemon.py', 'app_runtime.py', 'ipc.py', 'jobmgmt.py',
     'procname.py', 'bootstrap.py', 'launcher_main.py', 'watchdog_boot.py',
-    'anthropic_api.py', 'version.py', 'launcher_version.txt',
+    'anthropic_api.py', 'admin_api.py', 'version.py', 'launcher_version.txt',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',
     '账号管理.bat',
@@ -38,6 +38,20 @@ EXTRA_DIRS = {
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dist', 'open-ai-launcher'):
         '',
 }
+
+# ── v3.0：桌面端（Tauri 2 + React）资源 ──
+# 产物来自 desktop-ui/ 的构建，安装后位于 <安装根>/desktop/：
+#   desktop/open-ai-desktop.exe   Tauri 应用（WebView2 内嵌前端）
+#   desktop/resources/            前端静态资源（dist/ 内容）
+# 注：node_modules / src-tauri/target 等构建中间产物一律不带。
+DESKTOP_SRC = os.path.join(PROJECT_ROOT, 'desktop-ui')
+DESKTOP_EXE_CANDIDATES = [
+    # 优先 release，缺失则回落 debug（便于快速验证）
+    os.path.join(DESKTOP_SRC, 'src-tauri', 'target', 'release', 'open-ai-desktop.exe'),
+    os.path.join(DESKTOP_SRC, 'src-tauri', 'target', 'debug', 'open-ai-desktop.exe'),
+]
+DESKTOP_DIST = os.path.join(DESKTOP_SRC, 'dist')
+
 # 排除项 (相对 project root)
 EXCLUDE_DIRS = {'__pycache__', '.venv', 'runtime', 'logs', 'data', '.git', 'installer'}
 EXCLUDE_EXTS = {'.pyc', '.log'}
@@ -56,6 +70,39 @@ def should_include(relpath: str) -> bool:
         if basename.endswith(ext):
             return False
     return True
+
+
+def build_desktop(zf, count: int, total_bytes: int):
+    """打包桌面端（Tauri exe + 前端资源）到 zip 内的 desktop/ 下。
+
+    缺失时只告警不中断 —— 保证「仅后端」安装包仍可构建，
+    便于 python 侧单独发版。
+    """
+    exe = next((p for p in DESKTOP_EXE_CANDIDATES if os.path.isfile(p)), None)
+    if exe is None:
+        print('[警告] 未找到 open-ai-desktop.exe，跳过桌面端（请先构建 desktop-ui）')
+        return count, total_bytes
+
+    arc = 'desktop/open-ai-desktop.exe'
+    zf.write(exe, arc)
+    count += 1
+    total_bytes += os.path.getsize(exe)
+    print(f'  [附加] 桌面端 exe -> {arc} '
+          f'({os.path.getsize(exe)/1024/1024:.1f} MB, {os.path.basename(os.path.dirname(os.path.dirname(exe)))} 构建)')
+
+    if not os.path.isdir(DESKTOP_DIST):
+        print('[警告] 缺少前端构建产物 desktop-ui/dist，exe 将无法加载界面')
+        return count, total_bytes
+
+    for root, _dirs, files in os.walk(DESKTOP_DIST):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, DESKTOP_DIST).replace('\\', '/')
+            zf.write(full, f'desktop/resources/{rel}')
+            count += 1
+            total_bytes += os.path.getsize(full)
+    print(f'  [附加] 前端资源 -> desktop/resources/ ({len(os.listdir(os.path.join(DESKTOP_DIST, "assets"))) if os.path.isdir(os.path.join(DESKTOP_DIST, "assets")) else 0} 个 assets)')
+    return count, total_bytes
 
 
 def build():
@@ -105,6 +152,8 @@ def build():
                         total_bytes += os.path.getsize(full)
                         packed += 1
             print(f'  [附加] {os.path.basename(src_dir)}/ -> {base or "(安装根)"} ({packed} 个文件)')
+        # 追加桌面端（Tauri exe + 前端资源）
+        count, total_bytes = build_desktop(zf, count, total_bytes)
     size_mb = os.path.getsize(OUT_ZIP) / 1024 / 1024
     print(f'[完成] 打包 {count} 个文件, {total_bytes/1024/1024:.1f} MB -> {size_mb:.1f} MB zip')
     print(f'  输出: {OUT_ZIP}')

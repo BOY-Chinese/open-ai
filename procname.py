@@ -49,17 +49,17 @@ VENV_SITE = os.path.join(BASE, '.venv', 'Lib', 'site-packages')
 PTH_FILE = os.path.join(VENV_SITE, 'openai_runtime.pth')
 STAMP_FILE = os.path.join(RUNTIME_DIR, '.build-stamp')
 
-# 版本号单源: 取自根目录 version.py 的 APP_VERSION (如 'v2.4-dev'), 提取纯数字段
-# (2.4.0) 作为 Windows 版本资源 FileVersion/ProductVersion, 与 GUI 显示一致。
+# 版本号单源: 取自根目录 version.py 的 APP_VERSION (如 'v3.0-dev'), 提取纯数字段
+# (3.0.0) 作为 Windows 版本资源 FileVersion/ProductVersion, 与 GUI 显示一致。
 # 读取失败 (拖拽运行/CI 测试等场景) 兜底旧版本号, 避免运行时构建崩溃。
 import re as _re
 try:
     from version import APP_VERSION as _APP_VERSION
 except Exception:
-    _APP_VERSION = '2.4.0'
+    _APP_VERSION = '3.0.0'
 _VER_NUMS = _re.findall(r'\d+', str(_APP_VERSION or ''))
 # 补足到至少 3 段 (x.y.z), 避免 'v2.4' 只取到 '2.4' 时版本资源过短
-APP_VERSION = '.'.join((_VER_NUMS + ['0', '0'])[:3]) if _VER_NUMS else '2.4.0'
+APP_VERSION = '.'.join((_VER_NUMS + ['0', '0'])[:3]) if _VER_NUMS else '3.0.0'
 
 # 是否打印解释器定位来源 (诊断用; 环境变量 open_ai_verbose_resolve=1 开启)
 _VERBOSE_RESOLVE = os.environ.get('open_ai_verbose_resolve') == '1'

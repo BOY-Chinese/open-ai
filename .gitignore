@@ -32,3 +32,14 @@ installer/resources.zip
 installer/build/
 installer/dist/
 installer/*.spec
+
+# ── v3.0 桌面端（Tauri + React）──
+desktop-ui/node_modules/
+desktop-ui/tools/node_modules_tools/
+desktop-ui/dist/
+desktop-ui/src-tauri/target/
+desktop-ui/src-tauri/gen/
+desktop-ui/build-*.log
+desktop-ui/src-tauri/build*.log
+desktop-ui/.vite/
+desktop-ui/docs/screenshots/*.png

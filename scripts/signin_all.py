@@ -6,6 +6,7 @@ open-ai 内部签到脚本 (不依赖任何外部脚本/目录)
 合并原 auto_renew.py + checkin_all.py 的功能, 数据源全部来自 open-ai 自身 config:
   * TRAE token 自动续期   : config.json providers.trae (accounts[].cookie -> GetUserToken)
   * WorkBuddy 每日签到    : config.json providers.workbuddy (copilot.tencent.com)
+  * WB 国际版每日签到     : config.json providers.workbuddy_intl (www.workbuddy.ai)
   * TRAE 每日签到         : config.json providers.trae (api.trae.cn)
 
 用法:
@@ -215,8 +216,8 @@ def today_str():
     return time.strftime('%Y-%m-%d')
 
 
-def _wb_pack_credited_today(acc, domain, product):
-    """检查该 WB 账号今天是否有入账的资源包 (签到积分到账的真实凭证)。"""
+def _wb_headers(acc, domain, product):
+    """WorkBuddy 系请求头: 国际版额外带 X-Product-Code。"""
     headers = {
         'Accept': 'application/json', 'Content-Type': 'application/json',
         'Authorization': f"Bearer {acc.get('accessToken', '')}",
@@ -225,7 +226,16 @@ def _wb_pack_credited_today(acc, domain, product):
         # ⚠️ 不能带 X-Enterprise-Id: 会切到企业视角, 个人资源包被隐藏
         'User-Agent': UA_WB,
     }
-    code, raw = post_json('https://copilot.tencent.com/billing/meter/get-user-resource', headers)
+    if str(domain).endswith('.ai'):
+        headers['X-Product-Code'] = product
+    return headers
+
+
+def _wb_pack_credited_today(acc, domain, product,
+                            base='https://copilot.tencent.com'):
+    """检查该 WB 账号今天是否有入账的资源包 (签到积分到账的真实凭证)。"""
+    headers = _wb_headers(acc, domain, product)
+    code, raw = post_json(base + '/billing/meter/get-user-resource', headers)
     if code != 200:
         return True   # 查询失败时保守放行, 不阻断正常流程
     try:
@@ -244,34 +254,34 @@ def _wb_pack_credited_today(acc, domain, product):
     return False
 
 
-def wb_checkin_one(acc, domain, product):
+def wb_checkin_one(acc, domain, product,
+                   base='https://copilot.tencent.com', tag='WB签到'):
+    """WorkBuddy 系签到 (国内 host=copilot.tencent.com, 国际版 host=www.workbuddy.ai)。
+
+    国际版与国内版接口路径完全一致, 差异只有 host 与 X-Product-Code,
+    故用 base/tag 参数化复用同一套补领与资源包校验逻辑。
+    """
     uid = acc.get('userId', '?')
-    headers = {
-        'Accept': 'application/json', 'Content-Type': 'application/json',
-        'Authorization': f"Bearer {acc.get('accessToken', '')}",
-        'X-User-Id': uid, 'X-Domain': domain, 'X-Product': product,
-        'User-Agent': UA_WB,
-    }
-    base = 'https://copilot.tencent.com'
+    headers = _wb_headers(acc, domain, product)
     code, raw = post_json(base + '/billing/meter/checkin-status', headers)
     if code != 200:
-        log('WB签到', f'账号{uid} 状态查询失败 HTTP {code}')
+        log(tag, f'账号{uid} 状态查询失败 HTTP {code}')
         return
     try:
         d = json.loads(raw)
         st = d.get('data') or {}
     except Exception:
-        log('WB签到', f'账号{uid} 状态解析失败: {raw[:100]}')
+        log(tag, f'账号{uid} 状态解析失败: {raw[:100]}')
         return
     if st.get('today_checked_in'):
-        log('WB签到', f'账号{uid} 今日已签到 (streak={st.get("streak_days", 0)})')
+        log(tag, f'账号{uid} 今日已签到 (streak={st.get("streak_days", 0)})')
         return
     # 注意: 不依赖 status 的 active 字段判断是否跳过 —— 实测即使 active=false,
     # daily-checkin 也照常返回 code:0/credit:100 (每日基础积分可领)。
     # 若 active=false 就跳过, 会漏签。改为始终调用 daily-checkin,
     # 由服务端幂等处理 (重复领取返回 400 / 已签)。
     if not st.get('active'):
-        log('WB签到', f'账号{uid} active=false 但仍尝试直接领取')
+        log(tag, f'账号{uid} active=false 但仍尝试直接领取')
     code, raw = post_json(base + '/billing/meter/daily-checkin', headers)
     try:
         result = json.loads(raw)
@@ -281,14 +291,14 @@ def wb_checkin_one(acc, domain, product):
     if c == 0:
         credit = (result.get('data') or {}).get('credit', '')
         streak = (result.get('data') or {}).get('streak_days', '')
-        log('WB签到', f'账号{uid} 签到成功! credit={credit} streak={streak}')
+        log(tag, f'账号{uid} 签到成功! credit={credit} streak={streak}')
     elif c == 10001:
         # ⚠️ 10001 不能盲信为"已签": 实测 0 点跨天边界服务端会误报 10001,
         # 而实际积分没到账 (当日无入账资源包)。用资源包校验, 无入账则补领一次。
-        if _wb_pack_credited_today(acc, domain, product):
-            log('WB签到', f'账号{uid} 今日已签到(10001, 资源包已入账)')
+        if _wb_pack_credited_today(acc, domain, product, base=base):
+            log(tag, f'账号{uid} 今日已签到(10001, 资源包已入账)')
         else:
-            log('WB签到', f'账号{uid} 10001 但无入账包(疑似跨天误报), 补领...')
+            log(tag, f'账号{uid} 10001 但无入账包(疑似跨天误报), 补领...')
             time.sleep(3)
             code2, raw2 = post_json(base + '/billing/meter/daily-checkin', headers)
             try:
@@ -297,14 +307,23 @@ def wb_checkin_one(acc, domain, product):
                 r2 = {}
             if r2.get('code') == 0:
                 credit2 = (r2.get('data') or {}).get('credit', '')
-                log('WB签到', f'账号{uid} 补领成功! credit={credit2}')
+                log(tag, f'账号{uid} 补领成功! credit={credit2}')
             else:
-                log('WB签到', f'账号{uid} 补领仍失败 code={r2.get("code")} '
-                              f'(若持续, 检查 {today_str()} 资源包是否入账)')
+                log(tag, f'账号{uid} 补领仍失败 code={r2.get("code")} '
+                         f'(若持续, 检查 {today_str()} 资源包是否入账)')
     elif c == 400:
-        log('WB签到', f'账号{uid} 今日已签到(HTTP 400/重复领取)')
+        log(tag, f'账号{uid} 今日已签到(HTTP 400/重复领取)')
     else:
-        log('WB签到', f'账号{uid} 签到失败 code={c} message={result.get("message") or result.get("msg") or ""} raw={raw[:200]}')
+        log(tag, f'账号{uid} 签到失败 code={c} message={result.get("message") or result.get("msg") or ""} raw={raw[:200]}')
+
+
+# 国际版 host (与国内版接口路径完全一致)
+WB_INTL_BASE = 'https://www.workbuddy.ai'
+
+
+def wb_intl_checkin_one(acc, domain, product):
+    """WorkBuddy 国际版签到 (www.workbuddy.ai)。"""
+    wb_checkin_one(acc, domain, product, base=WB_INTL_BASE, tag='WB国际签到')
 
 
 # ================= TRAE 签到 =================
@@ -421,6 +440,18 @@ def main():
                 wb_checkin_one(acc, domain, product)
             else:
                 log('WB签到', f"账号{acc.get('userId', '?')} 今日已入账, 跳过")
+        # 国际版同样走 --wb-only 补签 (daemon 白天补试也覆盖国际版账号)
+        wbai = providers.get('workbuddy_intl') or {}
+        wbai_accs = wbai.get('accounts') or []
+        i_domain = wbai.get('domain', 'www.workbuddy.ai')
+        i_product = wbai.get('product', 'workbuddy-ai')
+        if wbai_accs:
+            log('WB国际签到', f'--wb-only 补签检查 ({len(wbai_accs)} 个账号)')
+            for acc in wbai_accs:
+                if not _wb_pack_credited_today(acc, i_domain, i_product, base=WB_INTL_BASE):
+                    wb_intl_checkin_one(acc, i_domain, i_product)
+                else:
+                    log('WB国际签到', f"账号{acc.get('userId', '?')} 今日已入账, 跳过")
         log('WB补签', '本轮补签检查完成')
         sys.exit(0)
 
@@ -446,6 +477,15 @@ def main():
         log('WB签到', f'WorkBuddy 签到 ({len(wb_accs)} 个账号)')
         for acc in wb_accs:
             wb_checkin_one(acc, domain, product)
+
+        # 2.5) WorkBuddy 国际版签到 (host=www.workbuddy.ai, 接口路径同国内版)
+        wbai = providers.get('workbuddy_intl') or {}
+        wbai_accs = wbai.get('accounts') or []
+        i_domain = wbai.get('domain', 'www.workbuddy.ai')
+        i_product = wbai.get('product', 'workbuddy-ai')
+        log('WB国际签到', f'WorkBuddy 国际版签到 ({len(wbai_accs)} 个账号)')
+        for acc in wbai_accs:
+            wb_intl_checkin_one(acc, i_domain, i_product)
 
     # 3) TRAE 签到 (始终执行)
     log('TRAE签到', f'TRAE 签到 ({len(trae_accs)} 个账号)')

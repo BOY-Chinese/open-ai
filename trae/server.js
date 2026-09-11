@@ -227,6 +227,7 @@ const MODEL_REFRESH_INTERVAL = (CFG.modelRefreshInterval || 86400) * 1000; // �
 let DYNAMIC_MODELS = [];        // 最近一次拉到的上游 config_name 数组
 let DYNAMIC_LAST_OK = 0;        // 上次成功拉取时间戳(ms)
 let dynamicRefreshing = false;
+let DYNAMIC_INIT = null;        // 首次拉取的 promise (供 /v1/models 等待)
 
 function hasDynamicModels() {
   return DYNAMIC_MODELS.length > 0;
@@ -538,6 +539,12 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/v1/models') {
     // 优先返回动态拉取的上游模型, 失败/未拉取时回退 config.json 表
+    // 关键: 首次拉取尚未完成时, 等待其结束 (否则会把 config 静态兜底表当成真实列表返回,
+    //       网关同步后就只剩十几个模型, 且要等 24h 才修正 —— glm/kimi/qwen 会凭空消失)
+    if (!hasDynamicModels()) {
+      if (!DYNAMIC_INIT) DYNAMIC_INIT = refreshModels(true).catch(() => {});
+      await DYNAMIC_INIT;
+    }
     const makeEntry = (id) => ({ id, object: 'model', created: 0, owned_by: 'trae-proxy' });
     let data;
     if (hasDynamicModels()) {
@@ -763,7 +770,7 @@ server.listen(PORT, HOST, () => {
   setTimeout(() => healthCheck('启动检查'), 1000);
   setInterval(() => healthCheck('每小时定时检查'), CHECK_INTERVAL);
   // 动态模型: 启动时强制拉取一次, 之后每 MODEL_REFRESH_INTERVAL(默认1天) 刷新
-  setTimeout(() => { refreshModels(true).catch(() => {}); }, 2000);
+  if (!DYNAMIC_INIT) DYNAMIC_INIT = refreshModels(true).catch(() => {});
   setInterval(() => { refreshModels(false).catch(() => {}); }, MODEL_REFRESH_INTERVAL);
   console.log(`[动态模型] 每日自动刷新已启用 (每 ${MODEL_REFRESH_INTERVAL / 1000 / 3600} 小时)`);
   // ---- Broker 托管 ----

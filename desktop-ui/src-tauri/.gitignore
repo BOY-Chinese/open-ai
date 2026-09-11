@@ -1,0 +1,9 @@
+# Tauri 构建产物
+/target
+
+# 由 tauri-build 生成
+/gen
+
+# 前端构建产物
+../dist
+../node_modules

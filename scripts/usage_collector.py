@@ -22,7 +22,11 @@ TRAE + WorkBuddy 逐笔消耗流水 · 自动采集与本地流水库
   WorkBuddy : POST copilot.tencent.com/billing/meter/get-user-request-usage
               鉴权 Bearer <accessToken> + X-User-Id + X-Enterprise-Id(=userId);
               支持 v1 页码式 (pageNum/pageSize, 回 total)
+  WB 国际版  : POST www.workbuddy.ai/billing/meter/get-user-request-usage
+              **路径与国内版完全一致**, 只差 host + X-Product-Code: workbuddy-ai
 本地库: data/usage_history.db (SQLite, usage 表, 以 platform+uid+entry_id 去重)
+        platform 取值: trae / workbuddy / workbuddy_intl
+读取接口: scripts/credits_api.py (给前端用的只读查询 API, 见其文件头)
 """
 import argparse
 import csv
@@ -55,6 +59,22 @@ MAX_PAGES = 40           # 单账号单轮上限 (TRAE 50*40=2000 条, WB 100*40
 UA_WEB = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
           '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0')
 UA_WB = 'WorkBuddy/5.3.12 WorkBuddy/5.3.12 CLI/2.115.0'
+
+# ---- WorkBuddy 系采集规格 (国内 / 国际) ----
+# 两者接口路径**完全一致**, 只差 host 与产品标识; 国际版额外要求
+# X-Product-Code: workbuddy-ai (实测确认, 见 MEMORY.md)。
+# 新增 WorkBuddy 系区域时, 往这里加一条即可, 采集/入库/查询全链路自动覆盖。
+WB_SPECS = (
+    {'platform': 'workbuddy', 'provider': 'workbuddy',
+     'base': 'https://copilot.tencent.com', 'label': 'WorkBuddy', 'short': 'wb',
+     'default_domain': 'www.workbuddy.cn', 'default_product': 'SaaS'},
+    {'platform': 'workbuddy_intl', 'provider': 'workbuddy_intl',
+     'base': 'https://www.workbuddy.ai', 'label': 'WorkBuddy国际', 'short': 'wbai',
+     'default_domain': 'www.workbuddy.ai', 'default_product': 'workbuddy-ai'},
+)
+WB_SPEC_BY_PLATFORM = {s['platform']: s for s in WB_SPECS}
+WB_SPEC_BY_PROVIDER = {s['provider']: s for s in WB_SPECS}
+WB_DEFAULT_SPEC = WB_SPEC_BY_PLATFORM['workbuddy']
 
 COLLECT_INTERVAL = 5 * 60          # 采集周期: 5 分钟 (daemon 与 GUI 页面刷新同节奏)
 WINDOW_DAYS = 3                    # 每轮回看窗口 (天): 周期 5min << 3d, 覆盖停机补漏
@@ -172,11 +192,11 @@ def trae_checkin_status(acc, device_id):
     return d.get('credits'), bool(d.get('checked_in')), None
 
 
-def wb_checkin_status(headers):
-    """WorkBuddy 签到状态. 返回 (today_credit or None, checked_in, err)。
+def wb_checkin_status(headers, base='https://copilot.tencent.com'):
+    """WorkBuddy 系签到状态. 返回 (today_credit or None, checked_in, err)。
     ⚠️ 实测: 账号 active=false 时该接口恒报 today_checked_in=False/today_credit=0,
     与实际签到入账脱节 (签到其实成功, 积分以资源包形式入账)。勿以此接口为统计依据。"""
-    code, raw = _post_json('https://copilot.tencent.com/billing/meter/checkin-status', headers, {})
+    code, raw = _post_json(f'{base}/billing/meter/checkin-status', headers, {})
     if code != 200:
         return None, False, f'HTTP {code}'
     try:
@@ -187,13 +207,13 @@ def wb_checkin_status(headers):
     return st.get('today_credit'), bool(st.get('today_checked_in')), None
 
 
-def wb_today_packs(headers):
-    """WB 今日入账的资源包 (签到/活动积分的真实凭证).
+def wb_today_packs(headers, base='https://copilot.tencent.com'):
+    """WB 系今日入账的资源包 (签到/活动积分的真实凭证).
     返回 [(resource_id, package_name, capacity_size)], err。
     ⚠️ 必须用不带 X-Enterprise-Id 的头: 该头会把 get-user-resource 切到企业视角,
     个人账号的资源包会被隐藏 (返回 0 包)。"""
     h = {k: v for k, v in headers.items() if k != 'X-Enterprise-Id'}
-    code, raw = _post_json('https://copilot.tencent.com/billing/meter/get-user-resource', h, {})
+    code, raw = _post_json(f'{base}/billing/meter/get-user-resource', h, {})
     if code != 200:
         return [], f'HTTP {code}'
     try:
@@ -236,27 +256,30 @@ def collect_gains(conn, cfg):
             continue
         if checked:
             rows.append(('trae', str(acc.get('uid', '')), day, 200.0, 'checkin', now_ts()))
-    # ---- WorkBuddy: 今日入账资源包 ----
-    wb_accounts, domain, product = load_wb(cfg)
-    for acc in wb_accounts:
-        if not acc.get('accessToken'):
-            continue
-        headers = wb_headers(acc, domain, product)
-        packs, err = wb_today_packs(headers)
-        if err:
-            log(f'gain wb[{acc.get("userId", "?")[:8]}]: {err}')
-            continue
-        if not packs:
-            # 无今日入账包 → 尝试签到状态兜底 (活动期账号 active=true 时有值)
-            credit, checked, err2 = wb_checkin_status(headers)
-            if not err2 and checked and credit:
-                rows.append(('workbuddy', str(acc.get('userId', '')), day, _f(credit), 'checkin', now_ts()))
-            continue
-        for rid, pkg, amount in packs:
-            if amount > 0:
-                kind = f'pack:{pkg}'[:40]
-                rows.append(('workbuddy', str(acc.get('userId', '')), day, amount, kind, now_ts()))
-        _ = rid  # rid 已并入 rows
+    # ---- WorkBuddy 系 (国内 + 国际): 今日入账资源包 ----
+    for spec in WB_SPECS:
+        plat, short = spec['platform'], spec['short']
+        wb_accounts, domain, product = load_wb(cfg, spec)
+        for acc in wb_accounts:
+            if not acc.get('accessToken') or acc.get('enabled') is False:
+                continue
+            headers = wb_headers(acc, domain, product, base=spec['base'])
+            packs, err = wb_today_packs(headers, base=spec['base'])
+            if err:
+                log(f'gain {short}[{acc.get("userId", "?")[:8]}]: {err}')
+                continue
+            if not packs:
+                # 无今日入账包 → 尝试签到状态兜底 (活动期账号 active=true 时有值)
+                credit, checked, err2 = wb_checkin_status(headers, base=spec['base'])
+                if not err2 and checked and credit:
+                    rows.append((plat, str(acc.get('userId', '')), day, _f(credit),
+                                 'checkin', now_ts()))
+                continue
+            for rid, pkg, amount in packs:
+                if amount > 0:
+                    kind = f'pack:{pkg}'[:40]
+                    rows.append((plat, str(acc.get('userId', '')), day, amount, kind, now_ts()))
+            _ = rid  # rid 已并入 rows
     if rows:
         conn.executemany('''INSERT INTO gain (platform, uid, day, amount, kind, updated_at)
             VALUES (?,?,?,?,?,?)
@@ -346,31 +369,45 @@ def collect_trae(conn, cfg, collected_at, window_days=WINDOW_DAYS):
     return '; '.join(msgs) or 'trae: 完成'
 
 
-# ============ WorkBuddy 采集 ============
+# ============ WorkBuddy 系采集 (国内 / 国际 共用一套逻辑) ============
 
-def load_wb(cfg):
-    wb = (cfg.get('providers') or {}).get('workbuddy') or {}
-    return wb.get('accounts') or [], wb.get('domain', 'www.workbuddy.cn'), wb.get('product', 'SaaS')
-
-
-def wb_headers(acc, domain, product):
-    return {'Content-Type': 'application/json', 'Accept': 'application/json',
-            'Authorization': f"Bearer {acc.get('accessToken', '')}",
-            'X-User-Id': acc.get('userId', ''),
-            'X-Domain': domain, 'X-Product': product,
-            # ⚠️ request/daily-usage 必须带此头 (否则 400); 但 get-user-resource 恰相反,
-            # 带了会切到企业视角、隐藏个人资源包 (wb_today_packs 已剔除该头)
-            'X-Enterprise-Id': acc.get('userId', ''),
-            'User-Agent': UA_WB, 'Accept-Language': 'zh'}
+def load_wb(cfg, spec=None):
+    """读取某个 WorkBuddy 系平台的账号与 (domain, product)。
+    spec 省略时默认国内版; 国际版传 WB_SPEC_BY_PLATFORM['workbuddy_intl']。"""
+    spec = spec or WB_DEFAULT_SPEC
+    prov = ((cfg.get('providers') or {}).get(spec['provider'])) or {}
+    return (prov.get('accounts') or [],
+            prov.get('domain', spec['default_domain']),
+            prov.get('product', spec['default_product']))
 
 
-def wb_fetch_all(headers, start_day, end_day, max_pages=MAX_PAGES):
-    """v1 页码式拉 WB 逐笔流水. 返回 (items, err)。"""
+def wb_headers(acc, domain, product, base='https://copilot.tencent.com'):
+    """WorkBuddy 系逐笔流水请求头。
+
+    ⚠️ request/daily-usage 必须带 X-Enterprise-Id (否则 400); 但 get-user-resource
+    恰相反, 带了会切到企业视角、隐藏个人资源包 (wb_today_packs 已剔除该头)。
+    国际版额外要求 X-Product-Code。
+    """
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
+               'Authorization': f"Bearer {acc.get('accessToken', '')}",
+               'X-User-Id': acc.get('userId', ''),
+               'X-Domain': domain, 'X-Product': product,
+               'X-Enterprise-Id': acc.get('userId', ''),
+               'User-Agent': UA_WB, 'Accept-Language': 'zh'}
+    if '.ai' in base:
+        headers['X-Product-Code'] = product
+    return headers
+
+
+def wb_fetch_all(headers, start_day, end_day, max_pages=MAX_PAGES,
+                 base='https://copilot.tencent.com'):
+    """v1 页码式拉 WB 系逐笔流水. 返回 (items, err)。"""
+    url = f'{base}/billing/meter/get-user-request-usage'
     items, err = [], None
     for page in range(1, max_pages + 1):
         body = {'startTime': f'{start_day} 00:00:00', 'endTime': f'{end_day} 23:59:59',
                 'pageNum': page, 'pageSize': PAGE_SIZE_WB}
-        code, raw = _post_json(WB_REQ_URL, headers, body)
+        code, raw = _post_json(url, headers, body)
         if code in (401, 403):
             return items, f'token 无效 ({code})'
         if code != 200:
@@ -393,7 +430,8 @@ def wb_fetch_all(headers, start_day, end_day, max_pages=MAX_PAGES):
     return items, err
 
 
-def wb_rows(acc, items, collected_at):
+def wb_rows(acc, items, collected_at, platform='workbuddy'):
+    """把 WB 系逐笔记录转成 usage 表行。platform 区分国内/国际。"""
     uid = str(acc.get('userId', ''))
     out = []
     for it in items:
@@ -403,7 +441,7 @@ def wb_rows(acc, items, collected_at):
         except Exception:
             ts = collected_at
         extra = {'agentPurpose': it.get('agentPurpose'), 'inputTrunc': (it.get('inputTrunc') or '')[:120]}
-        out.append(('workbuddy', uid, str(it.get('requestId') or ''),
+        out.append((platform, uid, str(it.get('requestId') or ''),
                     ts, it.get('model') or '', _f(it.get('credit')), 0.0,
                     0, 0, 0,
                     it.get('client') or '', (it.get('requestId') or '')[:12],
@@ -412,33 +450,52 @@ def wb_rows(acc, items, collected_at):
     return out
 
 
-def collect_workbuddy(conn, cfg, collected_at, window_days=WINDOW_DAYS):
-    accounts, domain, product = load_wb(cfg)
+def collect_workbuddy(conn, cfg, collected_at, window_days=WINDOW_DAYS, spec=None):
+    """采集某个 WorkBuddy 系平台 (国内/国际) 的逐笔消耗流水。
+
+    spec 省略 = 国内版; 国际版传 WB_SPEC_BY_PLATFORM['workbuddy_intl']。
+    两者接口路径一致, 只差 host / X-Product-Code, 故共用同一段逻辑。
+    """
+    spec = spec or WB_DEFAULT_SPEC
+    plat, short = spec['platform'], spec['short']
+    accounts, domain, product = load_wb(cfg, spec)
     if not accounts:
-        return 'workbuddy: 无账号'
+        return f'{plat}: 无账号'
     end_day = time.strftime('%Y-%m-%d')
     start_day = time.strftime('%Y-%m-%d', time.localtime(now_ts() - window_days * 86400))
     added_total, msgs = 0, []
     for acc in accounts:
         uid = acc.get('userId', '?')
         if not acc.get('accessToken'):
-            msgs.append(f'wb[{uid[:8]}]: 缺 accessToken')
+            msgs.append(f'{short}[{uid[:8]}]: 缺 accessToken')
             continue
-        headers = wb_headers(acc, domain, product)
-        items, err = wb_fetch_all(headers, start_day, end_day)
+        # 账号级 enabled=false 视为停用: 仍然采集历史, 但跳过以省请求
+        if acc.get('enabled') is False:
+            msgs.append(f'{short}[{uid[:8]}]: 已停用, 跳过')
+            continue
+        headers = wb_headers(acc, domain, product, base=spec['base'])
+        items, err = wb_fetch_all(headers, start_day, end_day, base=spec['base'])
         if err and not items:
-            msgs.append(f'wb[{uid[:8]}]: 失败 ({err})')
+            msgs.append(f'{short}[{uid[:8]}]: 失败 ({err})')
             continue
-        added, _n = db_upsert(conn, wb_rows(acc, items, collected_at))
+        added, _n = db_upsert(conn, wb_rows(acc, items, collected_at, platform=plat))
         added_total += added
-        msgs.append(f'wb[{uid[:8]}]: 抓到 {len(items)} 条, 新增 {added} 条' + (f' (警告: {err})' if err else ''))
-    return '; '.join(msgs) or 'workbuddy: 完成'
+        msgs.append(f'{short}[{uid[:8]}]: 抓到 {len(items)} 条, 新增 {added} 条'
+                    + (f' (警告: {err})' if err else ''))
+    return '; '.join(msgs) or f'{plat}: 完成'
+
+
+def collect_all_workbuddy(conn, cfg, collected_at, window_days=WINDOW_DAYS):
+    """采集全部 WorkBuddy 系平台 (国内 + 国际)。新增区域时 WB_SPECS 加一条即可。"""
+    return [collect_workbuddy(conn, cfg, collected_at, window_days, spec)
+            for spec in WB_SPECS]
 
 
 # ============ 汇总入口 ============
 
 def collect_all(window_days=WINDOW_DAYS):
-    """采集一轮 (TRAE + WorkBuddy 消耗流水 + 获取积分) 并入库. 返回汇总消息字符串。"""
+    """采集一轮 (TRAE + WorkBuddy 国内 + WorkBuddy 国际 消耗流水 + 获取积分) 并入库。
+    返回汇总消息字符串。"""
     collected_at = now_ts()
     try:
         with open(OPENAI_CFG, encoding='utf-8') as f:
@@ -449,8 +506,8 @@ def collect_all(window_days=WINDOW_DAYS):
     conn = sqlite3.connect(DB_PATH)
     try:
         db_init(conn)
-        msgs = [collect_trae(conn, cfg, collected_at, window_days),
-                collect_workbuddy(conn, cfg, collected_at, window_days)]
+        msgs = [collect_trae(conn, cfg, collected_at, window_days)]
+        msgs.extend(collect_all_workbuddy(conn, cfg, collected_at, window_days))
         n_gain = collect_gains(conn, cfg)
         msgs.append(f'获取积分记录 {n_gain} 条')
         db_prune(conn)
@@ -505,7 +562,8 @@ def show_local(days=7, platform=None, uid=None, csv_path=None, as_json=False, li
     print('-' * len(hdr))
     for r in items:
         t = time.strftime('%m-%d %H:%M:%S', time.localtime(r['ts']))
-        plat = {'trae': 'TRAE', 'workbuddy': 'WorkBuddy'}.get(r['platform'], r['platform'])
+        plat = {'trae': 'TRAE', 'workbuddy': 'WorkBuddy',
+                'workbuddy_intl': 'WBuddy国际'}.get(r['platform'], r['platform'])
         print(f"{plat:<10} {t:<20} {(r['model'] or '-'):<16} {r['credits']:>8.3f} "
               f"{r['cost_money'] or 0:>8.4f} {r['input_tok'] or 0:>9} {r['output_tok'] or 0:>8} {r['uid'][:10]}")
     # 汇总
@@ -540,7 +598,9 @@ def main():
     ap.add_argument('--collect-loop', action='store_true', help='常驻采集循环 (默认关)')
     ap.add_argument('--local', action='store_true', help='查看本地流水库 (默认行为)')
     ap.add_argument('--days', type=int, default=7, help='查看最近 N 天 (默认 7)')
-    ap.add_argument('--platform', choices=['trae', 'workbuddy'], help='只看某平台')
+    ap.add_argument('--platform',
+                    choices=['trae', 'workbuddy', 'workbuddy_intl'],
+                    help='只看某平台')
     ap.add_argument('--uid', help='只看某账号 (uid 前缀)')
     ap.add_argument('--limit', type=int, default=500, help='最多显示条数 (默认 500)')
     ap.add_argument('--csv', metavar='PATH', help='本地库导出 CSV')

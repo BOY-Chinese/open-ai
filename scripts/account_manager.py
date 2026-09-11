@@ -6,11 +6,13 @@ AI 账号管理器 — 显示各账号积分 / 添加账号
 数据源:
   TRAE      : open-ai/config.json  providers.trae.accounts[]  积分接口 /trae/api/v2/pay/ide_user_ent_usage
   WorkBuddy : open-ai/config.json  providers.workbuddy.accounts[]  积分接口 /billing/meter/get-user-resource
+  WB 国际版 : open-ai/config.json  providers.workbuddy_intl.accounts[]  (host=www.workbuddy.ai)
 
 功能:
-  [1] 刷新积分    — 重新查询 TRAE + WorkBuddy 所有账号积分
+  [1] 刷新积分    — 重新查询 TRAE + WorkBuddy + 国际版 所有账号积分
   [2] 添加 TRAE 账号   — 打开网页登录, 自动抓 token 入池 (login_trae.py)
   [3] 添加 WorkBuddy 账号 — 打开网页登录, 自动抓 token 入池 (login_workbuddy.py)
+  [9] 添加 WorkBuddy 国际版账号 — 网页登录, 入池 (login_workbuddy_intl.py)
   [Q] 退出
 
 用法:  python account_manager.py [--once]   # --once 显示一次积分后直接退出
@@ -258,35 +260,42 @@ def trae_model_rates():
     return items, None
 
 
-def wb_model_rates():
-    """拉取 WorkBuddy 全部模型及其积分倍率 (模型 credits 字段, 形如 "x0.17")。
-    返回 [(model_id, display_name, credits, err_or_None)], err 非 None 表示整体失败。"""
+def _wb_family_model_rates(provider_key, host, default_domain, default_product,
+                           known_extra=None):
+    """WorkBuddy 系 (国内/国际) 模型目录拉取: GET /v2/enterprises/personal/models。
+
+    国际版与国内版同路径、同响应结构, 差异只有 host 与 X-Product-Code。
+    known_extra: 标准目录不返回但可直接调用的模型 (id -> 显示名), 合并进结果。
+    返回 [(model_id, display_name, credits, err_or_None)], err 非 None 表示整体失败。
+    """
     try:
         with open(OPENAI_CFG, encoding='utf-8') as _f:
             cfg = json.load(_f)
     except Exception as e:
         return None, f'config 读取失败: {e}'
-    wb = (cfg.get('providers') or {}).get('workbuddy') or {}
-    accs = wb.get('accounts') or []
+    prov = (cfg.get('providers') or {}).get(provider_key) or {}
+    accs = prov.get('accounts') or []
     if not accs:
-        return None, '无 WorkBuddy 账号'
+        return None, f'无 WorkBuddy 账号 ({provider_key})'
     acc = accs[0]
-    domain = wb.get('domain', 'www.codebuddy.cn')
-    product = wb.get('product', 'SaaS')
+    domain = prov.get('domain', default_domain)
+    product = prov.get('product', default_product)
     if not acc.get('accessToken'):
-        return None, 'WorkBuddy 账号缺 accessToken'
+        return None, '账号缺 accessToken'
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': f"Bearer {acc.get('accessToken', '')}",
+        'X-User-Id': acc.get('userId', ''),
+        'X-Domain': domain,
+        'X-Product': product,
+        'User-Agent': UA_WB,
+        'Accept-Language': 'zh',
+    }
+    if host.endswith('workbuddy.ai'):
+        headers['X-Product-Code'] = product
     code, raw = post_json(
-        'https://copilot.tencent.com/v2/enterprises/personal/models',
-        {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'Authorization': f"Bearer {acc.get('accessToken', '')}",
-            'X-User-Id': acc.get('userId', ''),
-            'X-Domain': domain,
-            'X-Product': product,
-            'User-Agent': UA_WB,
-            'Accept-Language': 'zh',
-        },
+        f'https://{host}/v2/enterprises/personal/models', headers,
         None, timeout=20, method='GET')
     if code != 200:
         return None, f'HTTP {code}'
@@ -305,13 +314,37 @@ def wb_model_rates():
         name = m.get('name') or mid
         credits = m.get('credits')
         items.append((mid, name, credits, None))
+    # 合并标准目录缺失但可直接调用的已知模型 (避免重复)
+    known_ids = {i[0] for i in items}
+    items.extend((mid, name, None, None)
+                 for mid, name in (known_extra or {}).items() if mid not in known_ids)
     if not items:
         return None, '未解析到模型'
     return items, None
 
 
+def wb_model_rates():
+    """拉取 WorkBuddy 全部模型及其积分倍率 (模型 credits 字段, 形如 "x0.17")。
+    返回 [(model_id, display_name, credits, err_or_None)], err 非 None 表示整体失败。"""
+    return _wb_family_model_rates('workbuddy', 'copilot.tencent.com',
+                                  'www.codebuddy.cn', 'SaaS')
+
+
+def intl_model_rates():
+    """拉取 WorkBuddy 国际版 (www.workbuddy.ai) 全部模型及其积分倍率。
+    返回 [(model_id, display_name, credits, err_or_None)]"""
+    # 标准目录接口不返回、但软件可直接调用/显示的模型 (id -> 显示名)
+    KNOWN_EXTRA = {
+        'deepseek-v4.1-flash': 'DeepSeek V4.1 Flash',
+        'gpt-6-astra': 'GPT-6 Astra',
+    }
+    return _wb_family_model_rates('workbuddy_intl', 'www.workbuddy.ai',
+                                  'www.workbuddy.ai', 'workbuddy-ai',
+                                  known_extra=KNOWN_EXTRA)
+
+
 def show_model_rates():
-    """控制台: 列出 TRAE + WorkBuddy 全部模型及倍率。"""
+    """控制台: 列出 TRAE + WorkBuddy + WorkBuddy 国际版 全部模型及倍率。"""
     print()
     print('=== TRAE 模型 + 积分倍率 ===')
     items, err = trae_model_rates()
@@ -327,6 +360,18 @@ def show_model_rates():
     print()
     print('=== WorkBuddy 模型 + 积分倍率 ===')
     items, err = wb_model_rates()
+    if err:
+        print(f'  获取失败: {err}')
+    else:
+        if items:
+            for mid, name, credits, e in items:
+                if credits is None:
+                    print(f'  {name:<22}  (无倍率)')
+                else:
+                    print(f'  {name:<22} {credits}')
+    print()
+    print('=== WorkBuddy 国际版 模型 + 积分倍率 ===')
+    items, err = intl_model_rates()
     if err:
         print(f'  获取失败: {err}')
     else:
@@ -385,18 +430,24 @@ def _fnum(v):
 
 
 def wb_credits(acc, domain, product):
+    if not acc.get('accessToken'):
+        return None, '账号缺 accessToken'
+    # 国际版 (www.workbuddy.ai) 走同一接口不同主机; 国内走 copilot.tencent.com
+    host = domain if domain.endswith('.ai') else 'copilot.tencent.com'
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': f"Bearer {acc.get('accessToken', '')}",
+        'X-User-Id': acc.get('userId', ''),
+        'X-Domain': domain,
+        'X-Product': product,
+        'User-Agent': UA_WB,
+        'Accept-Language': 'zh',
+    }
+    if host.endswith('workbuddy.ai'):
+        headers['X-Product-Code'] = product
     code, raw = post_json(
-        'https://copilot.tencent.com/billing/meter/get-user-resource',
-        {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'Authorization': f"Bearer {acc.get('accessToken', '')}",
-            'X-User-Id': acc.get('userId', ''),
-            'X-Domain': domain,
-            'X-Product': product,
-            'User-Agent': UA_WB,
-            'Accept-Language': 'zh',
-        })
+        f'https://{host}/billing/meter/get-user-resource', headers)
     if code != 200:
         return None, f'HTTP {code}'
     try:
@@ -411,17 +462,18 @@ def wb_credits(acc, domain, product):
     return total, None
 
 
-def show_workbuddy_accounts():
+def _show_wb_family_accounts(provider_key, label, default_domain, default_product):
+    """WorkBuddy 系 (国内/国际) 账号积分显示。"""
     try:
         with open(OPENAI_CFG, encoding='utf-8') as _f:
             cfg = json.load(_f)
     except Exception as e:
-        log(f'WorkBuddy 配置读取失败: {e}')
+        log(f'{label} 配置读取失败: {e}')
         return
-    wb = (cfg.get('providers') or {}).get('workbuddy') or {}
-    accs = wb.get('accounts') or []
-    domain = wb.get('domain', 'www.workbuddy.cn')
-    product = wb.get('product', 'SaaS')
+    prov = (cfg.get('providers') or {}).get(provider_key) or {}
+    accs = prov.get('accounts') or []
+    domain = prov.get('domain', default_domain)
+    product = prov.get('product', default_product)
     if not accs:
         log('无账号')
         return
@@ -431,6 +483,15 @@ def show_workbuddy_accounts():
             log(f'账号{i} — 积分查询失败: {err}')
         else:
             log(f'账号{i} — 积分 {total:.2f}')
+
+
+def show_workbuddy_accounts():
+    _show_wb_family_accounts('workbuddy', 'WorkBuddy', 'www.workbuddy.cn', 'SaaS')
+
+
+def show_workbuddy_intl_accounts():
+    _show_wb_family_accounts('workbuddy_intl', 'WorkBuddy 国际版',
+                             'www.workbuddy.ai', 'workbuddy-ai')
 
 
 # ============ 添加账号 ============
@@ -447,6 +508,14 @@ def add_workbuddy():
     py = _script_py()
     script = os.path.join(BASE, 'login_workbuddy.py')
     print('\n>>> 即将打开 WorkBuddy 网页登录, 请在弹出的浏览器中完成登录 <<<')
+    subprocess.run([py, script], cwd=os.path.dirname(BASE))
+    print('\n[提示] 若登录成功, 重启 open-ai 网关后新账号生效')
+
+
+def add_workbuddy_intl():
+    py = _script_py()
+    script = os.path.join(BASE, 'login_workbuddy_intl.py')
+    print('\n>>> 即将打开 WorkBuddy 国际版 (www.workbuddy.ai) 网页登录, 请在弹出的浏览器中完成登录 <<<')
     subprocess.run([py, script], cwd=os.path.dirname(BASE))
     print('\n[提示] 若登录成功, 重启 open-ai 网关后新账号生效')
 
@@ -477,24 +546,27 @@ def reconnect_all():
         log(f'trae: 重新连接失败 (server.js 可能未运行): {type(e).__name__} {e}')
 
     # ---- WorkBuddy: 直连计费接口验证每个账号 token ----
-    try:
-        with open(OPENAI_CFG, encoding='utf-8') as _f:
-            cfg = json.load(_f)
-        wb = (cfg.get('providers') or {}).get('workbuddy') or {}
-        accs = wb.get('accounts') or []
-        domain = wb.get('domain', 'www.workbuddy.cn')
-        product = wb.get('product', 'SaaS')
-        if not accs:
-            log('workbuddy: 无账号')
-        else:
+    for _key, _label, _hint, _dd, _dp in (
+            ('workbuddy', 'workbuddy', '[3]', 'www.workbuddy.cn', 'SaaS'),
+            ('workbuddy_intl', 'workbuddy-intl(国际版)', '[9]', 'www.workbuddy.ai', 'workbuddy-ai')):
+        try:
+            with open(OPENAI_CFG, encoding='utf-8') as _f:
+                cfg = json.load(_f)
+            prov = (cfg.get('providers') or {}).get(_key) or {}
+            accs = prov.get('accounts') or []
+            domain = prov.get('domain', _dd)
+            product = prov.get('product', _dp)
+            if not accs:
+                log(f'{_label}: 无账号')
+                continue
             for i, a in enumerate(accs, 1):
                 total, err = wb_credits(a, domain, product)
                 if err:
-                    log(f'workbuddy账号{i} 连接失败 ({err}, 请用 [3] 重新网页登录)')
+                    log(f'{_label}账号{i} 连接失败 ({err}, 请用 {_hint} 重新网页登录)')
                 else:
-                    log(f'workbuddy账号{i} 连接成功')
-    except Exception as e:
-        log(f'workbuddy: 重新连接失败: {type(e).__name__} {e}')
+                    log(f'{_label}账号{i} 连接成功')
+        except Exception as e:
+            log(f'{_label}: 重新连接失败: {type(e).__name__} {e}')
 
 
 # ============ 主流程 ============
@@ -507,6 +579,9 @@ def refresh():
     print('-' * 62)
     print('workbuddy：')
     show_workbuddy_accounts()
+    print('-' * 62)
+    print('workbuddy 国际版：')
+    show_workbuddy_intl_accounts()
     print('=' * 62)
 
 
@@ -571,6 +646,7 @@ def menu():
     print('  [6] TRAE 逐笔消耗流水 (实时查询)')
     print('  [7] WorkBuddy 逐笔消耗流水 (实时查询)')
     print('  [8] 消耗流水本地库 (自动采集汇总)')
+    print('  [9] 添加 WorkBuddy 国际版账号 (网页登录)')
     print('  [Q] 退出')
 
 
@@ -601,6 +677,8 @@ def main():
             show_wb_usage_history()
         elif choice == '8':
             show_local_usage()
+        elif choice == '9':
+            add_workbuddy_intl()
         else:
             print('  无效选项')
 

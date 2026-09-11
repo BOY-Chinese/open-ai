@@ -4,12 +4,14 @@
 open-ai 账号管理 - 图形界面版 (Tkinter)
 =========================================
 页面1「已添加账号」:
-  - TRAE 通道 / WorkBuddy 通道 上下分开显示, 每个列表可上下滑动 + 左右滑动
-  - 底部 4 个功能按键:
-      [1] 刷新积分      — 重新查询 TRAE + WorkBuddy 全部账号积分
+  - TRAE 通道 / WorkBuddy 通道 / WorkBuddy 国际通道 上下分开显示,
+    每个列表可上下滑动 + 左右滑动
+  - 底部 5 个功能按键:
+      [1] 刷新积分      — 重新查询 TRAE + WorkBuddy + 国际版 全部账号积分
       [2] 添加 TRAE 账号 — 打开网页登录, 自动抓 token 入池 (login_trae.py)
       [3] 添加 WorkBuddy 账号 — 打开网页登录, 自动抓 token 入池 (login_workbuddy.py)
-      [4] 重新连接      — 验证全部 provider token 是否可用
+      [4] 添加国际版账号 — 网页登录 www.workbuddy.ai, 入池 (login_workbuddy_intl.py)
+      [5] 重新连接      — 验证全部 provider token 是否可用
 页面2「API 管理」:
   - 顶部展示网关地址 (OpenAI / Anthropic 兼容端点, 按 config.json 的 host/port 生成),
     每行带「⧉ 复制」按钮; 另有「⧉ 复制地址+密钥」把地址和选中密钥一并复制
@@ -17,7 +19,8 @@ open-ai 账号管理 - 图形界面版 (Tkinter)
 页面3「模型列表」:
   - 右键模型行: 复制模型名称 / 复制上游模型 id / 固定到顶部(取消固定) / 隐藏(取消隐藏)
   - 固定与隐藏互相独立, 持久化于 data/model_view_state.json (key: TRAE=config_name,
-    WorkBuddy=model_id); 上游更新后新模型正常进入列表, 已消失的 key 自动惰性清理
+    WorkBuddy=model_id, WorkBuddy国际=model_id); 上游更新后新模型正常进入列表,
+    已消失的 key 自动惰性清理
   - 底部「显示已隐藏模型」勾选框: hidden>0 显示计数; 勾选后隐藏行灰显可恢复
 页面4「查看积分消耗」(位于 模型列表 与 设置 之间):
   - 今日情况: 上半部分显示今日获取/消耗积分, 下半部分为逐笔消耗流水
@@ -92,12 +95,16 @@ VENV_PY = (_OPENAI_TASK_SHIM if os.path.isfile(_OPENAI_TASK_SHIM)
                  else sys.executable))
 
 # ---- 模型列表视图状态 (固定/隐藏) 持久化 ----
-# 存储文件: data/model_view_state.json, 结构 {"pinned": {"trae": [key..], "workbuddy": [key..]},
-#          "hidden": {"trae": [key..], "workbuddy": [key..]}}
-# key 为模型唯一标识: TRAE=config_name, WorkBuddy=model_id。
+# 存储文件: data/model_view_state.json, 结构 {"pinned": {"trae": [key..], "workbuddy": [key..],
+#          "workbuddy_intl": [key..]}, "hidden": {...}}
+# key 为模型唯一标识: TRAE=config_name, WorkBuddy / WorkBuddy国际=model_id。
 # 固定与隐藏互相独立; 上游更新后仍存在的 key 自动生效, 已消失的 key 惰性清理。
 MODEL_STATE_PATH = os.path.join(os.path.dirname(BASE), 'data', 'model_view_state.json')
-MODEL_PROVIDERS = ('trae', 'workbuddy')
+MODEL_PROVIDERS = ('trae', 'workbuddy', 'workbuddy_intl')
+
+# 消耗流水里的平台 key -> 展示名 (usage_history.db 的 platform 列)
+_PLATFORM_LABEL = {'trae': 'TRAE 通道', 'workbuddy': 'WorkBuddy 通道',
+                   'workbuddy_intl': 'WorkBuddy 国际通道'}
 
 # ---- 托盘退出状态标记 (抑制 watchdog 复活) ----
 # 彻底退出时写 data/.gui_exit_suppress (内容=时间戳), watchdog_boot.py 每次运行
@@ -205,14 +212,16 @@ class Toast:
 # ================= 账号数据获取 =================
 
 def load_account_groups():
-    """读取 config.json, 返回 (trae_info, wb_info)。trae_info / wb_info 为
-    (trae_dict, accounts, device_id, invalid_map) 与 (wb_dict, accounts, domain, product),
-    无账号时相关 accounts 为空列表。同时返回错误信息(无则 None)。"""
+    """读取 config.json, 返回 (trae_info, wb_info, wbai_info)。trae_info / wb_info /
+    wbai_info 为 (trae_dict, accounts, device_id, invalid_map) 与
+    (wb_dict, accounts, domain, product), 无账号时相关 accounts 为空列表。
+    wbai_info 对应 providers.workbuddy_intl (www.workbuddy.ai 国际版)。
+    同时返回错误信息(无则 None)。"""
     try:
         with open(OPENAI_CFG, encoding='utf-8') as f:
             cfg = json.load(f)
     except Exception as e:
-        return None, None, f'config.json 读取失败: {e}'
+        return None, None, None, f'config.json 读取失败: {e}'
 
     prov = cfg.get('providers') or {}
 
@@ -228,9 +237,14 @@ def load_account_groups():
     wb_info = (wb, wb.get('accounts') or [], wb.get('domain', 'www.workbuddy.cn'),
                wb.get('product', 'SaaS'))
 
-    if not trae_info[1] and not wb_info[1]:
-        return trae_info, wb_info, '尚未添加任何账号'
-    return trae_info, wb_info, None
+    wbai = prov.get('workbuddy_intl') or {}
+    wbai_info = (wbai, wbai.get('accounts') or [],
+                 wbai.get('domain', 'www.workbuddy.ai'),
+                 wbai.get('product', 'workbuddy-ai'))
+
+    if not trae_info[1] and not wb_info[1] and not wbai_info[1]:
+        return trae_info, wb_info, wbai_info, '尚未添加任何账号'
+    return trae_info, wb_info, wbai_info, None
 
 
 def trae_row_name(trae, a, invalid_map, i):
@@ -243,6 +257,11 @@ def trae_row_name(trae, a, invalid_map, i):
 def wb_row_name(wb, a, i):
     uid = a.get('userId', '')
     return a.get('name') or uid or f'#{i}'
+
+
+def wbai_row_name(wbai, a, i):
+    """WorkBuddy 国际版账号行名 (账号结构与国内版一致: name -> userId -> #i)。"""
+    return wb_row_name(wbai, a, i)
 
 
 def trae_row_detail(a, device_id):
@@ -265,16 +284,17 @@ class AccountManagerApp:
     def __init__(self, root):
         self.root = root
         root.title('open-ai 账号管理')
-        root.geometry('760x620')
-        root.minsize(600, 480)
+        root.geometry('780x720')
+        root.minsize(620, 540)
         # (窗口图标在托盘装配段统一设置: _set_icon 同时返回 HWND 供 WM_CLOSE 拦截)
 
         self.busy = False
         self.result_q = queue.Queue()
         # 模型列表视图状态 (固定/隐藏), 持久化于 data/model_view_state.json
         self.model_state = load_model_state()
-        self._model_cache = {'trae': None, 'workbuddy': None}  # 最近一次成功拉取的模型行
-        self._model_errs = {'trae': None, 'workbuddy': None}
+        # 最近一次成功拉取的模型行 (trae / workbuddy / workbuddy_intl)
+        self._model_cache = {p: None for p in MODEL_PROVIDERS}
+        self._model_errs = {p: None for p in MODEL_PROVIDERS}
         self._model_rerender_job = None  # 勾选框触发的重渲染防抖
         # ---- 托盘生命周期状态 (v2.4) ----
         self.tray = None
@@ -861,20 +881,27 @@ class AccountManagerApp:
         self.trae_frame.pack(fill='both', expand=True, **pad)
         self.tree_trae = self._make_tree(self.trae_frame)
         self.tree_trae.bind('<ButtonRelease-1>', self._on_account_click)
-        # WorkBuddy 通道 (下)
+        # WorkBuddy 通道 (中)
         self.wb_frame = ttk.LabelFrame(page_acct, text='WorkBuddy 通道')
         self.wb_frame.pack(fill='both', expand=True, **pad)
         self.tree_wb = self._make_tree(self.wb_frame)
         self.tree_wb.bind('<ButtonRelease-1>', self._on_account_click)
+        # WorkBuddy 国际通道 (下, www.workbuddy.ai)
+        self.wbai_frame = ttk.LabelFrame(page_acct, text='WorkBuddy 国际通道（www.workbuddy.ai）')
+        self.wbai_frame.pack(fill='both', expand=True, **pad)
+        self.tree_wbai = self._make_tree(self.wbai_frame)
+        self.tree_wbai.bind('<ButtonRelease-1>', self._on_account_click)
 
-        # 按钮区 —— 4 个功能按键
+        # 按钮区 —— 5 个功能按键
         btn_frame = ttk.Frame(page_acct)
         btn_frame.pack(fill='x', **pad)
         self.btn_refresh = ttk.Button(btn_frame, text='① 刷新积分', command=self.on_refresh)
         self.btn_add_trae = ttk.Button(btn_frame, text='② 添加 TRAE 账号', command=self.on_add_trae)
         self.btn_add_wb = ttk.Button(btn_frame, text='③ 添加 WorkBuddy 账号', command=self.on_add_wb)
-        self.btn_reconnect = ttk.Button(btn_frame, text='④ 重新连接', command=self.on_reconnect)
-        for b in (self.btn_refresh, self.btn_add_trae, self.btn_add_wb, self.btn_reconnect):
+        self.btn_add_wbai = ttk.Button(btn_frame, text='④ 添加国际版账号', command=self.on_add_wbai)
+        self.btn_reconnect = ttk.Button(btn_frame, text='⑤ 重新连接', command=self.on_reconnect)
+        for b in (self.btn_refresh, self.btn_add_trae, self.btn_add_wb,
+                  self.btn_add_wbai, self.btn_reconnect):
             b.pack(side='left', fill='x', expand=True, padx=3)
 
         # ---- 页面2: API 管理 ----
@@ -934,11 +961,17 @@ class AccountManagerApp:
         self.model_tree_trae = self._make_model_tree(self.trae_model_frame)
         self.model_tree_trae.bind('<Button-3>', self._on_model_menu_trae)
 
-        # WorkBuddy 模型 (下)
+        # WorkBuddy 模型 (中)
         self.wb_model_frame = ttk.LabelFrame(page_model, text='WorkBuddy 模型')
         self.wb_model_frame.pack(fill='both', expand=True, **pad)
         self.model_tree_wb = self._make_model_tree(self.wb_model_frame)
         self.model_tree_wb.bind('<Button-3>', self._on_model_menu_workbuddy)
+
+        # WorkBuddy 国际版模型 (下)
+        self.wbai_model_frame = ttk.LabelFrame(page_model, text='WorkBuddy 国际版模型')
+        self.wbai_model_frame.pack(fill='both', expand=True, **pad)
+        self.model_tree_wbai = self._make_model_tree(self.wbai_model_frame)
+        self.model_tree_wbai.bind('<Button-3>', self._on_model_menu_wbai)
 
         # 刷新按钮 + 显示未知倍率勾选框 + 显示已隐藏勾选框
         model_btn = ttk.Frame(page_model)
@@ -1329,7 +1362,7 @@ class AccountManagerApp:
             self.cred_tip.withdraw()
             return
         plat, amount, day = hit
-        name = 'TRAE 通道' if plat == 'trae' else 'WorkBuddy 通道'
+        name = _PLATFORM_LABEL.get(plat, f'{plat} 通道')
         self.cred_tip_lbl.configure(text=f'{day}\n{name}: {amount:.2f} 积分')
         self.cred_tip.deiconify()
         try:
@@ -1859,7 +1892,8 @@ class AccountManagerApp:
                   background=[('selected', '#cce4ff')],
                   foreground=[('selected', '#000000')])
         # 交替行背景, 让网格感更明显
-        for tree in (getattr(self, 'tree_trae', None), getattr(self, 'tree_wb', None)):
+        for tree in (getattr(self, 'tree_trae', None), getattr(self, 'tree_wb', None),
+                     getattr(self, 'tree_wbai', None)):
             if tree is not None:
                 tree.tag_configure('odd', background='#f2f5f9')
                 tree.tag_configure('even', background='#ffffff')
@@ -2177,11 +2211,11 @@ class AccountManagerApp:
 
     # ---------- 账号列表 ----------
     def refresh_account_list(self):
-        trae_info, wb_info, err = load_account_groups()
+        trae_info, wb_info, wbai_info, err = load_account_groups()
         if err:
             messagebox.showwarning('提示', err)
             return
-        items_t, items_w = [], []
+        items_t, items_w, items_i = [], [], []
         trae, trae_accs, device_id, invalid_map = trae_info
         for i, a in enumerate(trae_accs, 1):
             enabled = '✓' if a.get('enabled', True) else '✗'
@@ -2190,15 +2224,19 @@ class AccountManagerApp:
         for i, a in enumerate(wb_accs, 1):
             enabled = '✓' if a.get('enabled', True) else '✗'
             items_w.append((enabled, wb_row_name(wb, a, i), ''))
-        self._update_trees(items_t, items_w)
+        wbai, wbai_accs, _wbai_domain, _wbai_product = wbai_info
+        for i, a in enumerate(wbai_accs, 1):
+            enabled = '✓' if a.get('enabled', True) else '✗'
+            items_i.append((enabled, wbai_row_name(wbai, a, i), ''))
+        self._update_trees(items_t, items_w, items_i)
 
     def _build_items_with_credits(self):
         """读取账号并计算每一行的积分(会发网络请求)。
-        返回 (trae_items, wb_items, err), 每项为 (启用状态, 账号名, 积分/状态)。"""
-        trae_info, wb_info, err = load_account_groups()
+        返回 (trae_items, wb_items, wbai_items, err), 每项为 (启用状态, 账号名, 积分/状态)。"""
+        trae_info, wb_info, wbai_info, err = load_account_groups()
         if err:
-            return [], [], err
-        items_t, items_w = [], []
+            return [], [], [], err
+        items_t, items_w, items_i = [], [], []
         trae, trae_accs, device_id, invalid_map = trae_info
         for i, a in enumerate(trae_accs, 1):
             enabled = '✓' if a.get('enabled', True) else '✗'
@@ -2208,18 +2246,36 @@ class AccountManagerApp:
         for i, a in enumerate(wb_accs, 1):
             enabled = '✓' if a.get('enabled', True) else '✗'
             items_w.append((enabled, wb_row_name(wb, a, i), wb_row_detail(a, domain, product)))
-        return items_t, items_w, None
+        # 国际版: 计费接口与国内版同路径不同 host, 失败时优雅降级不中断整轮刷新
+        wbai, wbai_accs, wbai_domain, wbai_product = wbai_info
+        for i, a in enumerate(wbai_accs, 1):
+            enabled = '✓' if a.get('enabled', True) else '✗'
+            detail = '积分待抓包补接口'
+            try:
+                total, e = am.wb_credits(a, wbai_domain, wbai_product)
+                if not e:
+                    detail = f'积分 {total:.2f}'
+                elif 'accessToken' not in str(e):
+                    detail = f'积分查询失败: {e}'
+            except Exception:
+                detail = '积分待抓包补接口'
+            items_i.append((enabled, wbai_row_name(wbai, a, i), detail))
+        return items_t, items_w, items_i, None
 
     def fill_credits(self):
         """后台线程调用的刷积分逻辑: 计算带积分的行, 再由主线程刷新列表。"""
-        items_t, items_w, err = self._build_items_with_credits()
+        items_t, items_w, items_i, err = self._build_items_with_credits()
         if err:
             self.result_q.put(f'[错误] {err}')
-        self.result_q.put(f'[完成] 共 {len(items_t) + len(items_w)} 个账号')
-        self.root.after(0, lambda: self._update_trees(items_t, items_w))
+        n = len(items_t) + len(items_w) + len(items_i)
+        self.result_q.put(f'[完成] 共 {n} 个账号')
+        self.root.after(0, lambda: self._update_trees(items_t, items_w, items_i))
 
-    def _update_trees(self, items_t, items_w):
-        for tree, items in ((self.tree_trae, items_t), (self.tree_wb, items_w)):
+    def _update_trees(self, items_t, items_w, items_i=None):
+        """填充三个通道的账号列表 (items_i 省略时视为空, 兼容旧调用)。"""
+        for tree, items in ((self.tree_trae, items_t),
+                            (self.tree_wb, items_w),
+                            (self.tree_wbai, items_i or [])):
             for i in tree.get_children():
                 tree.delete(i)
             for idx, (enabled, acct, det) in enumerate(items):
@@ -2244,10 +2300,14 @@ class AccountManagerApp:
         if not item:
             return
         values = tree.item(item, 'values')
-        # 判断该行属于 trae 还是 wb
-        is_trae = tree == self.tree_trae
-        is_wb = tree == self.tree_wb
-        if not is_trae and not is_wb:
+        # 判断该行属于哪个通道
+        if tree == self.tree_trae:
+            provider_key, is_trae = 'trae', True
+        elif tree == self.tree_wb:
+            provider_key, is_trae = 'workbuddy', False
+        elif tree == self.tree_wbai:
+            provider_key, is_trae = 'workbuddy_intl', False
+        else:
             return
         # 根据行索引找账号
         all_items = tree.get_children()
@@ -2255,7 +2315,7 @@ class AccountManagerApp:
         enabled = values[0]
         new_enabled = enabled == '✗'  # 切换
         # 保存到 config.json
-        ok, msg = self._save_account_enabled('trae' if is_trae else 'workbuddy', row_idx, new_enabled)
+        ok, msg = self._save_account_enabled(provider_key, row_idx, new_enabled)
         if ok:
             tree.set(item, 'enabled', '✓' if new_enabled else '✗')
             # 通知后端重新加载账号
@@ -2275,12 +2335,13 @@ class AccountManagerApp:
             try:
                 req = urllib.request.Request('http://127.0.0.1:8000/v1/admin/reload-providers', method='POST')
                 urllib.request.urlopen(req, timeout=5)
-                self.result_q.put('[设置] WorkBuddy 后端已重载账号状态')
+                self.result_q.put('[设置] WorkBuddy 网关(含国际版) 后端已重载账号状态')
             except Exception as e:
-                self.result_q.put(f'[设置] WorkBuddy 后端重载失败: {e}')
+                self.result_q.put(f'[设置] WorkBuddy 网关后端重载失败: {e}')
 
     def _save_account_enabled(self, provider_key, row_idx, enabled):
-        """保存账号启用状态到 config.json。provider_key: 'trae' 或 'workbuddy'。返回 (成功否, 消息)。"""
+        """保存账号启用状态到 config.json。
+        provider_key: 'trae' / 'workbuddy' / 'workbuddy_intl'。返回 (成功否, 消息)。"""
         try:
             with open(OPENAI_CFG, encoding='utf-8') as f:
                 cfg = json.load(f)
@@ -2304,7 +2365,7 @@ class AccountManagerApp:
     def _model_visible_rows(self, prov, items, show_unknown):
         """把上游模型行整理为渲染行 (应用隐藏/固定/未知倍率过滤与排序)。
         返回 [(key, (name, rate_txt, upstream), is_hidden)]。
-        key: TRAE=config_name, WorkBuddy=model_id。
+        key: TRAE=config_name, WorkBuddy / WorkBuddy国际=model_id。
         排序: 固定的在前, 其余保持原始顺序 —— 取消固定即自然回到原位;
         隐藏行始终参与排序 (取消隐藏后, 之前固定的行仍在顶部, 两状态互不干扰)。"""
         st = self.model_state
@@ -2316,10 +2377,13 @@ class AccountManagerApp:
                 name, disp, mdl, rate, _e = it
                 key, upstream = name, mdl
                 row_name = disp or name  # 展示名优先 (与旧版一致)
-            else:
+            elif prov in ('workbuddy', 'workbuddy_intl'):
+                # 国际版模型目录结构与国内版一致: (id, name, credits, err)
                 mid, name, rate, _e = it
                 key, upstream = mid, mid
                 row_name = name
+            else:
+                continue
             is_hidden = key in hidden
             if rate is None and not show_unknown:
                 continue  # 未知倍率过滤 (隐藏行同样受控)
@@ -2360,8 +2424,9 @@ class AccountManagerApp:
             tag = 'hidden' if is_hidden else ('even' if i % 2 == 0 else 'odd')
             tree.insert('', 'end', values=values, tags=(tag,))
 
-    def _fill_model_trees(self, trae_items, trae_err, wb_items, wb_err):
-        """渲染两表并缓存成功数据 (勾选框切换时用缓存重渲染, 免重复网络请求)。"""
+    def _fill_model_trees(self, trae_items, trae_err, wb_items, wb_err,
+                          wbai_items=None, wbai_err=None):
+        """渲染三表并缓存成功数据 (勾选框切换时用缓存重渲染, 免重复网络请求)。"""
         show_unknown = self.show_unknown_rate_var.get() if hasattr(self, 'show_unknown_rate_var') else False
         self._update_hidden_checkbox()
         # TRAE: (config_name, display, model_name, rate, err)
@@ -2380,6 +2445,14 @@ class AccountManagerApp:
         self._fill_model_tree(self.model_tree_wb, 'workbuddy',
                               self._model_cache['workbuddy'] or [], self._model_errs['workbuddy'],
                               show_unknown)
+        # WorkBuddy 国际版: (id, name, credits, err) —— 与国内版同结构
+        if wbai_err:
+            self._model_errs['workbuddy_intl'] = wbai_err
+        else:
+            self._model_cache['workbuddy_intl'] = wbai_items
+        self._fill_model_tree(self.model_tree_wbai, 'workbuddy_intl',
+                              self._model_cache['workbuddy_intl'] or [],
+                              self._model_errs['workbuddy_intl'], show_unknown)
 
     def _update_hidden_checkbox(self):
         """「显示已隐藏模型」勾选框文案: hidden 数量 > 0 时追加计数。"""
@@ -2395,21 +2468,23 @@ class AccountManagerApp:
         self._render_model_views()
 
     def _render_model_views(self):
-        """按当前勾选状态重渲染两表 (仅用缓存)。"""
+        """按当前勾选状态重渲染三表 (仅用缓存)。"""
         show_unknown = self.show_unknown_rate_var.get()
         self._update_hidden_checkbox()
-        self._fill_model_tree(self.model_tree_trae, 'trae',
-                              self._model_cache['trae'] or [],
-                              self._model_errs['trae'], show_unknown)
-        self._fill_model_tree(self.model_tree_wb, 'workbuddy',
-                              self._model_cache['workbuddy'] or [],
-                              self._model_errs['workbuddy'], show_unknown)
+        for tree, prov in ((self.model_tree_trae, 'trae'),
+                           (self.model_tree_wb, 'workbuddy'),
+                           (self.model_tree_wbai, 'workbuddy_intl')):
+            self._fill_model_tree(tree, prov, self._model_cache[prov] or [],
+                                  self._model_errs[prov], show_unknown)
 
     def _on_model_menu_trae(self, event):
         self._show_model_menu(event, 'trae', self.model_tree_trae)
 
     def _on_model_menu_workbuddy(self, event):
         self._show_model_menu(event, 'workbuddy', self.model_tree_wb)
+
+    def _on_model_menu_wbai(self, event):
+        self._show_model_menu(event, 'workbuddy_intl', self.model_tree_wbai)
 
     def _show_model_menu(self, event, prov, tree):
         """模型行右键菜单: 复制模型名称 / 复制上游模型 id / 固定到顶部 / 隐藏。"""
@@ -2485,24 +2560,29 @@ class AccountManagerApp:
         self._render_model_views()
 
     def _render_models(self):
-        """后台线程拉取两个平台模型+倍率, 主线程填充表格。
+        """后台线程拉取三个平台模型+倍率, 主线程填充表格。
         上游更新后: 新模型按原始顺序进入列表; 状态里已消失的 key 自动惰性清理。"""
         def work():
             self.result_q.put('正在拉取模型列表及积分倍率 ...')
             trae_items, trae_err = am.trae_model_rates()
             wb_items, wb_err = am.wb_model_rates()
+            wbai_items, wbai_err = am.intl_model_rates()
             self.root.after(0, lambda: self._after_models_fetched(
-                trae_items, trae_err, wb_items, wb_err))
+                trae_items, trae_err, wb_items, wb_err, wbai_items, wbai_err))
         # 用独立线程, 不占用账号操作的 busy 锁
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_models_fetched(self, trae_items, trae_err, wb_items, wb_err):
+    def _after_models_fetched(self, trae_items, trae_err, wb_items, wb_err,
+                              wbai_items=None, wbai_err=None):
         """拉取完成 (主线程): 先清理上游已消失的 key, 再渲染。"""
         if not trae_err and trae_items:
             self._prune_model_state('trae', [it[0] for it in trae_items])
         if not wb_err and wb_items:
             self._prune_model_state('workbuddy', [it[0] for it in wb_items])
-        self._fill_model_trees(trae_items, trae_err, wb_items, wb_err)
+        if not wbai_err and wbai_items:
+            self._prune_model_state('workbuddy_intl', [it[0] for it in wbai_items])
+        self._fill_model_trees(trae_items, trae_err, wb_items, wb_err,
+                               wbai_items, wbai_err)
 
     def _prune_model_state(self, prov, current_keys):
         """清理 pinned/hidden 中上游已不存在的 key (只清状态引用, 不动模型数据)。"""
@@ -2559,6 +2639,19 @@ class AccountManagerApp:
             self._subprocess_stream(VENV_PY, os.path.join(BASE, 'login_workbuddy.py'),
                                     'WorkBuddy 登录助手 (login_workbuddy.py)')
             self.result_q.put('[提示] 登录成功后新账号即可参与轮询')
+            self.fill_credits()
+        self._run(work)
+
+    def on_add_wbai(self):
+        """添加 WorkBuddy 国际版账号 (www.workbuddy.ai 网页登录 → login_workbuddy_intl.py)。"""
+        def work():
+            self.result_q.put('>>> 即将打开 WorkBuddy 国际版 (www.workbuddy.ai) 网页登录 <<<')
+            self._subprocess_stream(VENV_PY, os.path.join(BASE, 'login_workbuddy_intl.py'),
+                                    'WorkBuddy 国际版登录助手 (login_workbuddy_intl.py)')
+            self.result_q.put('[提示] 登录成功后新账号即可参与轮询')
+            # 国际版账号池变化后让网关重载 provider, 并刷新列表+积分
+            self._trigger_reload(False)
+            self.refresh_account_list()
             self.fill_credits()
         self._run(work)
 

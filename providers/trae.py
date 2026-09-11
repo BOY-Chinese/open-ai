@@ -50,22 +50,33 @@ class TraeProvider(Provider):
             now = time.time()
             if not force and now - self._node_synced_at < 86400:
                 return bool(self._node_models)
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(f"{self.base_url}/models")
-                    if resp.status_code != 200:
-                        logger.warning("trae Node 后端 /v1/models HTTP %s (回退静态)", resp.status_code)
-                        return bool(self._node_models)
-                    data = resp.json()
-                    models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
-                if models:
-                    self._node_models = models
-                    self._node_synced_at = time.time()
-                    logger.info("trae 动态模型同步成功: %d 个", len(models))
-                    return True
-                logger.warning("trae Node 后端 /v1/models 返回空, 保留现有列表")
-            except Exception as e:  # noqa: BLE001
-                logger.warning("trae 动态模型同步失败: %s (回退静态表格)", e)
+            # 首次同步: Node 后端可能仍在启动/拉取上游, 重试直到拿到真实列表
+            # (否则一次失败就要等 24h, 期间 /v1/models 缺 glm/kimi/qwen 等绝大多数模型)
+            attempts = 10 if not self._node_models else 1
+            for i in range(attempts):
+                try:
+                    async with httpx.AsyncClient(timeout=20.0) as client:
+                        resp = await client.get(f"{self.base_url}/models")
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            models = [m.get("id") for m in (data.get("data") or [])
+                                      if m.get("id")]
+                            if models:
+                                self._node_models = models
+                                self._node_synced_at = time.time()
+                                logger.info("trae 动态模型同步成功: %d 个", len(models))
+                                return True
+                            logger.warning("trae Node 后端 /v1/models 返回空 (%d/%d), 重试",
+                                           i + 1, attempts)
+                        else:
+                            logger.warning("trae Node 后端 /v1/models HTTP %s (%d/%d), 重试",
+                                           resp.status_code, i + 1, attempts)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("trae 动态模型同步失败 (%d/%d): %s, 重试",
+                                   i + 1, attempts, e)
+                if i < attempts - 1:
+                    await asyncio.sleep(10)
+            logger.warning("trae 动态模型同步仍未成功, 回退静态表格")
             return bool(self._node_models)
 
     # ---------------- 基础接口 ----------------

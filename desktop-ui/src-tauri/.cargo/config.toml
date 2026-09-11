@@ -1,0 +1,7 @@
+# 指向手工组装的独立 Rust 工具链，避免经过 rustup shim
+# （本机 rustup 元数据不完整，shim 会报 "Missing manifest"）
+[build]
+rustc = "D:/app/dsh_plugin/open-ai/toolchain/bin/rustc.exe"
+
+[net]
+git-fetch-with-cli = true

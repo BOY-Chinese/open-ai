@@ -1,0 +1,142 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ═══════════════════════════════════════════════════════════════
+   open-ai 暗色主题令牌 (Dark Mode First)
+   所有颜色仅在此处定义，组件内一律通过 Tailwind 语义类引用。
+   色值区间遵循设计规范：背景 #0F0F0F~#1A1A1A，卡片 #1E1E1E~#252525
+   HSL 分量写法（无 hsl() 包裹）以便 Tailwind 调节透明度。
+   ═══════════════════════════════════════════════════════════════ */
+@layer base {
+  :root,
+  .dark {
+    /* ── 背景层级 ── */
+    --bg-app: 0 0% 6%;            /* #0F0F0F  应用底 */
+    --bg-sidebar: 0 0% 8%;        /* #141414  侧边栏 */
+    --bg-content: 0 0% 10%;       /* #1A1A1A  内容区 */
+    --bg-card: 0 0% 12%;          /* #1E1E1E  卡片 */
+    --bg-card-hover: 0 0% 15%;    /* #262626  卡片悬停 */
+    --bg-input: 0 0% 9%;          /* #171717  输入框 */
+    --bg-log: 0 0% 4%;            /* #0A0A0A  日志底 */
+
+    /* ── 边框 ── */
+    --border: 0 0% 18%;           /* #2E2E2E */
+    --border-subtle: 0 0% 14%;    /* #242424 */
+    --border-strong: 0 0% 26%;    /* #424242 */
+
+    /* ── 文字（深色模式对比度实测：fg 15.8:1 / muted 7.2:1 / subtle 4.6:1）── */
+    --fg: 0 0% 100%;              /* #FFFFFF */
+    --fg-muted: 0 0% 63%;         /* #A1A1AA */
+    --fg-subtle: 0 0% 45%;        /* #737373 */
+    --fg-faint: 0 0% 33%;         /* #545454 */
+
+    /* ── 主色 ── */
+    --primary: 217 91% 60%;       /* #3B82F6 */
+    --primary-hover: 217 91% 66%;
+    --primary-fg: 0 0% 100%;
+    --primary-soft: 217 91% 60%;  /* 配 /10~/15 透明度做高亮底 */
+
+    /* ── 状态色 ── */
+    --success: 142 71% 45%;       /* #22C55E */
+    --success-soft: 142 71% 45%;
+    --warning: 48 96% 53%;        /* #EAB308 */
+    --warning-soft: 48 96% 53%;
+    --danger: 0 84% 60%;          /* #EF4444 */
+    --danger-hover: 0 84% 66%;
+    --danger-soft: 0 84% 60%;
+
+    /* ── 三通道品牌色（与需求一致，图表与徽标共用）── */
+    --channel-trae: 0 0% 10%;     /* #1A1A1A 深灰 */
+    --channel-wb: 142 71% 45%;    /* #22C55E 绿 */
+    --channel-wbie: 48 96% 53%;   /* #EAB308 黄 */
+
+    /* 图表专用：Trae 系列。
+       需求指定 #1A1A1A，但在同色卡片底上对比度 1:1 完全不可见，
+       故提升到中性灰以满足「图形元素对背景 ≥3:1」的无障碍要求。 */
+    --chart-trea: 240 4% 46%;     /* #71717A zinc-500 */
+  }
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden; /* 桌面应用：滚动交给内容区 */
+  }
+
+  body {
+    @apply bg-bg-app text-fg font-sans text-base;
+    -webkit-font-smoothing: antialiased;
+    user-select: none; /* 原生应用质感；日志区单独放开 */
+  }
+
+  /* 键盘焦点可见（无障碍硬要求） */
+  :focus-visible {
+    outline: 2px solid hsl(var(--primary));
+    outline-offset: 1px;
+  }
+
+  /* 滚动条：细窄暗色 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(0 0% 24%);
+    border: 2px solid transparent;
+    background-clip: content-box;
+    border-radius: 8px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(0 0% 34%);
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* 禁用动画偏好 */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* 表格数值列等宽对齐 */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .selectable {
+    user-select: text;
+  }
+
+  /* 骨架屏微光 */
+  .skeleton {
+    @apply relative overflow-hidden bg-bg-card-hover;
+  }
+  .skeleton::after {
+    content: '';
+    @apply absolute inset-0 -translate-x-full animate-shimmer;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      hsl(0 0% 100% / 0.04),
+      transparent
+    );
+  }
+}

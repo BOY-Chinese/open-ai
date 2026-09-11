@@ -4,8 +4,9 @@ Open-API — 统一 OpenAI 兼容聚合网关 (open-ai, 端口 8000)
 
 聚合多个逆向提供商, 单端口对外提供标准 OpenAI 兼容 API。
 当前注册的提供商 (providers/):
-  * workbuddy — 腾讯 WorkBuddy 网关 (copilot.tencent.com 内置 DeepSeek 等)
-  * trae      — TRAE 内嵌 Node 后端 (trae/server.js, 转发 18787, Work 积分通道, DeepSeek-V4-Flash-Official)
+  * workbuddy      — 腾讯 WorkBuddy 网关 (copilot.tencent.com 内置 DeepSeek 等)
+  * workbuddy-intl — WorkBuddy 国际版网关 (www.workbuddy.ai, wbie-* 模型)
+  * trae           — TRAE 内嵌 Node 后端 (trae/server.js, 转发 18787, Work 积分通道, DeepSeek-V4-Flash-Official)
 
 端点:
   GET  /v1/models                 所有提供商模型列表
@@ -16,13 +17,15 @@ Open-API — 统一 OpenAI 兼容聚合网关 (open-ai, 端口 8000)
 
 模型路由 (providers/__init__.py route_provider):
   模型名以 "tr-" 开头或含 "trae"      → trae provider (tr-<上游模型名>, Work 积分通道)
+  模型名以 "wbie" 开头或含 "intl"     → workbuddy-intl provider (wbie-<上游模型名>)
   模型名含 "workbuddy" 或以 "wb-" 开头 → workbuddy provider
   其他 → 第一个 provider (workbuddy)
 
-模型列表: 两通道均每日自动同步上游 (/v1/models 无需改代码跟随上游更新)。
-对外命名: trae 通道统一 tr- 前缀; workbuddy 通道统一 wb- 前缀 (另保留
-auto / deepseek-chat / deepseek-reasoner 三个通用别名)。历史裸名与
-custom-local: 前缀的请求仍兼容, 但不再出现在列表中。
+模型列表: 三通道均每日自动同步上游 (/v1/models 无需改代码跟随上游更新)。
+  国际版走 /v2/enterprises/personal/models 目录接口。
+对外命名: trae 通道统一 tr- 前缀; workbuddy 通道统一 wb- 前缀; 国际版统一
+wbie- 前缀 (另保留 auto / deepseek-chat / deepseek-reasoner 三个通用别名)。
+历史裸名、wbai- 旧前缀与 custom-local: 前缀的请求仍兼容, 但不再出现在列表中。
 """
 import asyncio
 import collections
@@ -31,7 +34,7 @@ import logging
 import os
 import time
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from providers import build_providers, route_provider
@@ -92,6 +95,16 @@ async def _refresh_workbuddy_models(force: bool = False):
             logger.warning("workbuddy 模型刷新异常: %s", e)
 
 
+async def _refresh_workbuddy_intl_models(force: bool = False):
+    """国际版模型每日刷新 (走 /v2/enterprises/personal/models 目录接口)。"""
+    intl = PROVIDERS.get("workbuddy-intl")
+    if intl is not None and hasattr(intl, "refresh_models"):
+        try:
+            await intl.refresh_models(force=force)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("workbuddy-intl 模型刷新异常: %s", e)
+
+
 async def _refresh_trae_models(force: bool = False):
     tr = PROVIDERS.get("trae")
     if tr is not None and hasattr(tr, "sync_models"):
@@ -102,12 +115,14 @@ async def _refresh_trae_models(force: bool = False):
 
 
 async def _model_refresh_loop():
-    """启动时先刷新, 之后每 24h 刷新一次 (workbuddy + trae 动态模型)。"""
+    """启动时先刷新, 之后每 24h 刷新一次 (workbuddy + 国际版 + trae 动态模型)。"""
     await _refresh_workbuddy_models(force=True)
+    await _refresh_workbuddy_intl_models(force=True)
     await _refresh_trae_models()
     while True:
         await asyncio.sleep(MODEL_REFRESH_INTERVAL)
         await _refresh_workbuddy_models()
+        await _refresh_workbuddy_intl_models()
         await _refresh_trae_models()
 
 
@@ -146,6 +161,26 @@ def _check_auth(request: Request) -> str | None:
     if auth[7:].strip() not in _valid_keys():
         return "API Key 无效"
     return None
+
+
+def require_auth(request: Request):
+    """FastAPI 依赖形式的管理面鉴权（与 /v1/* 共用同一套密钥）。
+
+    admin_api 的路由统一以此作为依赖注入，避免在 10+ 个端点上重复粘贴
+    `_check_auth` 调用；鉴权失败直接 401，语义与既有端点一致。
+    """
+    err = _check_auth(request)
+    if err:
+        raise HTTPException(
+            status_code=401,
+            detail={"message": err, "type": "auth_error"},
+        )
+
+
+# ── 管理面路由（供桌面端调用）：账号 / 密钥 / 模型 / 积分 / 日志 ──
+from admin_api import router as admin_router  # noqa: E402
+
+app.include_router(admin_router, dependencies=[Depends(require_auth)])
 
 
 @app.get("/")

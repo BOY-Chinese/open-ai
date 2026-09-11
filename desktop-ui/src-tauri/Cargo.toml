@@ -22,7 +22,13 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], optional = true }
 
 [features]
-default = []
+# custom-protocol 是 Tauri 的**生产构建开关**：
+#   启用 → 前端资源经 tauri:// 协议从二进制内嵌资源加载（无需 dev server）
+#   未启用 → 即便配了 frontendDist，release 包仍会去连 devUrl(127.0.0.1:1420)，
+#            在没有 dev server 的机器上表现为 ERR_CONNECTION_REFUSED。
+# 这正是 v3.0 首个安装包在虚拟机上打不开页面的根因（已修）。
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
 # 启用后 Tauri 命令直接转发到本地 FastAPI 网关
 backend-http = ["dep:reqwest"]
 

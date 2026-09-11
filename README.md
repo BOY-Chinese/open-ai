@@ -4,12 +4,26 @@
 OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼容接口（`/v1/messages`），
 供 Claude Code、CC Switch、OpenAI 客户端等任意兼容工具统一调用。
 
-> **当前版本: v2.4**（`version.py` 单源定义 `APP_VERSION` / `UPDATE_CHANNEL`）
-> - **dev 版**（开源/开发者版）: `APP_VERSION='v2.4-dev'`、通道 `dev`，需自备 Python 3.10+ 运行环境；
-> - **portable 版**（普通用户版）: `APP_VERSION='portable-v2.4'`、通道 `portable`，安装包内建运行时，
+> **当前版本: v3.0**（`version.py` 单源定义 `APP_VERSION` / `UPDATE_CHANNEL`）
+> - **dev 版**（开源/开发者版）: `APP_VERSION='v3.0-dev'`、通道 `dev`，需自备 Python 3.10+ 运行环境；
+> - **portable 版**（普通用户版）: `APP_VERSION='portable-v3.0'`、通道 `portable`，安装包内建运行时，
 >   对电脑运行环境要求大大降低。
 > 两个通道互不干扰，「一键更新」按 `UPDATE_CHANNEL` 在 GitHub Release Assets 中精确匹配对应安装包
 > （dev → `open-ai-installer-dev.exe`；portable → `open-ai-installer-portable.exe`）。
+
+## v3.0 更新内容
+
+1. **全新桌面端（Tauri 2 + React 18）**：暗色主题、左侧导航、三通道统一表格；
+   安装包内置于 `desktop/`，桌面快捷方式默认拉起新桌面端。
+2. **前后端链路打通**：网关新增管理面 REST 接口 `/v1/admin/*`
+   （账号 / API 密钥 / 模型 / 积分 / 日志），桌面端直接读取真实数据。
+   `GET` 只读本地（毫秒级），需要联网的动作走 `POST`。
+3. **修复开机自启托盘缺陷**：原先自启只拉起后端，托盘图标由 GUI 创建故不显示；
+   现改为「后端 + 界面」双启动（桌面端 → Python 托盘 GUI 三级降级）。
+4. **国际版模型前缀 `wbai-` → `wbie-`**：与 Trae `tr-`、WorkBuddy `wb-` 形成统一
+   三字母通道前缀；旧前缀仍作为请求别名兼容，老客户端无需改动。
+5. **自启脚本根治硬编码路径**：`open-ai-autostart.bat` 改为 `%~dp0` 自适应，
+   安装到任意目录都能工作。
 
 ## v2.4 更新内容
 
@@ -158,6 +172,8 @@ open-ai/
 ├── start.bat               # 一键启动 (建 venv / 装依赖 / 构建 runtime / 起 Broker)
 ├── start_hidden.ps1        # 隐藏窗口启动 (供开机自启调用, 委托 bootstrap)
 ├── open-ai-autostart.bat   # 开机自启入口 (GUI 自启用隐藏 open-ai-autostart.vbs 调 start_hidden.ps1)
+├── desktop-ui/             # ★ v3.0 桌面端 (Tauri 2 + React 18 + Tailwind)
+├── admin_api.py            # ★ v3.0 管理面 REST 接口 (/v1/admin/*)
 ├── runtime/                # ★ v2.4 进程管理运行时 (procname.py 自动构建)
 │   ├── pyvenv.cfg          #   home = Store Python 包目录
 │   ├── Lib/site-packages   #   junction → .venv 的 site-packages
@@ -422,6 +438,7 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 Broker 白天反�
 | Broker/服务没在跑 | 先 `bootstrap.py status` / `doctor`；计划任务 `OpenAI-DaemonBoot` 每 5 分钟兜底拉起；手动 `bootstrap.py start` |
 | 想彻底关掉所有进程 | 托盘右键「退出」（GUI 内一键）；或 `bootstrap.py stop`（优雅，二者均抑制 watchdog 复活 10 分钟）；或任务管理器结束 `open-ai-daemon.exe`（Job Object 连带终止全部子进程） |
 | runtime 构建失败 | 删除 `runtime\` 目录后重新运行 `start.bat`（自动重建）；解释器需为 Store Python 3.13 或 python.org 3.10+（任选其一） |
+| 开机自启后**托盘没有图标** | v3.0 已修复：v2.4 自启只拉起 Broker，而托盘图标由 GUI 创建。现在自启会同时拉起界面（桌面端优先，回落 Python 托盘 GUI）。若仍是旧版，用「一键卸载」清理后重装 |
 | 开机自启弹控制台/报「daemon 未运行」 | v2.4 已修复：开机自启改为隐藏 VBS（无窗口）调用 `start_hidden.ps1`；若仍弹旧版残留的启动项/计划任务，用「一键卸载」清理后重装即可 |
 | 启动/卸载时弹 "Failed to remove temporary directory: ...\_MEIxxxxxx" | 已修复（launcher/uninstaller 改 PyInstaller onedir 打包，不再解压 `%TEMP%` 临时目录；onefile 引导器在 VM/杀软锁定文件时无法清理才会弹此框） |
 

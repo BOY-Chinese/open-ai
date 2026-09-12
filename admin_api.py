@@ -350,10 +350,29 @@ async def launch_login(payload: dict = Body(default={})):
         exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
         if not os.path.exists(exe):
             exe = sys.executable
-        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+
+        # ★ 必须 CREATE_NO_WINDOW：登录脚本本身只在终端里打印进度，
+        #   真正的交互发生在它打开的浏览器里（扫码/密码）。原实现用
+        #   CREATE_NEW_CONSOLE，于是「点添加账号就弹出一个黑终端」——
+        #   用户实测反馈的正是这个（脚本并不需要那个窗口）。
+        #
+        #   代价是看不到脚本输出，因此把它重定向到 logs/login_<通道>.log，
+        #   否则登录失败时用户和开发者都无从下手。
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        logs_dir = os.path.join(BASE, "logs")
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+            log_path = os.path.join(logs_dir, f"login_{channel}.log")
+            logf = open(log_path, "ab", buffering=0)
+        except Exception:  # noqa: BLE001
+            logf, log_path = subprocess.DEVNULL, ""
+
         subprocess.Popen([exe, script], cwd=BASE,  # noqa: S603
-                         creationflags=flags)
-        return {"ok": True, "launched": script_name, "channel": channel}
+                         creationflags=flags,
+                         stdin=subprocess.DEVNULL,
+                         stdout=logf, stderr=subprocess.STDOUT)
+        return {"ok": True, "launched": script_name, "channel": channel,
+                "logFile": log_path}
 
     return await _in_thread(_work)
 
@@ -765,24 +784,31 @@ def _api_store():
 
 @router.get("/api-keys")
 async def list_api_keys():
-    """API 密钥列表。
+    """API 密钥列表（只读 config.json 的 api_keys，毫秒级）。
 
-    api_store.list_apis() 返回 [(name, key, is_legacy)]，其中 is_legacy 表示
-    该密钥来自旧版顶层 api_key 字段（改名走 rename_legacy_api 而非 rename_api）。
+    api_store.list_apis() 返回 [(name, key, created_at)]；created_at 为 0 表示
+    老配置里没有该字段（前端显示「—」，不再伪造 1970）。
     前端用 key 本身作为行标识（key 唯一且不可变）。
+
+    读的时候顺手做一次旧结构迁移：把顶层 api_key/api_key_name 并入 api_keys。
+    放在这里是为了「即使网关先于配置改动启动，用户点开这一页也能自愈」。
     """
     def _work() -> list[dict]:
         store = _api_store()
         cfg = store.load_config()
+        try:
+            if store.ensure_api_keys(cfg):
+                cfg = store.load_config()      # 迁移已落盘，重新读取
+        except Exception as e:  # noqa: BLE001
+            logger.warning("API 密钥结构统一失败: %s", e)
         items = []
         for i, row in enumerate(store.list_apis(cfg)):
-            name, key, legacy = (list(row) + [None, None, False])[:3]
+            name, key, created = (list(row) + [None, None, 0])[:3]
             items.append({
                 "id": f"key-{i}",
                 "name": name or f"无名{i + 1}",
                 "key": key or "",
-                "legacy": bool(legacy),
-                "createdAt": 0,
+                "createdAt": int(created or 0),
             })
         return items
 
@@ -795,15 +821,16 @@ async def create_api_key(payload: dict = Body(default={})):
     def _work() -> dict:
         store = _api_store()
         cfg = store.load_config()
-        name, key = store.create_api(cfg)
-        return {"ok": True, "name": name, "key": key}
+        name, key, created = store.create_api(cfg,
+                                              str(payload.get("name") or ""))
+        return {"ok": True, "name": name, "key": key, "createdAt": created}
 
     return await _in_thread(_work)
 
 
 @router.post("/api-keys/rename")
 async def rename_api_key(payload: dict = Body(...)):
-    """body: {key, name}；legacy 密钥走独立改名路径。"""
+    """body: {key, name}。"""
     def _work() -> dict:
         store = _api_store()
         cfg = store.load_config()
@@ -811,28 +838,22 @@ async def rename_api_key(payload: dict = Body(...)):
         name = str(payload.get("name") or "").strip()
         if not old or not name:
             raise HTTPException(status_code=400, detail="key 与 name 必填")
-        if old == (cfg.get("api_key") or ""):
-            store.rename_legacy_api(cfg, name)
-            return {"ok": True, "legacy": True}
         if not store.rename_api(cfg, old, name):
             raise HTTPException(status_code=404, detail="密钥不存在")
-        return {"ok": True, "legacy": False}
+        return {"ok": True}
 
     return await _in_thread(_work)
 
 
 @router.post("/api-keys/delete")
 async def delete_api_key(payload: dict = Body(...)):
-    """body: {key}；旧版顶层 api_key 不允许删除（它是网关的兜底密钥）。"""
+    """body: {key}。v3.0 起所有密钥一视同仁，均可删除。"""
     def _work() -> dict:
         store = _api_store()
         cfg = store.load_config()
         key = str(payload.get("key") or "")
         if not key:
             raise HTTPException(status_code=400, detail="key 必填")
-        if key == (cfg.get("api_key") or ""):
-            raise HTTPException(status_code=400,
-                                detail="旧版 api_key 为网关兜底密钥，不可删除")
         if not store.delete_api(cfg, key):
             raise HTTPException(status_code=404, detail="密钥不存在")
         return {"ok": True}

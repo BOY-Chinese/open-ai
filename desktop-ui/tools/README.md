@@ -6,6 +6,7 @@
 |---|---|---|
 | `screenshot.mjs` | 六页面 + 周视图截图自检 | 依赖装在 `tools/node_modules_tools/`（见下）；dev server 在跑 |
 | `verify-ui.mjs` | **DOM 文本断言自检（18 项）**，比截图可靠 | 同上（puppeteer + dev server） |
+| `verify-packaged.mjs` | **直连真实打包应用**（WebView2 CDP）做 DOM 断言与点击流程；`--uninstall` 额外验证一键卸载 | 应用需带 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` 启动 |
 | `build-tauri.ps1` | 编译 Tauri Rust 后端（debug） | 独立工具链 `open-ai/toolchain/`（见下） |
 | `build-tauri-release.ps1` | **生产构建**：`TAURI_ENV_DEBUG=false` + `custom-protocol`，产物同步到 `<根>\desktop\` | 同上；已先 `npm run build` |
 | `install-local-shortcut.ps1` | 把桌面 `open-ai.lnk` 指向本机构建的桌面端 | 已生成 `<根>\desktop\open-ai-desktop.exe` |
@@ -25,6 +26,12 @@ node tools/screenshot.mjs
 
 # 2b) DOM 断言自检（推荐日常使用：确定性，不依赖人眼看图）
 node tools/verify-ui.mjs
+
+# 2c) 直连「真实打包应用」做断言（验证用户实际在用的那一份）
+#     先带调试端口启动：set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222
+#                       desktop\open-ai-desktop.exe
+node tools/verify-packaged.mjs
+node tools/verify-packaged.mjs --uninstall    # 额外走一遍一键卸载点击流程
 
 # 3) 编译并启动桌面应用
 powershell -ExecutionPolicy Bypass -File tools/build-tauri.ps1

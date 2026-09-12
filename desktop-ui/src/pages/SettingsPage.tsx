@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { AlertTriangle, Download, Info, Power, Trash2 } from 'lucide-react'
 import { PageHeader, PageShell } from '@/components/layout/PageShell'
 import { Button } from '@/components/ui/button'
@@ -15,6 +16,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useToast } from '@/components/feedback/Toast'
 import { useAsync } from '@/hooks/useAsync'
 import { backend } from '@/lib/dataSource'
+import { inTauri } from '@/lib/gateway'
 
 /** 版本号统一展示格式：后端返回 "2.4.0" / "v2.4.0" 均归一为 v 前缀 */
 function formatVersion(raw: string): string {
@@ -126,14 +128,30 @@ export function SettingsPage() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [confirmOpen, closeConfirm])
 
-  /** 确认卸载：模拟后端调用，完成后提示并关闭对话框 */
+  /**
+   * 确认卸载：真正拉起安装目录下的 uninstall.exe。
+   *
+   * 此前这里是**空壳**（`await new Promise(r => setTimeout(r, 900))` + 一条
+   * toast）—— 点了「一键卸载」什么都没发生，用户实测反馈的正是这个。
+   *
+   * 交给 Tauri 命令而不是 HTTP 路由，是因为卸载器要删掉
+   * `<安装根>\desktop\open-ai-desktop.exe` **自己**；界面必须先让出文件占用，
+   * 所以命令在启动卸载器后会自行退出桌面端（见 Rust `uninstall_app`）。
+   */
   const handleConfirmUninstall = useCallback(async () => {
+    if (!inTauri) {
+      toast('一键卸载只能在桌面端应用内使用（当前是浏览器预览）', 'warn', 4000)
+      return
+    }
     setUninstalling(true)
     try {
-      await new Promise((r) => setTimeout(r, 900))
-      toast('卸载请求已提交，请在弹出的窗口中确认', 'warn', 4000)
+      await invoke<string>('uninstall_app')
+      toast('卸载程序已启动，请按提示完成卸载', 'warn', 5000)
       setConfirmOpen(false)
-    } finally {
+      // 界面随后会被 Rust 侧退出，这里不重置 uninstalling，
+      // 避免退出前按钮闪回可点状态导致重复触发
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), 'error', 6000)
       setUninstalling(false)
     }
   }, [toast])

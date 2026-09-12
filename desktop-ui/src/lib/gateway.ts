@@ -54,6 +54,19 @@ export function gatewayRuntime(): Promise<GatewayRuntime> {
   return pending
 }
 
+/**
+ * 丢弃缓存的网关配置并重新读取。
+ *
+ * 为什么需要：密钥/端口都来自 `config.json`，而用户可能在界面开着的时候
+ * 直接改这个文件（换了 api_keys、换了端口）。此时界面缓存的旧密钥会立刻失配，
+ * 表现为「点刷新没反应、列表还是旧的」。请求层遇到 401 时调用本函数重读配置，
+ * 再重试一次，就能自动跟上配置变更，不需要重启桌面端。
+ */
+export function invalidateGatewayRuntime(): Promise<GatewayRuntime> {
+  pending = null
+  return gatewayRuntime()
+}
+
 async function loadRuntime(): Promise<GatewayRuntime> {
   const devBase = stripSlash(import.meta.env.VITE_GATEWAY_BASE as string | undefined)
 

@@ -9,7 +9,7 @@
  *  - 生产态：经 Tauri 命令读同一份 config.json，拿到真实地址与密钥
  *  两种形态下前端代码一致、产物中都不含密钥（见 `./gateway.ts`）。
  */
-import { authHeaders, gatewayRuntime } from './gateway'
+import { authHeaders, gatewayRuntime, invalidateGatewayRuntime } from './gateway'
 import type {
   Account,
   ApiKey,
@@ -40,48 +40,65 @@ async function req<T>(
   init?: { method?: 'GET' | 'POST'; body?: unknown; timeoutMs?: number }
 ): Promise<T> {
   const { method = 'GET', body, timeoutMs = 20000 } = init ?? {}
-  // 运行期解析网关地址与密钥：打包态由 Tauri 从 config.json 提供，
-  // 开发态为空串 → 同源相对路径 → Vite 代理转发并注入密钥
-  const rt = await gatewayRuntime()
-  const headers: Record<string, string> = { ...(authHeaders(rt) ?? {}) }
-  if (body) headers['Content-Type'] = 'application/json'
 
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  // 首次尝试 + 401 后重读配置再试一次。
+  // 为什么需要重试：密钥来自 config.json，用户可能一边开着界面一边改它
+  // （实测：「我换了 config.json，点刷新没反应」——旧密钥失配 → 401 →
+  //  刷新失败 → 列表保持旧数据，看起来就像刷新按钮坏了）。
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const rt = attempt === 0 ? await gatewayRuntime() : await invalidateGatewayRuntime()
+    const headers: Record<string, string> = { ...(authHeaders(rt) ?? {}) }
+    if (body) headers['Content-Type'] = 'application/json'
 
-  try {
-    const res = await fetch(`${rt.baseUrl}${path}`, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: ctrl.signal,
-    })
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
 
-    if (!res.ok) {
-      let detail = `HTTP ${res.status}`
-      try {
-        const j = await res.json()
-        const d = j?.detail
-        detail = typeof d === 'string' ? d : d?.message ?? JSON.stringify(d ?? j)
-      } catch {
-        /* 保留 HTTP 状态文案 */
+    try {
+      const res = await fetch(`${rt.baseUrl}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: ctrl.signal,
+        // 管理面数据必须实时：WebView2 / 中间层不允许返回缓存副本，
+        // 否则「点刷新拿到的还是上一次的列表」
+        cache: 'no-store',
+      })
+
+      // 密钥失配：重读 config.json 后再试一次（配置改了但界面还开着）
+      if ((res.status === 401 || res.status === 403) && attempt === 0) {
+        continue
       }
-      throw new ApiError(res.status, detail)
+
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`
+        try {
+          const j = await res.json()
+          const d = j?.detail
+          detail = typeof d === 'string' ? d : d?.message ?? JSON.stringify(d ?? j)
+        } catch {
+          /* 保留 HTTP 状态文案 */
+        }
+        if (res.status === 401 || res.status === 403) {
+          detail = `${detail}（已按 config.json 重新读取密钥仍被拒绝，请确认网关已重启以加载新的 api_keys）`
+        }
+        throw new ApiError(res.status, detail)
+      }
+      return (await res.json()) as T
+    } catch (e) {
+      if (e instanceof ApiError) throw e
+      if ((e as Error).name === 'AbortError') {
+        throw new ApiError(408, '请求超时（网关无响应）')
+      }
+      // 带上实际请求地址：虚拟机排障时一眼能看出「打到哪儿去了」
+      throw new ApiError(
+        0,
+        `无法连接网关${rt.baseUrl ? `（${rt.baseUrl}）` : ''}：${(e as Error).message}`
+      )
+    } finally {
+      clearTimeout(timer)
     }
-    return (await res.json()) as T
-  } catch (e) {
-    if (e instanceof ApiError) throw e
-    if ((e as Error).name === 'AbortError') {
-      throw new ApiError(408, '请求超时（网关无响应）')
-    }
-    // 带上实际请求地址：虚拟机排障时一眼能看出「打到哪儿去了」
-    throw new ApiError(
-      0,
-      `无法连接网关${rt.baseUrl ? `（${rt.baseUrl}）` : ''}：${(e as Error).message}`
-    )
-  } finally {
-    clearTimeout(timer)
   }
+  throw new ApiError(401, '网关拒绝鉴权（已重试）')
 }
 
 const q = (params: Record<string, string | number | undefined>) => {
@@ -188,18 +205,23 @@ export const httpBackend = {
   /* ═══════════════ API 密钥 ═══════════════ */
 
   async listApiKeys(): Promise<ApiKey[]> {
-    const r = await req<{ apiKeys: (ApiKey & { legacy?: boolean })[] }>(
-      '/v1/admin/api-keys'
-    )
+    const r = await req<{ apiKeys: ApiKey[] }>('/v1/admin/api-keys')
     return r.apiKeys
   },
 
   async createApiKey(): Promise<ApiKey> {
-    const r = await req<{ name: string; key: string }>('/v1/admin/api-keys/create', {
-      method: 'POST',
-      body: {},
-    })
-    return { id: `key-${r.key.slice(-6)}`, name: r.name, key: r.key, createdAt: Date.now() / 1000 }
+    const r = await req<{ name: string; key: string; createdAt: number }>(
+      '/v1/admin/api-keys/create',
+      { method: 'POST', body: {} }
+    )
+    // createdAt 由后端持久化到 config.json（此前是硬编码 0，
+    // 前端一格式化就显示成 1970/01/01 —— 用户实测反馈的 bug）
+    return {
+      id: `key-${r.key.slice(-6)}`,
+      name: r.name,
+      key: r.key,
+      createdAt: r.createdAt ?? 0,
+    }
   },
 
   /** 注意：用 key 作为标识（密钥不可变且唯一） */

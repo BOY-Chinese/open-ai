@@ -33,10 +33,22 @@ class TraeProvider(Provider):
         # 例: {"deepseek-v4-flash": "DeepSeek-V4-Flash", "trae-flash-official": "DeepSeek-V4-Flash-Official"}
         self.aliases = {k: v for k, v in (cfg.get("models") or {}).items()}
         self._default = (cfg.get("default_model") or "DeepSeek-V4-Flash-Official").strip()
+        # 账号池: 与 trae/server.js 读的是同一份 config.json providers.trae.accounts。
+        # 仅用于「有没有可用账号」的判定 —— 见 list_models()。
+        self.accounts = cfg.get("accounts") or []
         # ---- 动态模型: 转发 Node 后端 /v1/models (Node 侧每日拉上游), 失败回退静态 ----
         self._node_models: list[str] = []   # 最近一次从 Node 后端同步到的上游模型
         self._node_synced_at: float = 0.0
         self._node_sync_lock = asyncio.Lock()
+
+    def has_usable_account(self) -> bool:
+        """是否存在可用 Trae 账号（未禁用、未标记失效）。
+
+        判定口径与 trae/server.js 的 `!a.invalid && a.enabled !== false` 对齐，
+        否则会出现「列表说有、请求说没有」的矛盾。
+        """
+        return any(a.get("enabled", True) is not False and not a.get("invalid")
+                   for a in self.accounts)
 
     # ---------------- 动态模型 (转发 Node 后端, 每日自动同步) ----------------
     async def sync_models(self, force: bool = False) -> bool:
@@ -81,6 +93,17 @@ class TraeProvider(Provider):
 
     # ---------------- 基础接口 ----------------
     def list_models(self) -> list[dict]:
+        # 没有任何可用账号时**不对外暴露任何模型**。
+        #
+        # 为什么（本机/虚拟机实测反馈「没账号却显示一堆 Trae 模型」）：
+        #   Trae 的模型列表 = 动态上游模型 + config 别名 + 默认模型回退，
+        #   后两者全是静态的，因此即使账号池为空也会列出一堆模型；
+        #   而这些模型一个都调不通（server.js 账号池为空会直接报错），
+        #   只会让用户误以为「有模型可用」。WorkBuddy 侧本来就是
+        #   「无账号则不注册 provider」，这里把 Trae 的口径对齐。
+        if not self.has_usable_account():
+            return []
+
         # 对外统一 tr- 前缀标识 Trae 通道: 动态上游模型 + 配置别名 + 默认模型回退
         names = set(self._node_models) | set(self.aliases.values()) \
             | set(self.aliases.keys())

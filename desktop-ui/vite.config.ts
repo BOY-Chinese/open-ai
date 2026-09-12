@@ -24,6 +24,11 @@ function readGatewayKey(): string {
     if (!c.endsWith('.json')) return c
     try {
       const cfg = JSON.parse(fs.readFileSync(c, 'utf-8'))
+      // v3.0 起密钥统一在 api_keys 里；顶层 api_key 仅作旧配置兜底
+      const first = Array.isArray(cfg?.api_keys)
+        ? cfg.api_keys.find((a: { key?: string }) => a?.key)?.key
+        : undefined
+      if (first) return String(first)
       if (cfg?.api_key) return String(cfg.api_key)
     } catch {
       /* 换下一个候选 */

@@ -637,3 +637,123 @@ Windows PowerShell 5.1 用 ANSI(GBK) 解码**无 BOM 的 UTF-8 脚本**，中文
 **顺带修掉一个真隐患**：`open-ai-autostart.bat` 是 **LF 换行**的批处理文件。
 cmd.exe 解析 LF-only 批处理的 `if (...)` 块并不可靠，而这是**开机自启链路**上
 唯一的 .bat。已转 CRLF（`file` 确认 `with CRLF line terminators`）。
+
+---
+
+## 十四、v3.0 四轮：8 项实测问题修复
+
+用户在本机与虚拟机上又报了 8 个问题。逐条记录根因与验证方式。
+
+### 14.1 没有账号时模型列表仍有模型（Trae 通道）
+
+`providers/trae.py` 的 `list_models()` 会把**动态上游模型 + config 别名 + 默认模型**
+三样并集返回，后两样是**静态**的 —— 账号池为空时照样列出一堆模型，而这些模型
+一个都调不通（`trae/server.js` 账号池为空会直接报错）。
+
+WorkBuddy / 国际版本来就是「无账号则在 `build_providers` 里根本不注册」，
+唯独 Trae 只要 `enabled != false` 就注册。修复：Trae 也按账号门控 ——
+新增 `has_usable_account()`（判定口径与 `server.js` 的 `!invalid && enabled !== false`
+对齐），无可用账号时 `list_models()` 返回 `[]`。
+
+> 实测：无账号 → `[]`；账号全部禁用 → `[]`；有账号 → 正常返回。
+
+### 14.2 「一键卸载」没有运行 uninstall.exe
+
+**前端那个按钮是空壳**：`await new Promise(r => setTimeout(r, 900))` + 一条 toast，
+压根没调用任何后端 —— 点了当然什么都没发生。
+
+修复：新增 Tauri 命令 `uninstall_app`，拉起 `<安装根>\uninstall.exe --silent`，
+并在 1.5 秒后退出桌面端本身。
+
+- 为什么走 Rust 而不是 HTTP：卸载器要删掉 `<安装根>\desktop\open-ai-desktop.exe`
+  **它自己**，界面必须先让出文件占用；
+- 为什么加 `--silent`：界面已经弹过一次二次确认，卸载器不必再问一遍，
+  但仍会显示自己的进度窗口（用户看得见它在删什么）。
+
+### 14.3 托盘「退出」应退出全部 open-ai 进程
+
+原来只退界面、保留后端，且菜单文案写着「退出界面（后端继续运行）」。
+按要求改为 **「退出」= 退出全部**。
+
+实现（Rust 侧）：先把 Broker 优雅停掉 —— 复用 `open-ai.exe bootstrap.py stop`
+（唯一实现了「IPC 优雅广播 → leaf Job → root Job → 兜底 kill」的入口，
+在 Rust 里重写必然与 Python 侧行为漂移），并写 `data/.gui_exit_suppress` 时间戳
+抑制 watchdog 在 10 分钟内复活后端，然后 `app.exit(0)`。
+
+### 14.4 添加账号会弹出终端窗口
+
+`admin_api.py` 的 `/accounts/login` 用了 `CREATE_NEW_CONSOLE`，于是每点一次
+「添加账号」就弹出一个黑终端 —— 而登录脚本**只在终端里打印进度**，
+真正的交互发生在它打开的浏览器里（扫码/密码），那个窗口纯属多余。
+
+改成 `CREATE_NO_WINDOW`，并把 `stdout/stderr` 重定向到
+`logs/login_<通道>.log`（隐藏终端后必须有地方看输出，否则登录失败无从排障），
+`stdin` 给 DEVNULL（脚本里的 `input()` 都有 `keep_open` 保护且带 try/except）。
+
+### 14.5 取消顶层 api_key / api_key_name，统一 api_keys
+
+虚拟机实测：API 列表里出现一条「无名1 YOUR_API_KEY_HERE」—— 那是安装包空壳配置
+`config.shell.json` 里的**占位符**被当成真密钥列了出来。顶层 api_key 结构还有第二个
+毛病：同一个概念有两个存放位置，且顶层那条「不可删除」，用户清理不掉。
+
+修复：新增 `api_store.ensure_api_keys()`（幂等，网关启动与管理面读取时各跑一次）：
+
+| 情况 | 处理 |
+|---|---|
+| 顶层 api_key 是占位符 `YOUR_API_KEY_HERE` | **丢弃，生成新的强密钥**（绝不是搬过去） |
+| 顶层 api_key 是真密钥 | 搬进 `api_keys`（保留 api_key_name 作为名字） |
+| 顶层 api_key 已在 api_keys 里 | 只删顶层字段，不产生重复 |
+| 迁移后 api_keys 为空 | 补生成一条「默认密钥」（否则网关没有任何合法密钥 → 全面 401） |
+
+同时：`config.shell.json` 去掉两个顶层字段；`list_apis` 只返回 `api_keys`；
+改名/删除不再有 legacy 分支（所有密钥一视同仁）；桌面端 Rust 的 `gateway_key()`
+改为**先读 `api_keys[0]`**、顶层字段仅作兜底。
+
+### 14.6 「+ 创建 API」→「创建 API」
+
+按钮文案与空态说明一并改掉（图标已经是 `+`，文字再带一个加号是重复）。
+
+### 14.7 API 创建时间全部显示 1970/01/01 08:00
+
+`admin_api.py` 里 `createdAt` **硬编码为 0**，前端 `new Date(0)` 自然就是 1970。
+
+修复：`api_store.create_api()` 写入真实 `createdAt`（秒级时间戳）并持久化到
+config.json；`list_apis()` 返回它。老配置里没有该字段的密钥返回 0，
+前端 `fmtTime()` 对 0 显示 **「—」（未知）而不是伪造时间** —— 1970 是缺数据，不是数据。
+
+### 14.8 API 列表刷新无效（换了 config.json 点刷新还是旧列表）
+
+后端每次请求都重读 config.json，本身没问题。真正的坑是**桌面端把网关密钥缓存在内存里**：
+用户在界面开着的时候换掉 config.json，旧密钥立刻失配 → 401 → 刷新失败 →
+列表保持旧数据，看起来就像「刷新按钮坏了」。
+
+修复（两处）：
+1. `req()` 遇到 401/403 时**重读 config.json 的地址与密钥并重试一次**
+   （新增 `invalidateGatewayRuntime()`），配置改了不必重启桌面端；
+2. 所有管理面请求加 `cache: 'no-store'`，禁止 WebView2 / 中间层返回缓存副本。
+
+### 14.9 本轮验证方式
+
+新增 `desktop-ui/tools/verify-packaged.mjs` —— **通过 WebView2 的 CDP 远程调试端口
+直连真实运行的打包应用**，读 DOM、点按钮。比截图 + 视觉模型可靠得多，
+而且验证的就是用户实际在用的那一份（dev server 里跑的是另一套环境）。
+
+```powershell
+# 带调试端口启动打包应用，然后：
+node tools/verify-packaged.mjs              # 19 项只读断言
+node tools/verify-packaged.mjs --uninstall  # 额外走一遍卸载点击流程
+```
+
+| 检查项 | 手段 | 结果 |
+|---|---|---|
+| 打包应用渲染 + 六页可达 + 网关在线 | CDP 直连真实应用读 DOM | **19/19 通过** |
+| API 页不再出现 1970 | 同上，断言页面文本 | **通过** |
+| 按钮文案为「创建 API」 | 同上 | **通过** |
+| 模型列表倍率非零 | 同上，读表格单元格 | **28/28 行非零** |
+| 一键卸载 | 放桩 `uninstall.exe` + 点击「一键卸载」「确认卸载」 | **桩收到 `--silent`，桌面端按预期退出** |
+| 托盘菜单文案 | 用 `WM_USER_TRAYICON` 触出真实菜单，读 Win32 菜单项 | **「显示主界面 / 打开日志目录 / 退出」** |
+| 托盘「退出」退出全部进程 | 点击菜单项「退出」 | **5 个 open-ai 进程全部退出 + 抑制标记已写** |
+| 添加账号不弹终端 | 换桩登录脚本走真实端点，枚举进程窗口 | **控制台窗口数=0，输出落盘 login_Trae.log** |
+| 无账号时模型列表为空 | 直接实例化 provider 断言 | **无账号/全禁用 → `[]`** |
+| 密钥结构迁移 | 6 种配置形态的单元测试 | **全部符合预期** |
+| 单元测试 | `python -m unittest discover -s tests` | **81/81 通过** |

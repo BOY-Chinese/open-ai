@@ -39,6 +39,29 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
    并清掉启动链里所有「回落到 Python GUI」的分支（`launcher_main.py`、
    `installer/launcher.py`、`start_hidden.ps1`、`installer.py` 生成的启动器）。
    界面**只有一个入口**：`desktop/open-ai-desktop.exe`。
+11. **没有账号时模型列表为空**：Trae 的模型列表 = 动态上游模型 + 配置别名 + 默认模型，
+    后两者是静态的，账号池为空时照样列出一堆调不通的模型。现按账号门控
+    （判定口径与 `trae/server.js` 一致），无可用账号则不暴露任何模型。
+12. **修复「一键卸载」**：桌面端那个按钮原本是**空壳**（只弹了个 toast，没调用任何
+    卸载程序）。现由 Tauri 命令拉起 `<安装根>\uninstall.exe --silent`，并在 1.5 秒后
+    退出桌面端本身（卸载器要删掉 desktop 目录里的 exe，界面必须先让出文件占用）。
+13. **托盘「退出」= 退出全部 open-ai 进程**：先把 Broker 优雅停掉
+    （`bootstrap.py stop`，同时写 watchdog 抑制标记），再退出界面 ——
+    任务管理器里不再残留 open-ai 进程。
+14. **「添加账号」不再弹终端**：登录脚本只在终端打印进度（真正的交互在它打开的
+    浏览器里），原实现用 `CREATE_NEW_CONSOLE` 白弹一个黑框。现改为无窗口启动，
+    输出重定向到 `logs/login_<通道>.log`，登录失败仍有据可查。
+15. **取消顶层 `api_key` / `api_key_name`**：密钥统一只在 `api_keys` 里维护。
+    安装包空壳配置里的 `YOUR_API_KEY_HERE` 曾被当成真密钥列在 API 列表里
+    （虚拟机实测显示为「无名1 YOUR_API_KEY_HERE」）。现启动时自动迁移：
+    真密钥搬进 `api_keys`，占位符换成新生成的强密钥，并保证至少有一条可用密钥。
+16. **API 创建时间不再显示 1970**：此前后端把 `createdAt` 硬编码为 0。现在创建时
+    写入真实时间戳并持久化；老配置里没有该字段的显示「—」（未知），不伪造时间。
+17. **API 列表刷新立即生效**：桌面端会在 401 时**重读 config.json 的地址与密钥并
+    重试一次**，所有管理面请求加 `no-store`。此前在界面开着时改 config.json，
+    旧密钥失配 → 刷新失败 → 列表保持旧数据，看起来就像刷新按钮坏了。
+18. **「创建 API」按钮文案**：去掉与 `+` 图标重复的加号。
+
 10. **修复模型列表「积分倍率」整列为 0**：三个根因 —— ① `admin_api` 里的 `import main`
    把网关**重复导入了一遍**，产生第二份 `PROVIDERS`，其 Trae 动态模型表为空
    （`/v1/models` 63 个模型 vs `/v1/admin/models` 只有 15 个配置别名）；

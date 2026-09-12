@@ -92,10 +92,95 @@ fn gateway_port(root: &Path) -> u16 {
 }
 
 /// 网关 API 密钥（前端凭它访问 /v1/admin/*）
+///
+/// ★ v3.0 起密钥统一存放在 `api_keys` 数组里（顶层 `api_key` 已取消）。
+/// 这里先取 api_keys[0]，再回落顶层 `api_key` —— 后者只覆盖
+/// 「网关尚未跑完迁移」的极短窗口，保证桌面端不会因为结构切换而 401。
 fn gateway_key(root: &Path) -> String {
-    read_config(root)
-        .and_then(|v| v.get("api_key").and_then(|k| k.as_str()).map(String::from))
-        .unwrap_or_default()
+    let cfg = match read_config(root) {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    let from_list = cfg
+        .get("api_keys")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find_map(|a| a.get("key").and_then(|k| k.as_str()))
+        })
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !from_list.is_empty() {
+        return from_list;
+    }
+    cfg.get("api_key")
+        .and_then(|k| k.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// 停止全部 open-ai 后端进程（托盘「退出」用）。
+///
+/// 复用 `bootstrap.py stop`，而不是在 Rust 里重写一遍：
+///   - 它是唯一实现了「IPC 优雅广播 → leaf Job → root Job → 兜底 kill」的入口，
+///     重复实现必然与 Python 侧行为漂移；
+///   - 品牌化 CLI shim `open-ai.exe` 保证任务管理器里显示的是 open-ai 而不是 python。
+///
+/// 另外写 `data/.gui_exit_suppress`（时间戳）：计划任务 `watchdog_boot.py`
+/// 在 10 分钟窗口内不复活 Broker —— 否则用户刚点「退出」，后端几秒后又被拉起来。
+/// 这与旧版 Python 托盘「彻底退出」的行为一致。
+fn stop_all_backends(root: &Path) {
+    let data = root.join("data");
+    let _ = std::fs::create_dir_all(&data);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let _ = std::fs::write(data.join(".gui_exit_suppress"), format!("{ts}"));
+
+    let cli = root.join("runtime").join("Scripts").join("open-ai.exe");
+    let py = root.join(".venv").join("Scripts").join("python.exe");
+    let entry = if cli.is_file() {
+        cli
+    } else if py.is_file() {
+        py
+    } else {
+        return;
+    };
+
+    let mut cmd = Command::new(entry);
+    cmd.arg(root.join("bootstrap.py"))
+        .arg("stop")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_window(&mut cmd);
+    let _ = cmd.spawn();
+}
+
+/// 启动安装目录下的卸载程序（系统设置页「一键卸载」）。
+///
+/// `--silent`：桌面端已经弹过一次二次确认，卸载器不再重复询问，
+/// 但仍会显示自己的进度窗口（用户能看见它在删什么）。
+fn launch_uninstaller(root: &Path) -> Result<PathBuf, String> {
+    let exe = root.join("uninstall.exe");
+    if !exe.is_file() {
+        return Err(format!("未找到卸载程序：{}", exe.display()));
+    }
+    let mut cmd = Command::new(&exe);
+    // 不加任何提权标志：以普通进程启动可免 UAC（安装目录在用户可写位置时足够）
+    cmd.arg("--silent")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_window(&mut cmd);
+    cmd.spawn()
+        .map_err(|e| format!("启动卸载程序失败：{e}"))?;
+    Ok(exe)
 }
 
 /// 后端启动入口优先级：
@@ -212,6 +297,29 @@ fn app_version() -> String {
     format!("v{}-dev", env!("CARGO_PKG_VERSION"))
 }
 
+/// 一键卸载：拉起安装目录下的 uninstall.exe，随后退出桌面端。
+///
+/// 为什么由 Rust 侧做而不是走 HTTP：
+///   uninstall.exe 会删掉 `<安装根>\desktop\open-ai-desktop.exe` 自身。
+///   如果只是通知网关去拉起它、界面继续跑，exe 被占用会导致删除失败
+///   （用户实测：点了「一键卸载」什么都没发生 —— 原实现其实是个空壳，
+///   只弹了个 toast，压根没调用卸载程序）。
+///   所以这里：启动卸载器 → 等它起来 → 自己退出，把文件占用让出来。
+#[tauri::command]
+fn uninstall_app<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
+    let root = find_root()
+        .ok_or_else(|| "未找到 open-ai 安装目录（缺少 bootstrap.py / config.json）".to_string())?;
+    let exe = launch_uninstaller(&root)?;
+
+    // 给卸载器一点时间把窗口画出来，再让出 exe 占用
+    QUITTING.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        app.exit(0);
+    });
+    Ok(format!("已启动卸载程序：{}", exe.display()))
+}
+
 // ────────────────────────── 窗口 / 托盘 ──────────────────────────
 
 /// 恢复主窗口：显示 + 取消最小化 + 置前
@@ -225,16 +333,16 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
 
 /// 创建系统托盘图标。
 ///
-/// 行为对齐原 tkinter 版（用户已习惯）：
+/// 行为：
 ///   - 左键单击 / 菜单「显示主界面」→ 恢复窗口
-///   - 窗口 X → 隐藏到托盘（见 on_window_event）
-///   - 菜单「退出界面」→ 退出桌面端进程；**后端保持运行**
-///     （原版「退出」会连同 Broker 一起关掉，此处改为只退界面并在菜单文案里
-///      明写，避免用户以为关掉界面就等于停掉网关）
+///   - 窗口 X → 隐藏到托盘（见 on_window_event），后端不受影响
+///   - 菜单「退出」→ **退出全部 open-ai 进程**：先把 Broker 优雅停掉
+///     （bootstrap.py stop，含 trae node 与定时任务），再退出桌面端。
+///     这样任务管理器里不会残留任何 open-ai 进程。
 fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
     let logs = MenuItem::with_id(app, "logs", "打开日志目录", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出界面（后端继续运行）", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&show, &logs, &sep, &quit])?;
 
@@ -255,7 +363,14 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 }
             }
             "quit" => {
+                // 「退出」= 退出**全部** open-ai 进程（界面 + 网关 + trae node + 定时任务）。
+                // 用户明确要求：托盘退出就该是一次干净的全退，而不是只关界面把
+                // 后端留在后台 ——「我点了退出，为什么任务管理器里还有一堆 open-ai」
+                // 是旧版最容易引起困惑的地方。
                 QUITTING.store(true, Ordering::SeqCst);
+                if let Some(root) = find_root() {
+                    stop_all_backends(&root);
+                }
                 app.exit(0);
             }
             _ => {}
@@ -290,6 +405,7 @@ pub fn run() {
             gateway_config,
             start_backend,
             open_logs_dir,
+            uninstall_app,
             app_version
         ])
         .setup(|app| {

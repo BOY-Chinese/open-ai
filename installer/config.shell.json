@@ -1,5 +1,4 @@
 {
-  "api_key": "YOUR_API_KEY_HERE",
   "host": "0.0.0.0",
   "port": 8000,
   "max_req_per_min": 30,
@@ -69,14 +68,23 @@
       "trae_dir": "C:/Users/<USER>/AppData/Local/Programs/TRAE SOLO CN"
     }
   },
-  "api_key_name": "",
   "api_keys": [],
   "runtime": {
     "heartbeat_interval": 10,
     "check_interval": 5,
-    "backoff_steps": [30, 60, 120, 240, 480, 900],
+    "backoff_steps": [
+      30,
+      60,
+      120,
+      240,
+      480,
+      900
+    ],
     "root_memory_mb": 3072,
-    "leaf_memory_mb": {"gateway": 1024, "task": 1024},
+    "leaf_memory_mb": {
+      "gateway": 1024,
+      "task": 1024
+    },
     "graceful_timeout": 15
   }
 }

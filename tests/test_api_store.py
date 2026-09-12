@@ -4,11 +4,15 @@
 ================================================
 用临时 config 隔离, 不触碰真实 config.json。
 运行: python -m unittest tests.test_api_store -v
+
+v3.0 变更：取消顶层 api_key / api_key_name，统一只在 api_keys 里维护；
+create_api 记录 createdAt。相应断言已更新，并新增迁移用例。
 """
 import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 # 让 scripts/ 可导入
@@ -25,6 +29,7 @@ class ApiStoreTest(unittest.TestCase):
         self.tmp_cfg = os.path.join(self.tmpdir, 'config.json')
         self._orig_cfg = api_store.OPENAI_CFG
         api_store.OPENAI_CFG = self.tmp_cfg
+        self._write({'api_keys': [{'name': 'base', 'key': 'sk-base'}]})
 
     def tearDown(self):
         api_store.OPENAI_CFG = self._orig_cfg
@@ -34,52 +39,84 @@ class ApiStoreTest(unittest.TestCase):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def test_create_auto_names_unnamed(self):
-        self._write({'api_key': 'legacy'})
-        name, key = api_store.create_api()
+        name, key, created = api_store.create_api()
         self.assertTrue(key.startswith('sk-'))
         self.assertEqual(name, '无名1')
+        # 创建时间必须真实记录（此前硬编码 0 → 界面显示 1970）
+        self.assertGreater(created, 1_600_000_000)
+        self.assertLessEqual(created, int(time.time()) + 5)
+
+    def test_created_at_persisted_and_listed(self):
+        _, key, created = api_store.create_api()
+        rows = {r[1]: r for r in api_store.list_apis()}
+        self.assertIn(key, rows)
+        self.assertEqual(rows[key][2], created)
 
     def test_unnamed_index_increments_and_skips(self):
-        self._write({'api_key': 'legacy',
-                     'api_keys': [{'name': '无名1', 'key': 'sk-1'}]})
-        name, _ = api_store.create_api()
+        self._write({'api_keys': [{'name': '无名1', 'key': 'sk-1'}]})
+        name, _, _ = api_store.create_api()
         self.assertEqual(name, '无名2')  # 无名1 已占用, 跳到无名2
 
     def test_rename_and_delete(self):
-        self._write({'api_key': 'legacy',
-                     'api_keys': [{'name': 'a', 'key': 'sk-1'}]})
         cfg = api_store.load_config()
-        self.assertTrue(api_store.rename_api(cfg, 'sk-1', '新名'))
-        self.assertEqual(api_store.list_apis()[1][0], '新名')
-        cfg = api_store.load_config()
-        self.assertTrue(api_store.delete_api(cfg, 'sk-1'))
-        self.assertEqual(len(api_store.list_apis()), 1)  # 只剩 legacy
-
-    def test_legacy_rename(self):
-        self._write({'api_key': 'legacy-key'})
-        cfg = api_store.load_config()
-        api_store.rename_legacy_api(cfg, '我的主密钥')
+        self.assertTrue(api_store.rename_api(cfg, 'sk-base', '新名'))
         rows = api_store.list_apis()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], '新名')
+        cfg = api_store.load_config()
+        self.assertTrue(api_store.delete_api(cfg, 'sk-base'))
+        self.assertEqual(len(api_store.list_apis()), 0)
+
+    def test_migrate_legacy_real_key(self):
+        """旧版顶层真密钥 → 搬进 api_keys，顶层字段消失。"""
+        self._write({'api_key': 'legacy-key', 'api_key_name': '我的主密钥'})
+        self.assertTrue(api_store.ensure_api_keys())
+        cfg = api_store.load_config()
+        self.assertNotIn('api_key', cfg)
+        self.assertNotIn('api_key_name', cfg)
+        rows = api_store.list_apis()
+        self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], '我的主密钥')
         self.assertEqual(rows[0][1], 'legacy-key')
 
-    def test_valid_keys_includes_legacy_and_all(self):
-        self._write({'api_key': 'legacy-key',
-                     'api_keys': [{'name': 'a', 'key': 'sk-1'},
+    def test_migrate_placeholder_becomes_real_key(self):
+        """空壳配置里的 YOUR_API_KEY_HERE 不是密钥：换成新生成的强密钥。"""
+        self._write({'api_key': api_store.LEGACY_PLACEHOLDER, 'api_key_name': ''})
+        api_store.ensure_api_keys()
+        cfg = api_store.load_config()
+        rows = api_store.list_apis()
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0][1], api_store.LEGACY_PLACEHOLDER)
+        self.assertTrue(rows[0][1].startswith('sk-'))
+        self.assertGreater(rows[0][2], 0)      # createdAt 有值
+        self.assertNotIn('api_key', cfg)
+
+    def test_ensure_generates_key_when_list_empty(self):
+        """api_keys 为空时必须补一条，否则网关没有任何合法密钥 → 全面 401。"""
+        self._write({'api_keys': []})
+        self.assertTrue(api_store.ensure_api_keys())
+        rows = api_store.list_apis()
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0][1].startswith('sk-'))
+
+    def test_ensure_is_idempotent(self):
+        self._write({'api_key': 'legacy-key'})
+        self.assertTrue(api_store.ensure_api_keys())
+        self.assertFalse(api_store.ensure_api_keys())   # 第二次不再改动
+
+    def test_valid_keys_includes_all(self):
+        self._write({'api_keys': [{'name': 'a', 'key': 'sk-1'},
                                   {'name': 'b', 'key': 'sk-2'}]})
         keys = api_store.valid_keys()
-        self.assertIn('legacy-key', keys)
         self.assertIn('sk-1', keys)
         self.assertIn('sk-2', keys)
 
     def test_normalize_names_fills_unnamed(self):
-        self._write({'api_key': 'legacy',
-                     'api_keys': [{'name': '', 'key': 'sk-1'}]})
+        self._write({'api_keys': [{'name': '', 'key': 'sk-1'}]})
         cfg = api_store.load_config()
         api_store.normalize_names(cfg)
         rows = api_store.list_apis()
-        # 找到 sk-1 的名字应为 无名1
-        self.assertEqual(rows[1][0], '无名1')
+        self.assertEqual(rows[0][0], '无名1')
 
 
 if __name__ == '__main__':

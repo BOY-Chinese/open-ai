@@ -32,9 +32,16 @@ export function maskKey(key: string): string {
   return `${key.slice(0, 6)}${'•'.repeat(16)}${key.slice(-4)}`
 }
 
-/** 时间戳(秒) → '2026/09/12 00:56' */
+/** 时间戳(秒) → '2026/09/12 00:56'
+ *
+ * 秒级时间戳为 0 或非法时返回「—」：表示**未知**，而不是伪造一个时间。
+ * 曾经后端把 createdAt 硬编码成 0，界面于是整列显示 1970/01/01 08:00 ——
+ * 那是缺数据，不是数据。老配置里没有 createdAt 的密钥就属于这种情况。
+ */
 export function fmtTime(sec: number): string {
+  if (!Number.isFinite(sec) || sec <= 0) return '—'
   const d = new Date(sec * 1000)
+  if (Number.isNaN(d.getTime())) return '—'
   const p = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(
     d.getMinutes()

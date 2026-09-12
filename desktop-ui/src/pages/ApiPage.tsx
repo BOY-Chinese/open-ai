@@ -215,7 +215,7 @@ export function ApiPage() {
                 colSpan={COLUMNS.length}
                 icon={KeyRound}
                 title="暂无 API 密钥"
-                description="点击下方「+ 创建 API」生成第一个密钥"
+                description="点击下方「创建 API」生成第一个密钥"
               />
             }
             /* 行右键菜单：改名 / 复制密钥 / 删除 */
@@ -294,7 +294,7 @@ export function ApiPage() {
         </Button>
         <Button variant="default" onClick={() => void onCreate()} loading={busy === 'create'}>
           <Plus />
-          + 创建 API
+          创建 API
         </Button>
       </PageFooter>
 

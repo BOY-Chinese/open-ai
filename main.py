@@ -128,6 +128,19 @@ async def _model_refresh_loop():
 
 @app.on_event("startup")
 async def _startup_refresh():
+    # 旧版顶层 api_key/api_key_name → 统一并入 api_keys（一次性，幂等）。
+    # 必须在网关开始对外服务前完成，否则会出现「配置里有密钥、列表里没有」
+    # 或反过来（空壳占位符被当成真密钥列出来）的不一致。
+    try:
+        import sys as _sys
+        if os.path.join(BASE_DIR, "scripts") not in _sys.path:
+            _sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
+        import api_store  # type: ignore
+        if api_store.ensure_api_keys():
+            logger.info("已统一 API 密钥结构（顶层 api_key → api_keys，并保证至少一条可用）")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("旧版 api_key 迁移失败（不影响启动）: %s", e)
+
     asyncio.create_task(_model_refresh_loop())
     logger.info("动态模型每日刷新任务已启动 (每 %d 秒)", MODEL_REFRESH_INTERVAL)
 

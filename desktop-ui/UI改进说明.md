@@ -479,3 +479,92 @@ npm run tauri:build  # 打包 exe / NSIS 安装包
 
 > 改了布局层文件（`AppLayout` 等）后请**重启 dev server**，见 §6 的环境踩坑说明。
 
+---
+
+## 十二、v3.0 二轮实测修复（本机 + 虚拟机反馈）
+
+用户在本机与虚拟机上实测报出三处问题。**根因都不在界面本身**，而在
+「谁启动界面 / 界面去哪里取数 / 谁来创建托盘」这三条链路上。
+
+### 12.1 本机：双击快捷方式仍是旧 GUI
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 本机双击桌面 `open-ai.lnk`，打开的是 Python tkinter 旧界面 |
+| 根因 | 快捷方式指向 `<项目根>\open-ai-launcher.exe`，而该启动器（`launcher_main.py`）**写死**拉起 `scripts/gui_account_manager.py`。v3.0 把界面整体迁到 `desktop-ui`（Tauri）后，这条链路没人改 |
+| 修复 | ① `launcher_main.py` 增加 `_find_desktop()`，优先 `desktop/open-ai-desktop.exe`，找不到才回落 Python GUI；② 新增 `tools/install-local-shortcut.ps1` 把快捷方式直接指向桌面端；③ `build-tauri-release.ps1` 构建后自动把 exe 同步到 `<根>\desktop\`，使**本机布局与安装包布局完全一致** |
+
+### 12.2 虚拟机：托盘里没有图标
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 后端起来了，但通知区域没有 open-ai 图标 |
+| 根因 | 托盘图标此前**只由 Python GUI**（`scripts/tray_icon.py`）创建。v3.0 的启动链改为优先拉桌面端后，Python GUI 不再启动 → 没有任何进程创建托盘 |
+| 修复 | 桌面端自带托盘（Rust `tauri` 的 `tray-icon` feature）：左键单击/菜单恢复主窗口、窗口 X = 隐藏到托盘、菜单「退出界面（后端继续运行）」。并补 `tauri-plugin-single-instance`，避免「双托盘 + 双窗口」 |
+
+> 语义差异（有意为之）：旧 Python 托盘的「退出」会**连后端一起关掉**；新版只退界面，
+> 菜单文案已写明，避免用户误以为关掉界面等于停掉网关。
+
+### 12.3 虚拟机：网页取不到后端数据（显示「无法连接网关」）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 窗口能开，内容区提示无法连接网关 |
+| 根因 | `httpBackend.ts` 把所有请求发到**相对路径** `/v1/admin/*`，并依赖开发态 Vite dev server 的 proxy 完成「转发到 127.0.0.1:8000」和「注入 Bearer 密钥」。打包后的桌面端没有 dev server，相对路径落到内嵌资源协议上，必然失败；密钥此时也无从获取 |
+| 修复 | 新增 `src/lib/gateway.ts`：打包态经 Tauri 命令 `gateway_config` 读**同一份** `config.json` 拿到地址与密钥；开发态保持相对路径走 Vite 代理。`req()` 改为按运行期配置拼 URL 并注入 `Authorization`。**前端产物中始终不含密钥明文** |
+
+### 12.4 顺带补上的两处韧性
+
+1. **后端自启**：新增 `start_backend` 命令（Rust 侧定位安装根 → 拉起
+   `bootstrap.py start`，幂等）。`AppLayout` 在挂载时先探活 `/v1/admin/health`，
+   不通则自动拉起并轮询就绪（最长 45s）。**实测：后端全停后仅双击桌面端，
+   15 秒内网关恢复、界面加载出 5 个真实账号。**
+2. **启动门 + 运行期存活探测**：后端未就绪时由 `GatewayGate` 占住内容区，
+   给出「重试连接 / 打开日志目录 / 安装目录」而不是让 6 个页面各弹一次错误；
+   运行期每 45s 探活，连续 2 次失败才判定断开（只提示、不偷偷重启后端）。
+
+### 12.5 两个「静默失效」陷阱（本轮最有价值的发现）
+
+#### ① PowerShell 无 BOM 脚本吞语句
+
+Windows PowerShell 5.1 用 ANSI(GBK) 解码**无 BOM 的 UTF-8 脚本**，中文注释的
+最后一个字节会与紧随的换行配成双字节字符，从而**整行吞掉下一条语句**。
+文件在编辑器里看着完全正常，只有运行时才出问题。
+
+实测命中：
+
+| 文件 | 被吞掉的内容 | 后果 |
+|---|---|---|
+| `tools/build-tauri-release.ps1` | `$env:TAURI_ENV_DEBUG = 'false'` | 打包态重新嵌入 devUrl → 虚拟机 ERR_CONNECTION_REFUSED |
+| `start_hidden.ps1`（开机自启入口） | 2 处硬语法错误 | 自启链路不可靠 |
+
+处置：两个文件转为 **UTF-8 with BOM**；构建脚本增加断言（未生效即 throw）；
+新增 `tools/check-ps1.ps1` 批量门禁（解析错误 + 非 ASCII 却无 BOM 一律 FAIL）。
+
+> 注意：用脚本/工具改写这两个 .ps1 时会**丢失 BOM**，改完必须重跑 `check-ps1.ps1`。
+
+#### ② 构建脚本用「产物存在」代替「构建成功」
+
+`cargo` 失败时 `target/release/` 里往往还躺着**上一次**的旧 exe。原脚本只看文件
+是否存在，于是 `exit=101` 仍打印 `[OK]` 并把陈旧产物同步出去（本项目已因此把
+旧包当新包交付过一次）。现改为按 `$code` 判定，并在复制后核对字节数。
+
+### 12.6 本轮验证方式（全部为运行时实证）
+
+| 检查项 | 手段 | 结果 |
+|---|---|---|
+| 托盘图标真实存在 | `tools/check-tray.ps1` 枚举顶层窗口，匹配类名 `tray_icon_app` + 进程 PID（并交叉核对 Win11 通知区域登记表） | **通过**，1 个 tray 窗口且已登记 |
+| 前后端链路 | 读网关 `logs/gateway_out.log`，确认来自桌面端的 `OPTIONS/GET /v1/admin/*` 全部 200（含 CORS 预检，可证明来自 WebView2） | **通过** |
+| 界面无报错 + 数据真实 | `tools/verify-ui.mjs` 用 puppeteer 读 **DOM 文本**断言（18 项） | **18/18 通过** |
+| 关闭到托盘 | 发送 WM_CLOSE 后用 `IsWindowVisible` 读主窗口可见性 | **通过**（窗口隐藏、进程存活、托盘仍在） |
+| 单实例唤醒 | 再次启动 exe → 进程数仍为 1，主窗口恢复可见 | **通过** |
+| `--minimized`（开机自启） | 带参启动 → 窗口不可见、托盘存在 | **通过** |
+| 后端全停后自愈 | `bootstrap.py stop` → 仅启动桌面端 | **通过**，15s 内网关 200 并加载 5 个账号 |
+| 快捷方式 | 用 `Start-Process` 打开 `open-ai.lnk`，核对进程名 | **通过**，启动 `open-ai-desktop`，无 Python GUI 进程 |
+
+> 教训：**截图 + 视觉模型不足以验收暗色低对比界面**。本轮视觉模型把 5 行账号
+> 表格读对了，却把侧边栏底部的「系统日志 / 系统设置 / 网关运行中 / v3.0-dev」
+> 整段漏报为空白，还凭空描述了不存在的地址栏。DOM 文本断言是确定性的，
+> 故新增 `verify-ui.mjs` 作为常规门禁。
+
+

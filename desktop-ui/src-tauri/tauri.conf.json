@@ -13,6 +13,8 @@
     "windows": [
       {
         "title": "open-ai 账号管理",
+        "label": "main",
+        "visible": false,
         "width": 1180,
         "height": 780,
         "minWidth": 960,

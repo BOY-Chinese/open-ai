@@ -6,9 +6,10 @@
  *
  * 鉴权与跨域：
  *  - 开发态：Vite dev server 把 /v1 代理到 127.0.0.1:8000 并注入 Bearer 密钥
- *  - 生产态：Tauri 的 Rust 命令做同样的事（读同一个 config.json）
- *  两种形态下前端都只请求同源(或本机)的 /v1/admin/*，产物中不含密钥。
+ *  - 生产态：经 Tauri 命令读同一份 config.json，拿到真实地址与密钥
+ *  两种形态下前端代码一致、产物中都不含密钥（见 `./gateway.ts`）。
  */
+import { authHeaders, gatewayRuntime } from './gateway'
 import type {
   Account,
   ApiKey,
@@ -23,9 +24,6 @@ import type {
   UsageRow,
   WeekBundle,
 } from '@/types/domain'
-
-/** 管理面基址：开发经 Vite 代理，生产走本机网关 */
-const BASE = (import.meta.env.VITE_GATEWAY_BASE as string | undefined) ?? ''
 
 export class ApiError extends Error {
   status: number
@@ -42,13 +40,19 @@ async function req<T>(
   init?: { method?: 'GET' | 'POST'; body?: unknown; timeoutMs?: number }
 ): Promise<T> {
   const { method = 'GET', body, timeoutMs = 20000 } = init ?? {}
+  // 运行期解析网关地址与密钥：打包态由 Tauri 从 config.json 提供，
+  // 开发态为空串 → 同源相对路径 → Vite 代理转发并注入密钥
+  const rt = await gatewayRuntime()
+  const headers: Record<string, string> = { ...(authHeaders(rt) ?? {}) }
+  if (body) headers['Content-Type'] = 'application/json'
+
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
 
   try {
-    const res = await fetch(`${BASE}${path}`, {
+    const res = await fetch(`${rt.baseUrl}${path}`, {
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
       signal: ctrl.signal,
     })
@@ -70,7 +74,11 @@ async function req<T>(
     if ((e as Error).name === 'AbortError') {
       throw new ApiError(408, '请求超时（网关无响应）')
     }
-    throw new ApiError(0, `无法连接网关：${(e as Error).message}`)
+    // 带上实际请求地址：虚拟机排障时一眼能看出「打到哪儿去了」
+    throw new ApiError(
+      0,
+      `无法连接网关${rt.baseUrl ? `（${rt.baseUrl}）` : ''}：${(e as Error).message}`
+    )
   } finally {
     clearTimeout(timer)
   }

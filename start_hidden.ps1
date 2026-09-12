@@ -1,4 +1,4 @@
-# open-ai - hidden startup (v3.0)
+﻿# open-ai - hidden startup (v3.0)
 #
 # 职责：开机/登录时静默拉起「后端进程树 + 托盘 GUI」。
 #
@@ -41,10 +41,11 @@ $guiScript   = Join-Path $dir "scripts\gui_account_manager.py"
 $pyw         = Join-Path $dir ".venv\Scripts\pythonw.exe"
 
 if (Test-Path $desktopExe) {
-    # 新桌面端（Tauri + React）：自带窗口，无需 --minimized 语义
-    Start-Process -FilePath $desktopExe -WorkingDirectory (Split-Path $desktopExe) `
-        -WindowStyle Hidden
-    Write-Output "[OK] open-ai broker + desktop UI launch requested (idempotent)"
+    # 新桌面端（Tauri + React）：--minimized = 只驻留托盘不弹窗，
+    # 托盘图标由桌面端自带（v3.0 起托盘不再依赖 Python GUI）
+    Start-Process -FilePath $desktopExe -ArgumentList "--minimized" `
+        -WorkingDirectory (Split-Path $desktopExe) -WindowStyle Hidden
+    Write-Output "[OK] open-ai broker + desktop UI launch requested (tray, idempotent)"
 } elseif (Test-Path $managerShim) {
     Start-Process -FilePath $managerShim -ArgumentList "`"$guiScript`"","--minimized" `
         -WorkingDirectory $dir -WindowStyle Hidden

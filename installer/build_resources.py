@@ -40,9 +40,10 @@ EXTRA_DIRS = {
 }
 
 # ── v3.0：桌面端（Tauri 2 + React）资源 ──
-# 产物来自 desktop-ui/ 的构建，安装后位于 <安装根>/desktop/：
-#   desktop/open-ai-desktop.exe   Tauri 应用（WebView2 内嵌前端）
-#   desktop/resources/            前端静态资源（dist/ 内容）
+# 只打包 exe：前端资源已由 tauri-build 在编译期**内嵌进 exe**
+#   （Cargo.toml 启用 custom-protocol + tauri.conf.json 的 frontendDist），
+#   exe 运行时不读任何外部目录，故不再附加 desktop/resources/。
+# 安装后位于 <安装根>/desktop/open-ai-desktop.exe。
 # 注：node_modules / src-tauri/target 等构建中间产物一律不带。
 DESKTOP_SRC = os.path.join(PROJECT_ROOT, 'desktop-ui')
 DESKTOP_EXE_CANDIDATES = [
@@ -50,7 +51,6 @@ DESKTOP_EXE_CANDIDATES = [
     os.path.join(DESKTOP_SRC, 'src-tauri', 'target', 'release', 'open-ai-desktop.exe'),
     os.path.join(DESKTOP_SRC, 'src-tauri', 'target', 'debug', 'open-ai-desktop.exe'),
 ]
-DESKTOP_DIST = os.path.join(DESKTOP_SRC, 'dist')
 
 # 排除项 (相对 project root)
 EXCLUDE_DIRS = {'__pycache__', '.venv', 'runtime', 'logs', 'data', '.git', 'installer'}
@@ -73,8 +73,9 @@ def should_include(relpath: str) -> bool:
 
 
 def build_desktop(zf, count: int, total_bytes: int):
-    """打包桌面端（Tauri exe + 前端资源）到 zip 内的 desktop/ 下。
+    """打包桌面端（Tauri exe）到 zip 内的 desktop/ 下。
 
+    前端资源已内嵌进 exe，无需附带 dist/。
     缺失时只告警不中断 —— 保证「仅后端」安装包仍可构建，
     便于 python 侧单独发版。
     """
@@ -89,19 +90,6 @@ def build_desktop(zf, count: int, total_bytes: int):
     total_bytes += os.path.getsize(exe)
     print(f'  [附加] 桌面端 exe -> {arc} '
           f'({os.path.getsize(exe)/1024/1024:.1f} MB, {os.path.basename(os.path.dirname(os.path.dirname(exe)))} 构建)')
-
-    if not os.path.isdir(DESKTOP_DIST):
-        print('[警告] 缺少前端构建产物 desktop-ui/dist，exe 将无法加载界面')
-        return count, total_bytes
-
-    for root, _dirs, files in os.walk(DESKTOP_DIST):
-        for f in files:
-            full = os.path.join(root, f)
-            rel = os.path.relpath(full, DESKTOP_DIST).replace('\\', '/')
-            zf.write(full, f'desktop/resources/{rel}')
-            count += 1
-            total_bytes += os.path.getsize(full)
-    print(f'  [附加] 前端资源 -> desktop/resources/ ({len(os.listdir(os.path.join(DESKTOP_DIST, "assets"))) if os.path.isdir(os.path.join(DESKTOP_DIST, "assets")) else 0} 个 assets)')
     return count, total_bytes
 
 

@@ -40,6 +40,22 @@ def _gui_env():
     return env
 
 
+def _find_desktop():
+    """定位 Tauri 桌面端可执行文件。
+
+    两个候选覆盖两种布局，运行时不必区分「本机项目目录」与「安装目录」：
+      - desktop/open-ai-desktop.exe                    —— 安装目录 / 本机构建同步副本
+      - desktop-ui/src-tauri/target/release/...        —— 本机 cargo 构建产物
+    """
+    for rel in (os.path.join('desktop', 'open-ai-desktop.exe'),
+                os.path.join('desktop-ui', 'src-tauri', 'target', 'release',
+                             'open-ai-desktop.exe')):
+        p = os.path.join(ROOT, rel)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def _spawn(argv, wait=False, env=None):
     flags = CREATE_NO_WINDOW if wait else (DETACHED_PROCESS | CREATE_NO_WINDOW)
     p = subprocess.Popen(argv, cwd=ROOT, creationflags=flags, env=env,
@@ -71,7 +87,16 @@ def main():
     broker = os.path.join(ROOT, 'runtime', 'Scripts', 'open-ai-daemon.exe')
     if os.path.exists(broker):
         _spawn([broker, os.path.join(ROOT, 'bootstrap.py'), 'start'])
-    # 3) 管理界面 (显式 Tcl/Tk 环境)
+    # 3) 界面：v3.0 起优先桌面端 (Tauri)，找不到才回落 Python tkinter GUI
+    #
+    # 为什么必须放在最前面：v3.0 的界面已整体迁移到 desktop-ui (Tauri + React)，
+    # Python GUI 只是兼容兜底。此前这里写死拉起 gui_account_manager.py，
+    # 导致「双击快捷方式还是旧界面」(本机实测反馈)。
+    desktop = _find_desktop()
+    if desktop:
+        _spawn([desktop], env=None)
+        return 0
+    # 4) 兼容兜底：Python GUI (显式 Tcl/Tk 环境)
     _spawn([manager, os.path.join(ROOT, 'scripts', 'gui_account_manager.py')],
            env=_gui_env())
     return 0

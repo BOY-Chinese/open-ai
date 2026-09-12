@@ -5,7 +5,12 @@
 | 脚本 | 用途 | 前置条件 |
 |---|---|---|
 | `screenshot.mjs` | 六页面 + 周视图截图自检 | 依赖装在 `tools/node_modules_tools/`（见下）；dev server 在跑 |
-| `build-tauri.ps1` | 编译 Tauri Rust 后端 | 独立工具链 `open-ai/toolchain/`（见下） |
+| `verify-ui.mjs` | **DOM 文本断言自检（18 项）**，比截图可靠 | 同上（puppeteer + dev server） |
+| `build-tauri.ps1` | 编译 Tauri Rust 后端（debug） | 独立工具链 `open-ai/toolchain/`（见下） |
+| `build-tauri-release.ps1` | **生产构建**：`TAURI_ENV_DEBUG=false` + `custom-protocol`，产物同步到 `<根>\desktop\` | 同上；已先 `npm run build` |
+| `install-local-shortcut.ps1` | 把桌面 `open-ai.lnk` 指向本机构建的桌面端 | 已生成 `<根>\desktop\open-ai-desktop.exe` |
+| `check-ps1.ps1` | **PowerShell 脚本门禁**：解析错误 / 非 ASCII 却无 UTF-8 BOM | 无 |
+| `check-tray.ps1` | **托盘图标运行时验证**：枚举 `tray_icon_app` 顶层窗口 + 通知区域登记表 | 应用正在运行 |
 | `launch-app.ps1` | 启动已编译的桌面应用 | 需先 `build-tauri.ps1`；dev 模式还需 dev server |
 | `shot-window.ps1` | 截取应用窗口（验收用） | 应用正在运行 |
 
@@ -18,16 +23,48 @@ cd desktop-ui && npm run dev
 # 2) 视觉回归截图 -> docs/screenshots/
 node tools/screenshot.mjs
 
+# 2b) DOM 断言自检（推荐日常使用：确定性，不依赖人眼看图）
+node tools/verify-ui.mjs
+
 # 3) 编译并启动桌面应用
 powershell -ExecutionPolicy Bypass -File tools/build-tauri.ps1
 powershell -ExecutionPolicy Bypass -File tools/launch-app.ps1
 powershell -ExecutionPolicy Bypass -File tools/shot-window.ps1
+
+# 4) 生产构建 + 本机快捷方式 + 托盘验证
+powershell -ExecutionPolicy Bypass -File tools/build-tauri-release.ps1
+powershell -ExecutionPolicy Bypass -File tools/install-local-shortcut.ps1
+powershell -ExecutionPolicy Bypass -File tools/check-tray.ps1 -ProcessName open-ai-desktop
+
+# 5) 改完任何 .ps1 后过一遍门禁
+powershell -ExecutionPolicy Bypass -File tools/check-ps1.ps1
+```
+
+## ⚠️ PowerShell 脚本编码（务必遵守）
+
+`tools/*.ps1` 与根目录的 `start_hidden.ps1` **必须保存为 UTF-8 with BOM**。
+
+原因：Windows PowerShell 5.1 对**无 BOM** 的脚本按 ANSI(GBK) 解码，中文注释的
+最后一个字节会与紧随的换行配成双字节字符，从而**整行吞掉下一条语句** ——
+文件在编辑器里完全正常，只有运行时才炸。本项目已被吞掉过
+`$env:TAURI_ENV_DEBUG = 'false'`（导致 release 包重新嵌入 dev 地址、虚拟机白屏），
+`start_hidden.ps1` 也出现过 2 处硬语法错误。
+
+**注意**：用脚本/工具（`write`、`edit`、各种编辑器）改写这些文件会**丢失 BOM**。
+改完必须执行：
+
+```powershell
+# 查看是否带 BOM（应为 efbbbf）
+Format-Hex file.ps1 -Count 3
+# 门禁：解析错误 + 非 ASCII 无 BOM 一律 FAIL
+powershell -ExecutionPolicy Bypass -File tools/check-ps1.ps1
 ```
 
 ## 关于截图依赖（为何单独一个目录）
 
-`screenshot.mjs` 用 **Windows 侧 Node** 运行 —— 因为 puppeteer 需要启动 Windows 的
-`msedge.exe`，而 WSL 内的 Node 无法跨 interop 拉起 Windows GUI 进程（会报 `Code: 21`）。
+`screenshot.mjs` 与 `verify-ui.mjs` 用 **Windows 侧 Node** 运行 —— 因为 puppeteer
+需要启动 Windows 的 `msedge.exe`，而 WSL 内的 Node 无法跨 interop 拉起 Windows
+GUI 进程（会报 `Code: 21`）。
 
 因此依赖装在 `tools/node_modules_tools/`，与前端 `node_modules` 完全隔离：
 

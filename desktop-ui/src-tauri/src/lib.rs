@@ -41,7 +41,14 @@ const MAIN_WINDOW: &str = "main";
 
 /// 判断目录是否是 open-ai 根目录：同时存在后端入口脚本与网关配置
 fn is_root(p: &Path) -> bool {
-    p.join("bootstrap.py").is_file() && p.join("config.json").is_file()
+    // 判据只要求 bootstrap.py + main.py（后端入口）。
+    //
+    // ★ 不要把 config.json 列为必需：它是**可缺**的 —— 用户可能在手动换配置、
+    //   卸载残留、或正处在「没有账号/没有密钥」的测试场景里。一旦要求它存在，
+    //   find_root() 会返回 None，界面直接报「未找到 open-ai 安装目录」，
+    //   连网关都连不上，把一个「缺配置文件」的小问题放大成「应用不可用」。
+    //   （本机实测踩到：用户删掉 config.json 后，桌面端整个失效。）
+    p.join("bootstrap.py").is_file() && p.join("main.py").is_file()
 }
 
 /// 定位 open-ai 根目录。
@@ -308,7 +315,7 @@ fn app_version() -> String {
 #[tauri::command]
 fn uninstall_app<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
     let root = find_root()
-        .ok_or_else(|| "未找到 open-ai 安装目录（缺少 bootstrap.py / config.json）".to_string())?;
+        .ok_or_else(|| "未找到 open-ai 安装目录（缺少 bootstrap.py / main.py）".to_string())?;
     let exe = launch_uninstaller(&root)?;
 
     // 给卸载器一点时间把窗口画出来，再让出 exe 占用

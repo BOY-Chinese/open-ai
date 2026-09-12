@@ -79,7 +79,9 @@ async function req<T>(
           /* 保留 HTTP 状态文案 */
         }
         if (res.status === 401 || res.status === 403) {
-          detail = `${detail}（已按 config.json 重新读取密钥仍被拒绝，请确认网关已重启以加载新的 api_keys）`
+          detail = headers.Authorization
+            ? `${detail}（已按 config.json 重新读取密钥仍被拒绝，请确认网关已重启以加载新的 api_keys）`
+            : `${detail}（当前从 config.json 读不到任何密钥；缺配置文件时重启网关会自动生成一条「默认密钥」）`
         }
         throw new ApiError(res.status, detail)
       }

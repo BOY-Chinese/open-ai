@@ -24,8 +24,7 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 4. **桌面端免配置连网关**：打包态经 Tauri 命令读 `config.json` 拿地址与密钥
    （前端产物中不含密钥明文），并在后端未运行时**自动拉起 + 轮询就绪**；
    界面顶部提供「启动门」，失败时给出原因、安装目录与重试入口。
-5. **修复开机自启托盘缺陷**：自启链路改为「后端 + 桌面端（`--minimized` 驻留托盘）」，
-   并保留 Python 托盘 GUI 作为降级兜底。
+5. **修复开机自启托盘缺陷**：自启链路改为「后端 + 桌面端（`--minimized` 驻留托盘）」。
 6. **国际版模型前缀 `wbai-` → `wbie-`**：与 Trae `tr-`、WorkBuddy `wb-` 形成统一
    三字母通道前缀；旧前缀仍作为请求别名兼容，老客户端无需改动。
 7. **自启脚本根治硬编码路径**：`open-ai-autostart.bat` 改为 `%~dp0` 自适应，
@@ -35,6 +34,17 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
    导致 release 包重新嵌入 dev 地址、虚拟机白屏）；已转 UTF-8 with BOM 并加断言与
    批量门禁 `desktop-ui/tools/check-ps1.ps1`。② 构建脚本原先用「产物存在」代替
    「构建成功」，cargo 失败时会同步旧 exe 并打印成功；现按退出码判定并核对字节数。
+9. **彻底删除旧 tkinter 界面**：`scripts/gui_account_manager.py`（2781 行）、
+   `scripts/tray_icon.py`、`账号管理.bat`、`open-ai-manager.exe` shim 及其单元测试全部移除，
+   并清掉启动链里所有「回落到 Python GUI」的分支（`launcher_main.py`、
+   `installer/launcher.py`、`start_hidden.ps1`、`installer.py` 生成的启动器）。
+   界面**只有一个入口**：`desktop/open-ai-desktop.exe`。
+10. **修复模型列表「积分倍率」整列为 0**：三个根因 —— ① `admin_api` 里的 `import main`
+   把网关**重复导入了一遍**，产生第二份 `PROVIDERS`，其 Trae 动态模型表为空
+   （`/v1/models` 63 个模型 vs `/v1/admin/models` 只有 15 个配置别名）；
+   ② WorkBuddy 倍率是字符串（`'x0.05 credits'`），`float()` 抛异常后整条记录被静默丢弃；
+   ③ Trae 倍率元组的第 0 个字段（干净的配置名 `glm-5.2`）未被登记。
+   修好后 105 个模型中 103 个可匹配、79 个非零（修前只有 2 个非零）。
 
 ## v2.4 更新内容
 
@@ -71,8 +81,8 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 #    - api_key: 替换 YOUR_API_KEY_HERE 为你的网关密钥
 #    - trae.device_id / headers.x-device-id / ttnet_params.deviceId:
 #      替换 YOUR_DEVICE_ID 为真实 machineid (见 §3)
-#    - 用 账号管理.bat 添加 TRAE / WorkBuddy 账号
-# 5) 运行 open-ai-autostart.bat 启动; 开机自启可在 账号管理.bat 设置页勾选
+#    - 账号请打开桌面端「账号管理」页添加 TRAE / WorkBuddy 账号
+# 5) 运行 open-ai-autostart.bat 启动; 开机自启可在桌面端「系统设置」页勾选
 ```
 
 > 注意：依赖安装使用清华镜像（`start.bat` 内已写 `-i https://pypi.tuna.tsinghua.edu.cn/simple`）。
@@ -120,28 +130,31 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 | 优雅退出 | `bootstrap.py stop` → IPC 广播 shutdown → 子进程自行清理退出 → Job 兜底 |
 | 开机自启后重复点击 | `bootstrap.py start` 幂等（单实例锁），已在跑直接返回 |
 
-### 系统托盘与窗口生命周期（v2.4, 抖音式托盘应用行为）
-图形界面（`账号管理.bat`）关闭 X **不再退出程序**，最小化到系统托盘；后端服务常驻：
+### 系统托盘与窗口生命周期（v3.0 桌面端）
+界面是独立的桌面端进程（`desktop\open-ai-desktop.exe`，Tauri 2 + React）。
+关闭窗口 X **不退出程序**，最小化到系统托盘；后端服务常驻：
 
 | 操作 | 行为 |
 |---|---|
-| 启动 GUI | 自动创建托盘图标（右下角，open-ai logo） |
+| 启动界面 | 桌面端自建托盘图标（右下角，open-ai logo） |
 | 点击窗口 **X** | 隐藏主窗口（**任务栏图标同步消失**），托盘图标保留，网关/签到/守护继续运行 |
 | **左键点击托盘图标** | 恢复主窗口并置于前台（任务栏图标恢复），自动回填账号/积分/模型数据 |
-| 托盘**右键 → 显示主窗口** | 同左键单击 |
-| 托盘**右键 → 退出** | **彻底退出**：IPC 通知 Broker 优雅关闭全部后端 → 写 watchdog 抑制标记（10 分钟内计划任务不复活）→ 销毁托盘 → 销毁窗口 → 结束进程 |
-| 重复双击 `账号管理.bat` | 不开第二个实例，直接把已运行实例（哪怕藏在托盘）的窗口带回前台 |
-| 后端意外恢复在线 | 界面每 3s 探测，恢复后自动刷新账号/API/积分/模型数据 |
+| 托盘**右键 → 显示主界面** | 同左键单击 |
+| 托盘**右键 → 打开日志目录** | 资源管理器打开 `logs\` |
+| 托盘**右键 → 退出界面（后端继续运行）** | 只退出**界面**；网关/签到/守护**继续跑**。要停后端请用 `bootstrap.py stop` |
+| 重复双击桌面快捷方式 | 单实例（`tauri-plugin-single-instance`）：不开第二个实例、不产生第二个托盘图标，直接把已运行实例的窗口带回前台 |
+| 后端未运行 | 启动时先探活 `/v1/admin/health`，不通则**自动拉起后端**并轮询就绪（最长 45s），期间内容区显示「启动门」 |
+| 运行中断开 | 每 45s 探活，连续 2 次失败才判定断开，给出原因 + 重试入口（**不会**偷偷重启后端） |
 
-托盘实现为纯 Win32（`scripts/tray_icon.py`，`Shell_NotifyIcon` + 主窗口 WM_CLOSE
-子类化，零第三方依赖）；托盘初始化失败时自动降级为普通窗口（关闭时询问是否连后端
-一起退出）。`bootstrap.py stop` 同样写入抑制标记 —— 计划任务不会"越停越起"。
+> **v3.0 语义变更**：旧版 Python 托盘的「退出」会**连后端一起关掉**；新版只退界面，
+> 且菜单文案已写明。如需停掉全部后端：`bootstrap.py stop`。
 
-**托盘右键菜单是可扩展功能模块**（`MenuItem` 声明式列表，`tray_icon.py` 模块头
-有完整示例）：支持任意深度子菜单、勾选（checkbox）、灰显、动态文字/状态
-（label/checked/enabled/visible 均可传 callable，每次右键实时求值）、顶层默认
-加粗项。GUI 侧扩展只需在构造 `TrayIcon` 时传 `menu=[...]` 或运行期
-`tray.menu.append(MenuItem(...))`。托盘故障日志见 `logs/tray_icon.err.log`。
+托盘由桌面端用 Tauri 的 `tray-icon`（Rust）实现；旧的纯 Win32 Python 托盘
+（`scripts/tray_icon.py`）已随旧 GUI 一并删除。验证托盘是否真的创建成功：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File desktop-ui\tools\check-tray.ps1 -ProcessName open-ai-desktop
+```
 
 ### 进程
 | 进程（任务管理器映像名） | 端口 | 说明 |
@@ -150,7 +163,7 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 | `open-ai-gateway.exe` | **8000** | 聚合网关（main.py），OpenAI / Anthropic 兼容接口 |
 | `open-ai-trae.exe` | **18787** | Trae Node 后端（server.js，积分/Work 通道） |
 | `open-ai-task.exe` | 无 | 短命脚本宿主（签到/流水采集/登录脚本），跑完即退 |
-| `open-ai-manager.exe` | 无 | 图形界面（账号管理），自建 `open-ai.gui` Job：登录脚本自动入树、GUI 退出即清理；安装/卸载器显式脱链 |
+| `open-ai-desktop.exe` | 无 | **图形界面（Tauri 桌面端）**，不在 Broker 进程树内：独立进程 + 自带托盘 |
 | `open-ai.exe` | 无 | 引导/控制 CLI（bootstrap.py） |
 | `watchdog_boot.py` | 无 | 计划任务兜底保活（委托 bootstrap） |
 
@@ -179,7 +192,8 @@ open-ai/
 ├── anthropic_api.py        # Anthropic 协议 ↔ OpenAI 协议转换
 ├── config.json             # ★ 核心配置 (含 runtime 节: 心跳/退避/内存限额)
 ├── MEMORY.md               # 关键事实记忆 (device_id 约束等, 打包必读)
-├── 账号管理.bat            # ★ 图形界面入口 (账号/API管理/设置/日志)
+├── desktop/                # ★ v3.0 桌面端 (唯一界面): open-ai-desktop.exe (Tauri 2 + React)
+├── desktop-ui/             # ★ 桌面端源码 (React + TypeScript + Tailwind; src-tauri = Rust 侧)
 ├── start.bat               # 一键启动 (建 venv / 装依赖 / 构建 runtime / 起 Broker)
 ├── start_hidden.ps1        # 隐藏窗口启动 (供开机自启调用, 委托 bootstrap)
 ├── open-ai-autostart.bat   # 开机自启入口 (GUI 自启用隐藏 open-ai-autostart.vbs 调 start_hidden.ps1)
@@ -198,11 +212,9 @@ open-ai/
 ├── trae/
 │   └── server.js           # Trae 内嵌 Node 后端 (:18787, 含 Broker IPC 客户端)
 ├── scripts/
-│   ├── gui_account_manager.py  # ★ 图形界面主程序 (账号/API管理/设置/日志; 托盘生命周期)
-│   ├── tray_icon.py        # ★ 系统托盘组件 (纯 Win32: 托盘图标/X拦截/右键菜单)
 │   ├── api_store.py        # API 密钥存储管理 (create/rename/delete)
 │   ├── signin_all.py       # 统一签到脚本 (TRAE + WorkBuddy + token 续期)
-│   ├── account_manager.py  # 控制台版账号管理 (积分查询等, GUI 复用其逻辑)
+│   ├── account_manager.py  # 账号读写与积分查询 (管理接口 admin_api.py 复用其逻辑)
 │   ├── usage_history.py    # ★ TRAE 逐笔积分消耗流水 (网页 dashboard 同款接口逆向)
 │   ├── wb_usage_history.py # ★ WorkBuddy 逐笔消耗流水 (官网个人中心同款接口逆向)
 │   ├── usage_collector.py  # ★ 逐笔流水自动采集 + 本地 SQLite 流水库 (Broker 调度)
@@ -269,22 +281,24 @@ open-ai/
 ## 4. 启动方式
 
 ### 图形界面（推荐，小白友好）
-双击 `账号管理.bat` 打开管理界面，内含：
-- **已添加账号**：查看 TRAE / WorkBuddy 账号与积分
+双击桌面 **`open-ai` 快捷方式**（或 `desktop\open-ai-desktop.exe`）打开管理界面。
+界面**只有这一个入口** —— 旧的 tkinter 界面（`账号管理.bat` 等）已在 v3.0 删除。
+
+六个页面：
+- **账号管理**：Trae / WorkBuddy / WorkBuddy 国际三通道合一表格，含每日签到、当前积分、
+  账号状态；底部可添加三类账号，右键行可复制账号名 / 重新连接 / 删除
 - **API 管理**：顶部展示网关地址（OpenAI 兼容 `http://127.0.0.1:8000/v1`、
   Anthropic 兼容 `http://127.0.0.1:8000`，按 config.json 的 host/port 生成），
-  每行可一键复制，另可「复制地址+密钥」；下方创建 / 命名 / 复制 / 删除 API 密钥（改后立即生效）
-- **模型列表**：右键模型行可复制模型名称 / 上游模型 id、固定到顶部、隐藏；
-  固定与隐藏持久化于 `data/model_view_state.json`（上游更新后自动清理失效项），
-  「显示已隐藏模型」勾选后灰显恢复（带隐藏计数）。
-  上游为同一模型返回的多个内部功能配置（refactor_* 管道、*_advisor* 变体等）已按
-  展示名+上游 id 归并去重，列表不再出现完全相同的重复行
-- **设置**：开机自动运行开关、一键卸载；显示当前版本号（根目录 `version.py`），
-  「一键更新」按 `UPDATE_CHANNEL` 在 GitHub Release Assets 中精确匹配对应通道安装包
-  （dev → `open-ai-installer-dev.exe`；portable → `open-ai-installer-portable.exe`；仓库
-  `BOY-Chinese/open-ai/releases`），
-  确认后自动下载安装包并启动安装，网络异常时提示「网络环境错误，无法下载！」
-- **操作日志**：查看后台操作输出
+  右键卡片可复制地址；下方创建 / 命名 / 复制 / 删除 API 密钥（改后立即生效）
+- **模型列表**：三通道合一，含积分倍率与「请求模型名称」（即实际路由表 ai 名称）；
+  右键行可复制请求模型名称 / 置顶 / 隐藏，支持多选批量操作
+- **积分看板**：今日情况（获取/消耗双卡片 + 逐笔流水）与每周情况（三通道堆叠柱状图，
+  可切通道与周次）
+- **系统日志**：网关与守护进程实时输出，级别着色、Ctrl+F 搜索、自动滚动
+- **系统设置**：启动设置（开机自动运行）、版本信息（一键更新，按 `UPDATE_CHANNEL`
+  在 GitHub Release Assets 精确匹配：dev → `open-ai-installer-dev.exe`；
+  portable → `open-ai-installer-portable.exe`；仓库 `BOY-Chinese/open-ai/releases`）、
+  危险操作（一键卸载）
 
 ### 开发/手动启动
 ```bat
@@ -361,7 +375,7 @@ python scripts/usage_history.py --csv out.csv    # 导出 CSV (多账号自动�
 python scripts/usage_history.py --json           # 输出原始 JSON
 ```
 
-也可在 `账号管理.bat` → `[6] TRAE 逐笔消耗流水` 调用。
+也可在 `scripts/usage_history.py` 直接调用（桌面端「积分看板」页同源）。
 
 > 接口要点（前端 JS 逆向确认）：`POST api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session`，
 > 鉴权 `Authorization: Cloud-IDE-JWT <token>` + `x-device-id`；
@@ -382,7 +396,7 @@ python scripts/wb_usage_history.py --uid a95fdb  # 只查指定账号 (userId �
 python scripts/wb_usage_history.py --csv out.csv # 导出 CSV
 ```
 
-也可在 `账号管理.bat` → `[7] WorkBuddy 逐笔消耗流水` 调用。
+也可在 `scripts/wb_usage_history.py` 直接调用（桌面端「积分看板」页同源）。
 
 > 接口要点（前端 JS 逆向确认）：`POST copilot.tencent.com/billing/meter/get-user-request-usage`
 >（逐笔）/ `get-user-daily-usage`（按天），鉴权 `Authorization: Bearer <accessToken>` +
@@ -398,7 +412,7 @@ python scripts/wb_usage_history.py --csv out.csv # 导出 CSV
 
 - 采集器：`scripts/usage_collector.py`（`--collect` 立即一轮 / `--collect-loop` 独立常驻 / 无参数查看本地库）
 - Broker 挂载：`app_runtime.py` → `TaskScheduler.run_collect()`（与监督/签到同循环，5 分钟一轮）
-- **GUI 查看**：`账号管理.bat` →「查看积分消耗」页签（模型列表与设置之间）：
+- **界面查看**：桌面端「积分看板」页（今日情况 / 每周情况）：
   - **今日情况**：上半部分显示今日获取/消耗积分；下半部分为逐笔消耗流水
     （格式：账号 + 模型 + 时间 + 消耗量，如 `TRAE_7593  GLM-5.3-Flash  2026/08/31 19:53  0.87`）
   - **每周情况**：优先显示本周，可回看最近 3 周；上半部分为该周获取/消耗积分；
@@ -445,7 +459,7 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 Broker 白天反�
 | TRAE 签到一直 9074 | 检查 `config.json` 的 `device_id` / `x-device-id` 是否为**真实客户端 machineid**（见 §3），占位符/伪造值必 9074 |
 | 网关起不来 | 看 `logs\gateway_err.log`；确认 `start.bat` 已建好 `.venv` 且装了依赖；`bootstrap.py doctor` 全量诊断 |
 | 端口被占 | `bootstrap.py doctor` 显示端口占用；8000/18787 被**非 open-ai** 进程占用时 Broker 会反复重启该角色（看 `logs\broker.log`） |
-| 开机没自启 | 确认启动文件夹里有 `open-ai-autostart.vbs`（在 账号管理.bat 设置页勾选「开机自动运行」） |
+| 开机没自启 | 确认启动文件夹里有 `open-ai-autostart.vbs`（在桌面端「系统设置」页勾选「开机自动运行」） |
 | Broker/服务没在跑 | 先 `bootstrap.py status` / `doctor`；计划任务 `OpenAI-DaemonBoot` 每 5 分钟兜底拉起；手动 `bootstrap.py start` |
 | 想彻底关掉所有进程 | 托盘右键「退出」（GUI 内一键）；或 `bootstrap.py stop`（优雅，二者均抑制 watchdog 复活 10 分钟）；或任务管理器结束 `open-ai-daemon.exe`（Job Object 连带终止全部子进程） |
 | runtime 构建失败 | 删除 `runtime\` 目录后重新运行 `start.bat`（自动重建）；解释器需为 Store Python 3.13 或 python.org 3.10+（任选其一） |
@@ -459,9 +473,9 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 Broker 白天反�
 
 | 我想… | 看/改 |
 |---|---|
-| 管理账号/积分/API/自启/卸载 | `账号管理.bat`（GUI）→ `scripts/gui_account_manager.py` |
+| 管理账号/积分/API/自启/卸载 | 桌面端 `desktop\open-ai-desktop.exe`（源码 `desktop-ui/`） |
 | 窗口 X 后找不到界面了 | 没退出，最小化到了**系统托盘**（右下角 open-ai 图标）→ 左键点击即恢复 |
-| 托盘图标行为异常 | `scripts/tray_icon.py`（纯 Win32 实现；初始化失败会自动降级为普通窗口，见 `logs\gui_account_manager.err.log`；菜单/托盘故障见 `logs\tray_icon.err.log`） |
+| 托盘图标不见了 | 由桌面端（Rust `tray-icon`）创建。用 `desktop-ui\tools\check-tray.ps1 -ProcessName open-ai-desktop` 验证；图标不显示时先确认是否被 Win11 收进托盘溢出区（`^`） |
 | 托盘「退出」没退出 | 看 `logs\gui_exit.log`（退出链路逐步诊断）与 `logs\broker.log`（应出现 `gui-shutdown`）；退出流程有多重兜底（IPC→Job 清理→抑制标记→5s 看门狗硬退出），正常必退 |
 | 管理 API 密钥 | GUI「API管理」页 → `scripts/api_store.py` |
 | 换模型/加别名 | `config.json` → `providers.workbuddy.models` |

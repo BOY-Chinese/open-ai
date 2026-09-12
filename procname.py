@@ -108,9 +108,9 @@ SPECS = {
                      'open-ai task (scripts)', 'open-ai-task.exe'),
     'cli': ProcSpec('cli', 'open-ai.exe', 'python',
                     'open-ai control CLI', 'open-ai.exe'),
-    # 图形界面 (账号管理): pythonw 系, 自带顶层窗口 → 任务管理器"应用"分组
-    'manager': ProcSpec('manager', 'open-ai-manager.exe', 'pythonw',
-                        'open-ai 账号管理', 'open-ai-manager.exe'),
+    # 注意：v3.0 起界面是独立进程 desktop/open-ai-desktop.exe（Tauri），
+    # 不再由 Python 启动，因此这里**没有** manager 角色 —— 原先的
+    # open-ai-manager.exe shim 随旧 tkinter GUI 一并移除。
 }
 
 

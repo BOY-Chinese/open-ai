@@ -389,6 +389,54 @@ async def reconnect_accounts(payload: dict = Body(default={})):
 
 # ─────────────────────────── 模型 ───────────────────────────
 
+# 从「x0.05」「x2.20 credits」「0.8」这类文案里抽出数字
+_CREDIT_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _norm_rate_key(name: Any) -> str:
+    """倍率表键归一化：去掉上游的 `__dev` 开发环境后缀并转小写。
+
+    上游在不同接口里对同一模型的命名并不一致，实测：
+        模型目录  kimi-k3                倍率表  kimi-k3__dev
+        模型目录  qwen3.8-flash          倍率表  qwen3.8-flash__dev
+        模型目录  glm-5.2                倍率表  GLM-5.2（大小写不同）
+    只做精确匹配就会出现「列表里有、倍率表里查不到」的行，前端显示 0。
+    """
+    s = str(name or "").strip()
+    if s.lower().endswith("__dev"):
+        s = s[:-5]
+    return s.lower()
+
+
+def _parse_credit_value(raw: Any) -> float | None:
+    """把上游返回的倍率转成数字；无法解析返回 None（调用方跳过该条）。
+
+    ★ 为什么不能直接 float()：上游三个通道返回的格式并不统一，实测有
+        Trae        0.8                 （已是数字）
+        WorkBuddy   'x0.05'             （前缀 x）
+        WorkBuddy   'x2.20 credits'     （前缀 x + 单位）
+        未提供      None / ''
+      `float('x0.05')` 会抛 ValueError，而原实现是 `except: continue` ——
+      **整条记录被静默丢弃**，倍率表里于是只剩那些 credits 为 None 的条目
+      （全被算成 0），前端「积分倍率」列因此整列为 0（本机实测 bug）。
+      改为「抽出字符串里第一个数字」，前缀与单位都不再影响结果。
+    """
+    if raw is None:
+        # 上游没给倍率：按 0 记（与旧行为一致），而不是丢弃整条记录
+        return 0.0
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    m = _CREDIT_NUM_RE.search(str(raw).replace(",", ""))
+    if not m:
+        return None
+    try:
+        return float(m.group())
+    except ValueError:
+        return None
+
+
 def _model_rates() -> dict:
     """各通道「模型 → 积分倍率」表：{channel: {模型名: rate}}。
 
@@ -401,6 +449,13 @@ def _model_rates() -> dict:
 
     倍率字段位置不同（Trae 在 idx 3、WB 系在 idx 2），故分别解析；
     同时按 routeModelId（带前缀）与裸名双向登记，便于前端任取其一匹配。
+
+    ★ 关于「倍率整列为 0」的两次踩坑（本机实测）：
+      1) Trae 的倍率元组第 0 个字段是**干净的配置名**（`glm-5.2`、`kimi-k2.7-code`），
+         第 2 个字段才是带 `__dev` 后缀的上游名（`glm-5.2__dev`、`kimi-k2.6-code__dev`）。
+         模型目录用的正是配置名，原先只登记第 1、2 个字段 → 查不到 → 显示 0。
+      2) WB/IE 的倍率是**字符串**（`'x0.05'`、`'x2.20 credits'`），直接 float() 会抛异常，
+         原实现 except 后 continue，把整条记录丢掉。
     """
     import sys
     if os.path.join(BASE, "scripts") not in sys.path:
@@ -409,8 +464,14 @@ def _model_rates() -> dict:
 
     def _put(table: dict, names: list[str], rate: float) -> None:
         for n in names:
-            if n:
-                table[str(n)] = rate
+            if not n:
+                continue
+            table[str(n)] = rate
+            # 归一化别名（小写 + 去 __dev）：上游同一模型在不同接口里
+            # 大小写/后缀并不一致（列表 `kimi-k3` vs 倍率表 `kimi-k3__dev`、
+            # 列表 `glm-5.2` vs 倍率表 `GLM-5.2`），不兜底就查不到。
+            # 用 setdefault 是为了不覆盖上游明确给出的精确键。
+            table.setdefault(_norm_rate_key(n), rate)
 
     out: dict[str, dict] = {}
 
@@ -423,15 +484,15 @@ def _model_rates() -> dict:
         for it in (items or []):
             if not isinstance(it, (tuple, list)) or len(it) < 4:
                 continue
-            _cfg_name, display_name, model_name, rate = it[0], it[1], it[2], it[3]
+            cfg_name, display_name, model_name, rate = it[0], it[1], it[2], it[3]
             if (it[4] if len(it) > 4 else None):
                 continue                       # 单模型失败，跳过
-            try:
-                r = float(rate or 0)
-            except (TypeError, ValueError):
-                continue
-            _put(table, [model_name, display_name,
-                         f"tr-{model_name}", f"tr-{display_name}"], r)
+            r = _parse_credit_value(rate)
+            if r is None:
+                continue                       # 彻底无法解析才跳过
+            _put(table, [cfg_name, model_name, display_name,
+                         f"tr-{cfg_name}", f"tr-{model_name}",
+                         f"tr-{display_name}"], r)
         out["Trae"] = table
     except Exception as e:  # noqa: BLE001
         logger.warning("trae_model_rates 异常: %s", e)
@@ -453,15 +514,38 @@ def _model_rates() -> dict:
                 model_id, display_name, credits = it[0], it[1], it[2]
                 if (it[3] if len(it) > 3 else None):
                     continue
-                try:
-                    r = float(credits or 0)
-                except (TypeError, ValueError):
+                r = _parse_credit_value(credits)
+                if r is None:
                     continue
                 _put(table, [model_id, display_name,
                              f"{prefix}{model_id}", f"{prefix}{display_name}"], r)
             out[channel] = table
         except Exception as e:  # noqa: BLE001
             logger.warning("%s 异常: %s", fn_name, e)
+
+    # ── 配置别名回填 ──
+    # config.json 里的别名（flash / pro / trae-flash / deepseek-flash …）本身
+    # 不在上游倍率表里，但它们指向的模型有倍率，直接继承即可 ——
+    # 否则这些别名行会永远显示 0（它们恰恰是 Trae 列表里最常见的名字）。
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+        for pkey, prov in providers.items():
+            channel = normalize_channel(PROVIDER_TO_CHANNEL.get(pkey, pkey))
+            table = out.get(channel)
+            aliases = getattr(prov, "aliases", None) or {}
+            if not table or not aliases:
+                continue
+            prefix = CHANNEL_PREFIX.get(channel, "")
+            for key, target in aliases.items():
+                r = table.get(str(target))
+                if r is None:
+                    r = table.get(_norm_rate_key(target))
+                if r is None:
+                    continue
+                _put(table, [key, f"{prefix}{key}"], r)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("别名倍率回填失败: %s", e)
 
     return {k: v for k, v in out.items() if v}
 
@@ -539,7 +623,13 @@ async def refresh_models(payload: dict = Body(default={})):
 
         async def _refresh_all():
             for pkey, prov in providers.items():
-                fn = getattr(prov, "refresh_models", None)
+                # 各 provider 的「重新拉取上游模型目录」方法名不统一：
+                #   workbuddy / workbuddy-intl → refresh_models
+                #   trae                       → sync_models（转发 Node 后端）
+                # 原先只找 refresh_models，导致 Trae 被静默跳过，
+                # 「刷新模型列表」按钮对 Trae 无效。
+                fn = (getattr(prov, "refresh_models", None)
+                      or getattr(prov, "sync_models", None))
                 if fn is None:
                     continue
                 try:

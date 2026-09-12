@@ -285,16 +285,20 @@ WorkBuddy 国际版原有的对外模型前缀 `wbai-` 已统一改为 `wbie-`�
 
 所以「后端在跑但托盘无图标」是必然结果，而非偶发故障。
 
-**修复**：自启动链路改为「后端 + 界面」双启动，并做三级降级：
+**修复**：自启动链路改为「后端 + 界面」双启动。
+
+> ⚠️ 本节记录的是 v3.0 第二轮的状态：当时界面有三级降级（桌面端 → Python 托盘 GUI
+> → pythonw）。**第三轮已把 Python GUI 整条删除**（见 §13.2），现在只剩一个入口：
+> `desktop/open-ai-desktop.exe`。下表仅作历史留存。
 
 | 优先级 | 目标 | 说明 |
 |---|---|---|
-| 1 | `desktop/open-ai-desktop.exe` | v3.0 桌面端（Tauri），自带窗口 |
-| 2 | `runtime/Scripts/open-ai-manager.exe` + `--minimized` | Python 托盘 GUI |
-| 3 | `.venv/Scripts/pythonw.exe` + `--minimized` | 无 shim 时的兜底 |
+| 1 | `desktop/open-ai-desktop.exe` | v3.0 桌面端（Tauri），自带窗口 + 自带托盘 |
+| ~~2~~ | ~~`runtime/Scripts/open-ai-manager.exe` + `--minimized`~~ | ~~Python 托盘 GUI~~ → **§13.2 已删除** |
+| ~~3~~ | ~~`.venv/Scripts/pythonw.exe` + `--minimized`~~ | ~~无 shim 时的兜底~~ → **§13.2 已删除** |
 
-**幂等性**：Broker 侧由 `bootstrap.py` 单实例锁保证；GUI 侧由 named mutex
-（`Local\open-ai.gui.mutex`）保证——重复触发只会唤醒既有窗口，不会出现双托盘。
+**幂等性**：Broker 侧由 `bootstrap.py` 单实例锁保证；界面侧由 Tauri 单实例插件
+（`tauri-plugin-single-instance`）保证——重复触发只会唤醒既有窗口，不会出现双托盘。
 
 **顺带修复**：`open-ai-autostart.bat` 原本硬编码 `D:\app\dsh_plugin\open-ai`，
 安装到其它路径即失效。已改为以脚本自身目录（`%~dp0`）为根。
@@ -568,3 +572,68 @@ Windows PowerShell 5.1 用 ANSI(GBK) 解码**无 BOM 的 UTF-8 脚本**，中文
 > 故新增 `verify-ui.mjs` 作为常规门禁。
 
 
+---
+
+## 十三、v3.0 三轮：积分倍率修复 + 旧界面彻底移除
+
+### 13.1 模型列表「积分倍率」整列为 0
+
+用户反馈「模型列表积分倍率这一列全部显示为 0」。实测 36 行里只有 2 行非零。
+**三个独立根因叠加**，只修一个都看不见效果：
+
+| # | 根因 | 表现 | 修复 |
+|---|---|---|---|
+| ① | `admin_api.py` 里写的是 `import main`，而网关以脚本方式启动时模块名是 `__main__` → Python 把**整个网关重新导入了一遍**，产生**第二份 `PROVIDERS`**。Trae 的动态模型表只在启动 lifespan 里同步一次，那一次同步发生在 `__main__` 那一份上，第二份的 `_node_models` 永远为空 | `/v1/models` 有 **63** 个 `tr-` 模型，`/v1/admin/models` 只有 **15** 个（且全是配置别名，上游真名如 `Doubao-Seed-Evolving`/`glm-5.1` 一个都没有）→ 倍率表按真名索引，自然全查不到 | `main.py` 在导入 `admin_api` 之前执行 `sys.modules.setdefault("main", sys.modules[__name__])`，两种启动方式共用同一份实例 |
+| ② | WorkBuddy / 国际版的倍率是**字符串**（`'x0.05'`、`'x2.20 credits'`、`'x0.29'`），原实现 `float(credits or 0)` 抛 `ValueError` 后被 `except: continue` **静默丢掉整条记录** | 倍率表里只剩 credits 为 `None` 的条目（全按 0 记），WB/IE 两列全 0 | 新增 `_parse_credit_value()`：正则抽出字符串里第一个数字，前缀 `x` 与单位 `credits` 都不再影响解析 |
+| ③ | Trae 倍率元组是 `(config_name, display_name, model_name, rate, err)`，其中 `model_name` 带 `__dev` 后缀（`glm-5.2__dev`、`kimi-k2.6-code__dev`），而**模型目录用的是第 0 个字段** `config_name`（`glm-5.2`、`kimi-k2.7-code`）。原实现只登记了 idx 1/2 | 带 `__dev` 的真实模型全部查不到 | 一并登记 `config_name` 及其 `tr-` 形式；并新增 `_norm_rate_key()`（去 `__dev` + 转小写）作为兜底键，顺带解决 `glm-5.2` vs `GLM-5.2` 的大小写不一致 |
+
+另外补了两处**顺带发现的问题**：
+
+- `POST /v1/admin/models/refresh` 只找 `refresh_models` 方法，而 Trae provider 的
+  方法叫 `sync_models` → Trae 被静默跳过，「刷新模型列表」对 Trae 无效。现两者都试。
+- 配置里的**别名**（`flash` / `pro` / `trae-flash` / `deepseek-flash` …）本身不在上游
+  倍率表里，但指向的模型有倍率。新增「配置别名回填」：按 provider 的 `aliases` 映射
+  继承目标模型的倍率，否则这些别名行会永远显示 0 —— 而它们恰恰是 Trae 列表里最常见的名字。
+
+**修复前后对比**（`/v1/admin/models` 与倍率表，实测）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 模型总数 | 36（Trae 15 / WB 18 / IE 3） | **105**（Trae 63 / WB 21 / IE 21） |
+| Trae 模型数与 `/v1/models` 一致 | ✗（15 vs 63） | **✓（63 vs 63）** |
+| 倍率非零的模型数 | **2** | **79** |
+| 倍率表条目数（Trae / WB / IE） | 314 / 12 / 8 | **474 / 152 / 220** |
+| 前端可匹配到倍率的模型 | 33/36 能匹配，但其中仅 **2** 个非零 | **103/105 命中，79 个非零** |
+
+> 剩余 2 个未命中（`glm-5.1_advisor`、`glm-5.2_advisor_doubao`）与少数零值
+> （`auto`、`hy3`）是**上游确实没有返回倍率**，不是解析问题。
+
+### 13.2 旧 GUI 彻底移除
+
+用户要求「旧的 gui 页面和代码给我删除，保证双击 open-ai 后只运行新的 open-ai 页面」。
+
+**删除清单**：
+
+| 文件 | 体积 | 说明 |
+|---|---|---|
+| `scripts/gui_account_manager.py` | 129 KB / 2781 行 | tkinter 主界面（v2.x 的整个 UI） |
+| `scripts/tray_icon.py` | 34 KB | 纯 Win32 托盘组件（仅旧 GUI 使用） |
+| `账号管理.bat` | — | 旧 GUI 入口 |
+| `tests/test_gui_layout.py`、`tests/test_account_parse.py` | — | 直接 `import gui_account_manager` |
+| `runtime/Scripts/open-ai-manager.exe`（+`.stamp`） | 247 KB | 旧 GUI 的品牌化 shim |
+| `procname.py` 的 `manager` ProcSpec | — | 移除后 `runtime` 不再生成该 shim |
+
+**清除的「回落分支」**（这是关键：留着任何一条，旧界面都可能被重新拉起）：
+
+- `launcher_main.py`：删掉 Python GUI 兜底，桌面端缺失时**明确弹窗报错**
+- `installer/launcher.py`：同上
+- `start_hidden.ps1`：删掉 `open-ai-manager.exe` / `pythonw.exe` 两条兜底
+- `installer/installer.py` 生成的启动器 bat：改为拉起 `desktop\open-ai-desktop.exe`
+- `installer/build_resources.py`：不再打包 `账号管理.bat`
+- `trae/server.js`、`main.py`、`scripts/usage_history.py`、`scripts/wb_usage_history.py`
+  的用户提示文案：`账号管理.bat` → 「open-ai 桌面端『账号管理』页」
+- `README.md`：托盘生命周期、进程表、目录树、图形界面说明、排错表全部改写
+
+**顺带修掉一个真隐患**：`open-ai-autostart.bat` 是 **LF 换行**的批处理文件。
+cmd.exe 解析 LF-only 批处理的 `if (...)` 块并不可靠，而这是**开机自启链路**上
+唯一的 .bat。已转 CRLF（`file` 确认 `with CRLF line terminators`）。

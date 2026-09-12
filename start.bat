@@ -13,7 +13,8 @@ rem ensure shims exist (open-ai-*.exe with icon/description), then start broker
 ".venv\Scripts\python.exe" bootstrap.py start
 echo.
 echo [OK] open-ai started.  Gateway http://127.0.0.1:8000  ^|  status: bootstrap.py status
-echo      Tip: "账号管理.bat" opens the GUI.  "bootstrap.py stop" stops everything.
+echo      UI  : desktop\open-ai-desktop.exe  (or the "open-ai" desktop shortcut)
+echo      Stop: ".venv\Scripts\python.exe" bootstrap.py stop
 pause
 exit /b 0
 :err

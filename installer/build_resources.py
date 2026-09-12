@@ -23,9 +23,10 @@ INCLUDE = [
     'anthropic_api.py', 'admin_api.py', 'version.py', 'launcher_version.txt',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',
-    '账号管理.bat',
     'providers', 'scripts', 'trae', 'tests', 'pic',
 ]
+# v3.0 移除项：'账号管理.bat'（旧 tkinter GUI 入口）与 scripts/ 下的
+# gui_account_manager.py、tray_icon.py 已整条删除，界面只有 desktop/ 桌面端。
 # 额外目录 (来自 installer/dist/, PyInstaller onedir 产物):
 #   键 = 源目录; 值 = zip 内基准路径 ('' = 装到安装根)。
 # onedir 布局: uninstall.exe + uninstall_internal/、open-ai-launcher.exe +

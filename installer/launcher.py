@@ -68,51 +68,28 @@ def start_services(root):
 def open_account_manager(root):
     """打开管理界面。
 
-    v3.0：优先拉起**桌面端**（desktop/open-ai-desktop.exe，Tauri + React）；
-    资源包未带桌面端时回退到品牌化 Python GUI（open-ai-manager.exe / pythonw），
-    保证旧包与「仅后端」部署仍可用。
+    v3.0：界面**只有**桌面端（desktop/open-ai-desktop.exe，Tauri + React）。
+    旧的 Python tkinter GUI（scripts/gui_account_manager.py / tray_icon.py /
+    open-ai-manager.exe shim / 账号管理.bat）已整条删除，因此这里不再有
+    「回落到 Python GUI」的分支 —— 桌面端缺失时明确报错，而不是悄悄打开一个
+    已经不存在的旧界面。
     """
     desktop = os.path.join(root, 'desktop', 'open-ai-desktop.exe')
-    if os.path.isfile(desktop):
-        try:
-            subprocess.Popen([desktop], cwd=os.path.dirname(desktop),
-                             creationflags=_NO_WINDOW)
-            return True, ''
-        except Exception as e:
-            # 桌面端拉起失败不应阻断流程：继续尝试 Python GUI
-            try:
-                logs = os.path.join(root, 'logs')
-                os.makedirs(logs, exist_ok=True)
-                with open(os.path.join(logs, 'launcher.err.log'), 'a',
-                          encoding='utf-8') as f:
-                    f.write('桌面端启动失败, 回退 Python GUI: %s\n' % e)
-            except Exception:
-                pass
-
-    manager = os.path.join(root, 'runtime', 'Scripts', 'open-ai-manager.exe')
-    pyw = os.path.join(root, '.venv', 'Scripts', 'pythonw.exe')
-    gui = os.path.join(root, 'scripts', 'gui_account_manager.py')
-    if not os.path.isfile(gui):
-        return False, '未找到 desktop/ 桌面端与 scripts/gui_account_manager.py'
-    # 显式 Tcl/Tk 数据目录 (runtime 内副本), 根治 Store 版 init.tcl 探测失败
-    env = dict(os.environ)
-    tcl = os.path.join(root, 'runtime', 'tcl', 'tcl8.6')
-    tk = os.path.join(root, 'runtime', 'tcl', 'tk8.6')
-    if os.path.isfile(os.path.join(tcl, 'init.tcl')):
-        env['TCL_LIBRARY'] = tcl
-    if os.path.isdir(tk):
-        env['TK_LIBRARY'] = tk
+    if not os.path.isfile(desktop):
+        return False, '未找到桌面端 desktop/open-ai-desktop.exe（资源包可能不完整）'
     try:
-        if os.path.isfile(manager):
-            exe, args = manager, [gui]
-        elif os.path.isfile(pyw):
-            exe, args = pyw, [gui]
-        else:
-            return False, '未找到 open-ai-manager.exe / pythonw.exe'
-        subprocess.Popen([exe] + args, cwd=root, env=env,
+        subprocess.Popen([desktop], cwd=os.path.dirname(desktop),
                          creationflags=_NO_WINDOW)
         return True, ''
     except Exception as e:
+        try:
+            logs = os.path.join(root, 'logs')
+            os.makedirs(logs, exist_ok=True)
+            with open(os.path.join(logs, 'launcher.err.log'), 'a',
+                      encoding='utf-8') as f:
+                f.write('桌面端启动失败: %s\n' % e)
+        except Exception:
+            pass
         return False, str(e)
 
 

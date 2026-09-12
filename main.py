@@ -178,8 +178,30 @@ def require_auth(request: Request):
 
 
 # ── 管理面路由（供桌面端调用）：账号 / 密钥 / 模型 / 积分 / 日志 ──
-from admin_api import router as admin_router  # noqa: E402
+#
+# ★ 先把本模块登记为 "main"，再导入 admin_api。
+#
+# 为什么必须这样（本机实测 bug 的根因）：
+#   以脚本方式启动时 (`python main.py`)，本模块在 sys.modules 里的名字是
+#   "__main__"，而不是 "main"。admin_api 内部写的是 `import main`，
+#   于是 Python 会把整个网关**从头再导入一遍**，得到一个独立的模块对象和
+#   **第二份 PROVIDERS**：
+#     - Trae provider 的 _node_models 只会在启动 lifespan 里同步一次，
+#       而那一次同步发生在 __main__ 那一份上；第二份的 _node_models 永远为空
+#     - 结果 /v1/models 有 63 个 tr- 模型，/v1/admin/models 却只有 15 个
+#       配置别名 -> 桌面端「积分倍率」列几乎全部匹配不到而显示 0
+#   副作用还包括：FastAPI 应用、provider、限流器各被创建两次（内存与启动开销）。
+#
+# setdefault 保证「正常 import main」时不会覆盖已有的模块对象，两种启动方式
+# 都指向同一份实例。
+import sys as _sys  # noqa: E402
 
+_sys.modules.setdefault("main", _sys.modules[__name__])
+
+from admin_api import router as admin_router, setup_cors  # noqa: E402
+
+# 打包后的 Tauri 应用运行在 tauri.localhost，与网关跨 origin，需放行 CORS
+setup_cors(app)
 app.include_router(admin_router, dependencies=[Depends(require_auth)])
 
 
@@ -310,7 +332,7 @@ async def anthropic_messages(request: Request):
         return JSONResponse(
             {"type": "error",
              "error": {"type": "provider_error",
-                       "message": "该模型提供商未配置或未注册(注意: 账号需先通过 账号管理.bat 登录)"}},
+                       "message": "该模型提供商未配置或未注册(注意: 账号需先在 open-ai 桌面端「账号管理」页添加并登录)"}},
             status_code=503)
 
     oa_body = anthropic_to_openai(body)

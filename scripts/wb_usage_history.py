@@ -289,7 +289,7 @@ def main():
             log(f'未找到 userId 前缀为 {args.uid} 的账号')
             return 1
     if not accounts:
-        log(f"无 {cur_spec()['label']} 账号, 请先用 账号管理.bat 添加")
+        log(f"无 {cur_spec()['label']} 账号, 请先在 open-ai 桌面端「账号管理」页添加")
         return 1
 
     log(f"=== {cur_spec()['label']} 逐笔消耗流水 "

@@ -17,7 +17,7 @@ TRAE 逐笔积分消耗流水查询
 注意:
   - usage_type 固定传 [7] (credits 计费类型, 数组形式; 传 0/1/2 或缺省均查不到数据或 400)
   - page_size 上限 50, 超过返回 HTTP 400
-  - token 过期会 401, 请先用 账号管理.bat -> 重新连接 或 signin_all.py 续期
+  - token 过期会 401, 请先在 open-ai 桌面端「账号管理」页重新连接, 或跑 signin_all.py 续期
 
 用法:
   python scripts/usage_history.py                    # 最近 7 天, 所有账号
@@ -253,7 +253,7 @@ def main():
             log(f'未找到 uid 前缀为 {args.uid} 的账号')
             return 1
     if not accounts:
-        log('无 TRAE 账号, 请先用 账号管理.bat 添加')
+        log('无 TRAE 账号, 请先在 open-ai 桌面端「账号管理」页添加')
         return 1
 
     log(f'=== TRAE 逐笔消耗流水 (最近 {args.days} 天) ===')

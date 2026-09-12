@@ -721,10 +721,14 @@ class InstallerApp:
         self._log('✓ 已创建桌面快捷方式: open-ai')
 
     def _create_launcher_bat(self, target, launcher_bat):
-        """生成启动器: 先启动网关(后台), 再打开账号管理GUI。自动隐藏自身控制台。"""
+        """生成启动器: 先启动网关(后台), 再打开桌面端。自动隐藏自身控制台。
+
+        v3.0：界面只有桌面端（Tauri）。旧 tkinter GUI / 账号管理.bat 已删除，
+        因此这里不再调用 pythonw + scripts\\gui_account_manager.py。
+        """
         bat_content = (
             '@echo off\r\n'
-            'rem open-ai 一键启动: 先启网关(后台) 再开账号管理\r\n'
+            'rem open-ai 一键启动: 先启网关(后台) 再开桌面端\r\n'
             'rem 隐藏本控制台窗口\r\n'
             'if not "%1"=="hidden" (\r\n'
             '    start "" /min cmd /c "%~f0" hidden\r\n'
@@ -734,7 +738,7 @@ class InstallerApp:
             'start "" powershell.exe -NoProfile -ExecutionPolicy Bypass '
             '-WindowStyle Hidden -File "%~dp0start_hidden.ps1"\r\n'
             'timeout /t 3 /nobreak >nul\r\n'
-            'start "" "%~dp0.venv\\Scripts\\pythonw.exe" "%~dp0scripts\\gui_account_manager.py"\r\n'
+            'start "" "%~dp0desktop\\open-ai-desktop.exe"\r\n'
             'exit /b\r\n'
         )
         with open(launcher_bat, 'w', encoding='gbk', newline='\r\n') as f:

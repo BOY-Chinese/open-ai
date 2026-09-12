@@ -1,11 +1,12 @@
 @echo off
-rem open-ai autostart (v3.0): 拉起后端进程树 + 托盘 GUI
+rem open-ai autostart (v3.0): 拉起后端进程树 + 桌面端(驻留托盘)
 rem
 rem v3.0 变更:
 rem   1) 以脚本自身目录为根, 不再硬编码 D:\app\dsh_plugin\open-ai —— 安装到
 rem      任意路径都能工作（旧版硬编码路径在非开发机上直接失效）。
-rem   2) 改为调用 start_hidden.ps1 拉起「Broker + 托盘 GUI」：托盘图标由 GUI
-rem      创建, 旧版只拉 Broker 会导致「后端在跑但托盘无图标」。
+rem   2) 改为调用 start_hidden.ps1 拉起「Broker + 桌面端 --minimized」：托盘图标
+rem      由桌面端创建, 旧版只拉 Broker 会导致「后端在跑但托盘无图标」。
+rem   3) 旧的 Python tkinter GUI 已整条删除, 这里不再有 Python 界面分支。
 setlocal
 set "ROOT=%~dp0"
 rem 去掉结尾反斜杠, 避免拼接出双斜杠

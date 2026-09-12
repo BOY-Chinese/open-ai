@@ -90,7 +90,7 @@ function pickAccount() {
   }
   const valid = ACCOUNTS.filter(a => !a.invalid && a.enabled !== false);
   if (valid.length === 0) {
-    throw new Error('TRAE 账号池为空或全部已失效, 请在 账号管理.bat 中 [4] 重新连接 或添加账号');
+    throw new Error('TRAE 账号池为空或全部已失效, 请在 open-ai 桌面端「账号管理」页重新连接或添加账号');
   }
   const idx = Math.floor(globalCallCount / SWITCH_EVERY) % valid.length;
   globalCallCount++;
@@ -670,7 +670,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ============ 账号管理接口 (供 账号管理.bat 显示 [已失效] 与 [4] 重新连接) ============
+  // ============ 账号管理接口 (供 open-ai 桌面端「账号管理」页显示 [已失效] / 重新连接) ============
   if (req.method === 'GET' && url.pathname === '/v1/admin/accounts') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -765,7 +765,7 @@ server.listen(PORT, HOST, () => {
   console.log(`  GET  /v1/models`);
   console.log(`默认模型: ${CFG.default_model}`);
   if (ACCOUNTS.length === 0) {
-    console.warn('[警告] 账号池为空! 请先运行 账号管理.bat -> [2] 添加 TRAE 账号');
+    console.warn('[警告] 账号池为空! 请先在 open-ai 桌面端「账号管理」页添加 TRAE 账号');
   }
   setTimeout(() => healthCheck('启动检查'), 1000);
   setInterval(() => healthCheck('每小时定时检查'), CHECK_INTERVAL);

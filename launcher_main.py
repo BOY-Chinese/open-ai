@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-open-ai-launcher 主程序 (PyInstaller onefile 打包, v2.4)
+open-ai-launcher 主程序 (PyInstaller onefile 打包, v3.0)
 =========================================================
 双击 = 一键启动 open-ai:
   1. 首次运行自动构建品牌化运行时 (runtime/)
   2. 启动后台服务 (幂等, 已在跑直接返回)
-  3. 打开管理界面 (显式 Tcl/Tk 数据目录, 根治 init.tcl 探测失败)
+  3. 打开桌面端界面 (desktop/open-ai-desktop.exe, Tauri + React)
+
 启动器自身立即退出; 常驻主体是 open-ai-daemon.exe (服务) 与
-open-ai-manager.exe (界面)。
+open-ai-desktop.exe (界面)。
+
+v3.0 变更: 旧的 Python tkinter 界面 (scripts/gui_account_manager.py +
+scripts/tray_icon.py + open-ai-manager.exe shim + 账号管理.bat) 已**整条删除**。
+界面只有一个入口 —— 桌面端。因此这里不再有任何「回落到 Python GUI」的分支:
+桌面端缺失时直接弹窗报错, 而不是悄悄打开一个已经被删掉的旧界面。
 """
 import os
 import sys
@@ -27,21 +33,8 @@ def _msg(text):
         pass
 
 
-def _gui_env():
-    """GUI 子进程环境: 显式 Tcl/Tk 数据目录 (runtime 内副本)。
-    根治偶发 'Can't find a usable init.tcl'。"""
-    env = dict(os.environ)
-    tcl = os.path.join(ROOT, 'runtime', 'tcl', 'tcl8.6')
-    tk = os.path.join(ROOT, 'runtime', 'tcl', 'tk8.6')
-    if os.path.isfile(os.path.join(tcl, 'init.tcl')):
-        env['TCL_LIBRARY'] = tcl
-    if os.path.isdir(tk):
-        env['TK_LIBRARY'] = tk
-    return env
-
-
 def _find_desktop():
-    """定位 Tauri 桌面端可执行文件。
+    """定位桌面端可执行文件。
 
     两个候选覆盖两种布局，运行时不必区分「本机项目目录」与「安装目录」：
       - desktop/open-ai-desktop.exe                    —— 安装目录 / 本机构建同步副本
@@ -56,9 +49,9 @@ def _find_desktop():
     return None
 
 
-def _spawn(argv, wait=False, env=None):
+def _spawn(argv, wait=False):
     flags = CREATE_NO_WINDOW if wait else (DETACHED_PROCESS | CREATE_NO_WINDOW)
-    p = subprocess.Popen(argv, cwd=ROOT, creationflags=flags, env=env,
+    p = subprocess.Popen(argv, cwd=ROOT, creationflags=flags,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL)
     if wait:
@@ -72,33 +65,30 @@ def _spawn(argv, wait=False, env=None):
 def main():
     if os.name != 'nt':
         return 1
-    # 1) 品牌化运行时 (首次运行构建)
-    manager = os.path.join(ROOT, 'runtime', 'Scripts', 'open-ai-manager.exe')
-    if not os.path.exists(manager):
+
+    # 1) 品牌化运行时 (首次运行构建): 以 broker shim 是否就位为判据
+    broker = os.path.join(ROOT, 'runtime', 'Scripts', 'open-ai-daemon.exe')
+    if not os.path.exists(broker):
         py = os.path.join(ROOT, '.venv', 'Scripts', 'python.exe')
         if not os.path.exists(py):
             _msg('未找到运行环境。\n\n请先在软件目录运行一次 start.bat 完成安装。')
             return 1
         _spawn([py, os.path.join(ROOT, 'procname.py')], wait=True)
-        if not os.path.exists(manager):
+        if not os.path.exists(broker):
             _msg('运行时构建失败, 请重试或运行 start.bat。')
             return 1
-    # 2) 后台服务 (幂等)
-    broker = os.path.join(ROOT, 'runtime', 'Scripts', 'open-ai-daemon.exe')
-    if os.path.exists(broker):
-        _spawn([broker, os.path.join(ROOT, 'bootstrap.py'), 'start'])
-    # 3) 界面：v3.0 起优先桌面端 (Tauri)，找不到才回落 Python tkinter GUI
-    #
-    # 为什么必须放在最前面：v3.0 的界面已整体迁移到 desktop-ui (Tauri + React)，
-    # Python GUI 只是兼容兜底。此前这里写死拉起 gui_account_manager.py，
-    # 导致「双击快捷方式还是旧界面」(本机实测反馈)。
+
+    # 2) 后台服务 (幂等, Broker 自带单实例锁)
+    _spawn([broker, os.path.join(ROOT, 'bootstrap.py'), 'start'])
+
+    # 3) 界面: 桌面端是唯一入口
     desktop = _find_desktop()
-    if desktop:
-        _spawn([desktop], env=None)
-        return 0
-    # 4) 兼容兜底：Python GUI (显式 Tcl/Tk 环境)
-    _spawn([manager, os.path.join(ROOT, 'scripts', 'gui_account_manager.py')],
-           env=_gui_env())
+    if not desktop:
+        _msg('未找到桌面端 desktop\\open-ai-desktop.exe。\n\n'
+             '后台服务已启动，但界面无法打开。\n'
+             '请重新安装，或联系开发者。')
+        return 1
+    _spawn([desktop])
     return 0
 
 

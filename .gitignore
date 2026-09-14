@@ -51,6 +51,7 @@ installer/open-ai.exe
 # build_exe.bat 用 `--name X script.py` 直接构建时, PyInstaller 会在 installer/
 # 下自动生成 X.spec —— 那是构建副产物, 手写 spec 才入库。
 installer/open-ai-installer-*.spec
+installer/uninstall.spec
 installer/ver_*.py
 
 # ===== v3.0 桌面端本机构建产物 (由 build-tauri-release.ps1 同步) =====

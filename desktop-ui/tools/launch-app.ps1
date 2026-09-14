@@ -1,5 +1,7 @@
 ﻿# 启动 Tauri 桌面应用（开发模式，需 dev server 在 1420 端口）
-$Exe = 'D:\app\dsh_plugin\open-ai\desktop-ui\src-tauri\target\debug\open-ai-desktop.exe'
+# 仓库根 = 本脚本所在目录 (desktop-ui/tools) 上溯两级
+$Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$Exe = Join-Path $Root 'desktop-ui\src-tauri\target\debug\open-ai-desktop.exe'
 if (-not (Test-Path $Exe)) { Write-Host "[FATAL] exe not found"; exit 1 }
 
 Start-Process -FilePath $Exe -WorkingDirectory (Split-Path $Exe) | Out-Null

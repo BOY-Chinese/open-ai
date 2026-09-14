@@ -10,16 +10,20 @@
  *  两种形态下前端代码一致、产物中都不含密钥（见 `./gateway.ts`）。
  */
 import { authHeaders, gatewayRuntime, invalidateGatewayRuntime } from './gateway'
+import { filterModelView } from './modelCache'
+import { emitAccountsChanged } from './accountEvents'
+import { followLoginLog, type LoginLogChunk } from './loginStream'
 import type {
   Account,
   ApiKey,
+  AutoChain,
   Channel,
   ChannelFilter,
   DailyUsage,
   GatewayInfo,
-  LogLine,
-  LogLevel,
   ModelEntry,
+  SigninBundle,
+  SigninStatus,
   TodayBundle,
   UsageRow,
   WeekBundle,
@@ -149,6 +153,20 @@ export const httpBackend = {
    * 刷新账号：先重新拉取列表，再触发一次联网积分刷新（真实余额）。
    * 联网较慢（逐账号请求上游），故给足超时并允许部分失败。
    */
+  /**
+   * 今日签到结果（只读本地流水库，毫秒级，不联网）。
+   *
+   * 返回体里**只包含签到成功的账号** —— 未出现即「今日未签到」，
+   * 页面按缺席判定即可，不需要后端为每个账号补一条 false
+   * （也让「真的没签到」和「接口没返回这个账号」走同一条渲染分支）。
+   */
+  async listSignin(filter: ChannelFilter = 'all'): Promise<SigninBundle> {
+    const r = await req<{ signin: Record<string, SigninStatus>; day: string }>(
+      `/v1/admin/accounts/signin${q({ channel: filter })}`
+    )
+    return { day: r.day ?? '', signin: r.signin ?? {} }
+  },
+
   async refreshAccounts(filter: ChannelFilter = 'all'): Promise<Account[]> {
     await req('/v1/admin/accounts/credits/refresh', {
       method: 'POST',
@@ -179,19 +197,46 @@ export const httpBackend = {
 
   /**
    * 添加账号：需要交互式登录（扫码/OIDC），无法由 HTTP 接口静默完成。
-   * 这里拉起网关侧的登录脚本，由用户在浏览器完成，随后列表会刷新出来。
+   * 这里拉起网关侧的登录脚本，由用户在浏览器完成。
+   *
+   * ★ 本方法**要等到登录脚本结束才返回**，脚本输出全程实时写进「操作日志」。
+   *   这正是 v2.3 GUI 的形状：一次「添加账号」在日志里是**一个**操作块 ——
+   *   分隔线 → 提示 → 脚本输出 → `[完成]`。若在这里 fire-and-forget 立刻返回，
+   *   代理写下的 `[完成]` 会插在脚本输出**前面**，读起来变成
+   *   「操作已完成，然后（莫名其妙地）又有一堆输出」。
+   *
+   *   调用方（账号列表页）因此**不应 await 本方法** —— 用户可能在浏览器里
+   *   填两分钟密码，界面没理由锁在那儿；结束后的刷新走 `accountEvents` 通知。
+   *   （v2.3 把整个流程放在 GUI 线程里，界面就是被卡住的。）
    */
   async addAccount(channel: Channel): Promise<Account> {
+    // Loomy 走讯飞手机号短信验证码登录（loomy.xunfei.cn Web 端），非浏览器交互。
+    // 正常路径已被界面拦截（「添加 Loomy 账号」弹出图形化向导），这里只是
+    // 防御性兜底 —— 万一有调用方绕过向导，给出明确指引而不是悄悄失败。
+    if (channel === 'Loomy') {
+      throw new ApiError(
+        501,
+        'Loomy 请使用「添加 Loomy 账号」弹窗登录（手机号验证码），无需命令行'
+      )
+    }
     const script =
       channel === 'Trae' ? 'login_trae.py'
         : channel === 'WorkBuddy' ? 'login_workbuddy.py'
           : 'login_workbuddy_intl.py'
-    await req('/v1/admin/accounts/login', {
+    const r = await req<{ logOffset?: number }>('/v1/admin/accounts/login', {
       method: 'POST',
       body: { channel, script },
       timeoutMs: 30000,
     })
-    // 登录是异步的：返回占位对象，界面会提示「已拉起登录窗口」
+
+    await followLoginLog({
+      fetchChunk: (offset) => this.loginLog(channel, offset),
+      startOffset: r.logOffset ?? 0,
+      label: `${channel} 登录助手（${script}）`,
+      onFinished: () => emitAccountsChanged(channel),
+    })
+
+    // 登录是异步的：返回占位对象，界面据此提示「已拉起登录助手」
     return {
       id: `${channel}:pending`,
       channel,
@@ -202,6 +247,13 @@ export const httpBackend = {
       workCredits: 0,
       refreshedAt: 0,
     }
+  },
+
+  /** 增量读取登录脚本输出（只读文件，不联网；见后端 /accounts/login/log） */
+  async loginLog(channel: Channel, offset: number): Promise<LoginLogChunk> {
+    return req<LoginLogChunk>(`/v1/admin/accounts/login/log${q({ channel, offset })}`, {
+      timeoutMs: 10000,
+    })
   },
 
   /* ═══════════════ API 密钥 ═══════════════ */
@@ -247,10 +299,22 @@ export const httpBackend = {
 
   /* ═══════════════ 模型 ═══════════════ */
 
+  /**
+   * 拉取模型列表（全量）+ 积分倍率。
+   *
+   * 两点与「按 channel 请求」不同的取舍：
+   *  1. **始终请求全量**（不带 channel）。后端这一步是内存读取（毫秒级），
+   *     全量与单通道几乎同价；换来的是调用方手里永远有一份完整列表，
+   *     切换通道/显隐筛选可以纯本地完成，不再各拉一次。
+   *  2. **筛选交给 {@link filterModelView}**，与页面读取缓存走同一段代码，
+   *     保证「缓存首帧」与「刷新后」结果一致。
+   *
+   * 注意：本函数**不写缓存** —— 缓存由模型列表页在拿到成功结果后统一落盘
+   * （见 `lib/modelCache.ts`），这样「网络结果」与「本地乐观修改」两条路径
+   * 只有一个写入点，不会互相覆盖。
+   */
   async listModels(opts?: { channel?: ChannelFilter; showHidden?: boolean }): Promise<ModelEntry[]> {
-    const r = await req<{ models: ModelEntry[] }>(
-      `/v1/admin/models${q({ channel: opts?.channel ?? 'all' })}`
-    )
+    const r = await req<{ models: ModelEntry[] }>('/v1/admin/models')
 
     // 隐藏/置顶是「视图偏好」——后端模型目录由上游动态生成，无此字段，
     // 故叠加本地偏好（见 updateModels），保证刷新后仍生效
@@ -263,13 +327,13 @@ export const httpBackend = {
 
     const merged = r.models.map((m) => {
       // 路由名去掉通道前缀即上游模型名，用它去倍率表里查
-      const bare = m.routeModelId.replace(/^(tr-|wb-|wbie-)/, '')
+      const bare = m.routeModelId.replace(/^(tr-|wb-|wbie-|lm-|loomy-)/, '')
       const table = rates.rates[m.channel] ?? {}
       const rate = table[m.routeModelId] ?? table[bare] ?? table[m.name] ?? 0
       return { ...m, ratio: rate || m.ratio || 0, ...(prefs[m.id] ?? {}) }
     })
-    const list = opts?.showHidden ? merged : merged.filter((m) => !m.hidden)
-    return list.slice().sort((a, b) => Number(b.pinned) - Number(a.pinned))
+    const all = merged.slice().sort((a, b) => Number(b.pinned) - Number(a.pinned))
+    return filterModelView(all, opts?.channel ?? 'all', opts?.showHidden ?? false)
   },
 
   async refreshModels(): Promise<void> {
@@ -306,16 +370,67 @@ export const httpBackend = {
     return r
   },
 
-  /* ═══════════════ 日志 ═══════════════ */
+  /* ═══════════════ Auto 路由连 ═══════════════ */
 
-  async listLogs(): Promise<LogLine[]> {
-    const r = await req<{ logs: LogLine[] }>('/v1/admin/logs?lines=300')
-    return r.logs
+  async getAutoChain(): Promise<{ chain: AutoChain; availableModels: string[] }> {
+    return req<{ chain: AutoChain; availableModels: string[] }>('/v1/admin/auto-chain')
   },
 
-  /** 真实日志来自网关文件，前端不再本地追加 */
-  appendLog(_level: LogLevel, _text: string): LogLine {
-    return { id: Date.now(), level: _level, text: _text, ts: Date.now() / 1000 }
+  async saveAutoChain(chain: AutoChain): Promise<void> {
+    await req('/v1/admin/auto-chain', { method: 'POST', body: chain })
+  },
+
+  /* ═══════════════ Loomy 登录（图形化向导用） ═══════════════ */
+
+  /**
+   * 桌面通道（讯飞账号服务）发送短信验证码。
+   *
+   * 只有桌面通道的 session 能鉴权对话，积分记在本账号；Web 通道的 cookie
+   * 只能查余额。因此界面默认走桌面通道。
+   */
+  async sendLoomyDesktopCode(
+    phone: string
+  ): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+    return req('/v1/admin/accounts/loomy/desktop-send-code', {
+      method: 'POST',
+      body: { phone },
+    })
+  },
+
+  /** 桌面通道验证码登录：本账号 session 由网关写入 config.json */
+  async loomyDesktopLogin(
+    phone: string,
+    code: string,
+    messageId: string
+  ): Promise<{ ok: boolean; userid?: string; name?: string; error?: string }> {
+    return req('/v1/admin/accounts/loomy/desktop-login', {
+      method: 'POST',
+      body: { phone, code, messageId },
+    })
+  },
+
+  /** 发送短信验证码（Web 通道，服务端校验手机号，{ok:false} 时带 error 文案） */
+  async sendLoomyCode(
+    phone: string
+  ): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+    return req('/v1/admin/accounts/loomy/send-code', { method: 'POST', body: { phone } })
+  },
+
+  /** 验证码登录：cookie 会话由网关写入 config.json */
+  async loomyWebLogin(
+    phone: string,
+    code: string,
+    messageId: string
+  ): Promise<{ ok: boolean; userid?: string; name?: string; error?: string }> {
+    return req('/v1/admin/accounts/loomy/web-login', {
+      method: 'POST',
+      body: { phone, code, messageId },
+    })
+  },
+
+  /** 校验某手机号的 Web 会话是否仍有效 */
+  async checkLoomySession(phone: string): Promise<{ valid: boolean; nickname?: string }> {
+    return req(`/v1/admin/accounts/loomy/session${q({ phone })}`)
   },
 
   /* ═══════════════ 设置 ═══════════════ */

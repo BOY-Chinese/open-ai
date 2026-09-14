@@ -35,14 +35,57 @@ logger = logging.getLogger("openapi.admin")
 
 router = APIRouter(prefix="/v1/admin", tags=["admin"])
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE, "config.json")
+from app_paths import ROOT as BASE, CONFIG_PATH  # 安装根: 见 app_paths.py
+
+
+def _update_repo() -> str:
+    """发布仓库（owner/repo），「检查更新」据此查 latest release。
+
+    取值优先级: 环境变量 OPEN_AI_UPDATE_REPO > version.py 的 UPDATE_REPO >
+    占位值。**不把某个人的 GitHub 账号写死在业务代码里** —— 那是发布者的
+    身份信息, 换了 fork/组织就要改代码。取不到时检查更新会失败但不会崩,
+    只报「无更新」(见 check_update 的兜底)。
+    """
+    env = (os.environ.get("OPEN_AI_UPDATE_REPO") or "").strip()
+    if env:
+        return env
+    try:
+        import sys as _sys
+        if BASE not in _sys.path:
+            _sys.path.insert(0, BASE)
+        from version import UPDATE_REPO as _r  # type: ignore
+        if _r:
+            return str(_r).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return "owner/open-ai"
+
+
+UPDATE_REPO = _update_repo()
 
 # 通道键（对外） → config.json providers 段键（对内）
 CHANNEL_TO_PROVIDER = {
     "Trae": "trae",
     "WorkBuddy": "workbuddy",
     "WorkBuddy_IE": "workbuddy_intl",
+    "Loomy": "loomy",
+}
+
+# 通道键（对外） → 流水库 gain/usage 表的 platform 键
+#
+# ★ 与 CHANNEL_TO_PROVIDER 是**两套不同的映射**，不要合并：
+#   前者指向 config.json 的段名（workbuddy_intl 用下划线），
+#   后者指向 credits_api.PLATFORMS 的稳定 key（同样是 workbuddy_intl，
+#   但 Trae 是小写 'trae' 而非 'Trae'）。历史上把两者混用会让
+#   「按通道查流水」静默返回空结果。
+#
+# Loomy 已接入流水库（usage_collector.collect_loomy / loomy_gains，
+# credits_api.PLATFORMS 有 'loomy' 键）。
+CHANNEL_TO_PLATFORM = {
+    "Trae": "trae",
+    "WorkBuddy": "workbuddy",
+    "WorkBuddy_IE": "workbuddy_intl",
+    "Loomy": "loomy",
 }
 
 # provider 注册键 → 对外通道名
@@ -55,9 +98,10 @@ PROVIDER_TO_CHANNEL = {
     "workbuddy_intl": "WorkBuddy_IE",
     "workbuddy-intl": "WorkBuddy_IE",
     "workbuddyintl": "WorkBuddy_IE",
+    "loomy": "Loomy",
 }
 
-# 归一化：把任何来源的通道写法收敛到对外三值
+# 归一化：把任何来源的通道写法收敛到对外值
 CHANNEL_ALIASES = {
     "trae": "Trae",
     "workbuddy": "WorkBuddy",
@@ -66,6 +110,7 @@ CHANNEL_ALIASES = {
     "workbuddy_intl": "WorkBuddy_IE",
     "workbuddy-intl": "WorkBuddy_IE",
     "intl": "WorkBuddy_IE",
+    "loomy": "Loomy",
 }
 
 
@@ -78,11 +123,16 @@ def normalize_channel(value: str | None) -> str:
     return CHANNEL_ALIASES.get(v.lower(), v)
 
 # 对外模型名前缀（与各 provider 实现保持一致）
+# Loomy v3.1 起对外前缀 lm-；倍率表同时登记 loomy- 历史前缀，两种写法都能匹配
 CHANNEL_PREFIX = {
     "Trae": "tr-",
     "WorkBuddy": "wb-",
     "WorkBuddy_IE": "wbie-",
+    "Loomy": "lm-",
 }
+
+# Loomy 历史前缀（v3.0 对外名），请求与倍率匹配仍兼容
+LOOMY_LEGACY_PREFIX = "loomy-"
 
 # 账号积分余额的内存缓存：{accountId: {credits, workCredits}}
 #   GET  只读这里（毫秒级，不联网）
@@ -90,6 +140,16 @@ CHANNEL_PREFIX = {
 # 进程重启即失效——这是有意的：余额是易变数据，不做跨进程持久化。
 _CREDIT_CACHE: dict[str, dict] = {}
 _CREDIT_CACHE_TS: float = 0.0
+
+# 登录脚本句柄：{channel: Popen}
+#
+# 为什么要留句柄：登录脚本是 fire-and-forget 拉起的，但桌面端要把它的输出
+# **实时**贴进操作日志（v2.3 GUI 的 `_subprocess_stream` 就是这么做的）。
+# 判断「脚本还在跑吗」需要一个句柄 —— 否则只能靠猜（比如看日志文件 mtime），
+# 那种推断在「用户把浏览器晾在一边十分钟」时必然误判。
+# 进程重启会丢掉句柄：此时 /accounts/login/log 会返回 running=False，
+# 前端停止跟随但已读到的输出仍在，不影响使用。
+_LOGIN_PROCS: dict[str, Any] = {}
 
 
 async def _in_thread(fn, *args, **kwargs):
@@ -123,8 +183,12 @@ def _now() -> float:
 # ─────────────────────────── 账号 ───────────────────────────
 
 def _account_id(channel: str, acc: dict, idx: int) -> str:
-    """稳定 id：优先 uid/userId，其次账号名，最后序号。"""
-    raw = str(acc.get("uid") or acc.get("userId") or acc.get("name") or idx)
+    """稳定 id：优先 uid/userId，其次账号名，最后序号。
+
+    Loomy 账号的字段是小写 userid（讯飞协议），一并纳入。
+    """
+    raw = str(acc.get("uid") or acc.get("userId") or acc.get("userid")
+              or acc.get("name") or idx)
     return f"{channel}:{raw}"
 
 
@@ -134,23 +198,56 @@ def _account_status(acc: dict) -> str:
     连接态判定依据（不联网）：有可用于上游调用的凭据即视为已连接。
       trae        → token
       workbuddy*  → accessToken 或 refreshToken（可自动刷新）
+      loomy       → session（桌面账号）或 cookies（Web 账号）
+                    —— 鉴权整改后两者都是「本账号自己的登录态」，平等可用
     """
     if acc.get("enabled", True) is False:
         return "disabled"
     has_cred = bool(acc.get("token") or acc.get("accessToken")
-                    or acc.get("refreshToken") or acc.get("cookie"))
+                    or acc.get("refreshToken") or acc.get("cookie")
+                    or acc.get("session") or acc.get("cookies"))
     return "enabled" if has_cred else "disconnected"
 
 
 def _load_accounts_raw() -> list[dict]:
-    """读取三通道账号，产出前端 Account[] 形状（不含联网积分）。"""
+    """读取三通道账号，产出前端 Account[] 形状（不含联网积分）。
+
+    Loomy 特例（2026-09-14 整合）：同一手机号的「桌面账号（session）」与
+    「Web 账号（cookies）」在 config 里是两条记录，但它们是同一个人，
+    界面合并成**一行** —— 行 id/名字用桌面账号的（`Loomy(手机号)`，
+    能鉴权对话的那条）；积分/签到的数据源仍走 Web 账号（见
+    refresh_account_credits / accounts_signin）。
+    """
     cfg = _read_config()
     prov = cfg.get("providers") or {}
     out: list[dict] = []
     for channel, pkey in CHANNEL_TO_PROVIDER.items():
         seg = prov.get(pkey) or {}
+        if channel == "Loomy":
+            for phone, g in _loomy_groups(seg.get("accounts") or []).items():
+                d, w = g.get("desktop"), g.get("web")
+                if d:
+                    idx, acc = d
+                    rid, name = _account_id("Loomy", acc, idx), \
+                        acc.get("name") or f"Loomy({phone})"
+                else:
+                    idx, acc = w
+                    rid, name = _account_id("Loomy", acc, idx), \
+                        acc.get("name") or f"Loomy Web({phone})"
+                status, enabled = _loomy_row_state(g)
+                out.append({
+                    "id": rid,
+                    "channel": channel,
+                    "name": name,
+                    "enabled": enabled,
+                    "status": status,
+                    "credits": 0,
+                    "workCredits": 0,
+                    "refreshedAt": 0,
+                })
+            continue
         for i, acc in enumerate(seg.get("accounts") or []):
-            uid = str(acc.get("uid") or acc.get("userId") or "")
+            uid = str(acc.get("uid") or acc.get("userId") or acc.get("userid") or "")
             name = acc.get("name") or (uid or f"#{i + 1}")
             out.append({
                 "id": _account_id(channel, acc, i),
@@ -164,6 +261,71 @@ def _load_accounts_raw() -> list[dict]:
                 "refreshedAt": 0,
             })
     return out
+
+
+def _loomy_groups(accs: list[dict]) -> "dict[str, dict]":
+    """Loomy 账号按手机号分组：{phone: {"desktop": (i, acc)|None, "web": ...}}。
+
+    桌面账号有 session（能鉴权对话），Web 账号是 cookies（仅 /web/api/*）；
+    同手机号的两条是同一个人，界面层合并为一行。
+    """
+    groups: dict[str, dict] = {}
+    for i, acc in enumerate(accs):
+        is_web = acc.get("kind") == "web" or \
+            (not acc.get("session") and acc.get("cookies"))
+        phone = str(acc.get("phone") or acc.get("userid") or f"#{i + 1}")
+        g = groups.setdefault(phone, {"desktop": None, "web": None})
+        g["web" if is_web else "desktop"] = (i, acc)
+    return groups
+
+
+def _loomy_row_state(g: dict) -> tuple[str, bool]:
+    """合并行的 (status, enabled)：任一半边启用即算启用；
+    连接态看还有没有可用凭据（桌面 session 或 Web cookies）。"""
+    halves = [h for h in (g.get("desktop"), g.get("web")) if h]
+    if not halves:
+        return "disconnected", False
+    enabled = any(acc.get("enabled", True) is not False for _, acc in halves)
+    if not enabled:
+        return "disabled", False
+    for _, acc in halves:
+        if _account_status(acc) == "enabled":
+            return "enabled", True
+    return "disconnected", True
+
+
+def _loomy_group_credits(lc, g: dict) -> tuple[float | None, str]:
+    """查一个 Loomy 合并组的积分总额。返回 (total|None, err)。
+
+    数据源优先 **Web 会话**（master 指定：积分/签到走 Web 通道）——
+    `/web/api/auth/points-summary` 返回 {permanent, daily}；
+    Web 不可用（无 cookie/会话失效）再回退桌面 session 打
+    `/api/v1/points/records`（字段 balance/dailyBalance/availableBalance，
+    ⚠️ 与 first-login 的 permanentBalance 不同名，认错会丢一半，踩过）。
+    """
+    d, w = g.get("desktop"), g.get("web")
+    if w and w[1].get("enabled", True) is not False and w[1].get("cookies"):
+        ok, r = lc.web_request_json("GET", "/web/api/auth/points-summary",
+                                    w[1].get("cookies") or {})
+        if ok and isinstance(r, dict):
+            data = r.get("data") or {}
+            return float(data.get("permanent") or 0) + float(data.get("daily") or 0), ""
+        last_web_err = str(r)[:120]
+    else:
+        last_web_err = "Web 会话不可用"
+    if d and d[1].get("enabled", True) is not False:
+        token = str(d[1].get("session") or "").strip()
+        if token:
+            ok, r = lc.query_points(token)
+            if ok and isinstance(r, dict) and r.get("code") == "000000":
+                data = r.get("data") or {}
+                total = float(data.get("availableBalance") or 0)
+                if not total:
+                    total = float(data.get("balance") or 0) + \
+                        float(data.get("dailyBalance") or 0)
+                return total, ""
+            return None, str(r)[:120]
+    return None, last_web_err
 
 
 def _history_accounts():
@@ -205,6 +367,117 @@ async def accounts_credits(channel: str | None = None):
             "cached": bool(_CREDIT_CACHE), "refreshedAt": _CREDIT_CACHE_TS}
 
 
+@router.get("/accounts/signin")
+async def accounts_signin(channel: str | None = None):
+    """今日签到结果（**只读本地流水库，不联网**，毫秒级）。
+
+    语义：回答「该账号今天签到成功了吗」，供账号管理页的「每日签到」列展示。
+    证据取自 `data/usage_history.db` 的 gain 表 —— 有当日入账记录即签到成功
+    （TRAE 写 `checkin`，WorkBuddy 系写官方 checkin-activity-status 的
+    today_checked_in 或当日入账的资源包，注册/订阅类礼包已排除）。
+    这是**客观入账凭证**，比问上游签到接口可靠。
+
+    注：WorkBuddy 国际版无签到渠道（2026-09-13 官方确认，服务端对国际账号
+    恒报 active=false），gain 表天然无记录 → 前端按「无渠道」渲染「—」。
+
+    Loomy：不进流水库（usage_collector 不采集），其凭证来自
+    `data/loomy_signin_state.json` —— signin_all 每日领取（Web 账号 = 登录
+    校验 + 积分摘要；桌面账号 = first-login 领取接口）成功后写入的按天缓存，
+    回答「今天领没领到」同样有本地凭证。领取失败/未运行则该账号缺席，
+    前端按「未签到」渲染。amount 取当日每日额度（dailyBalance）。
+
+    返回 {signin: {<accountId>: {checkedIn, amount, kinds, ts}}, day, updatedAt}
+    —— key 与 GET /accounts 的 account id 同构（`通道:uid`），前端可直接对表。
+    """
+    def _work() -> dict:
+        _, ca = _history_accounts()
+        day = ca.day_str(time.time()) if ca is not None else time.strftime("%Y-%m-%d")
+        by_platform = ca.gains_accounts(day) if ca is not None else {}
+        out: dict[str, dict] = {}
+        # Loomy gain 表的 uid（桌面 userid / web:<phone>）要映射到合并行 id ——
+        # 否则同一个人的凭证会以两个 key 出现，界面长出第二行
+        loomy_rid_by_uid: dict[str, str] = {}
+        if not channel or channel == "all" or channel == "Loomy":
+            try:
+                accs = ((_read_config().get("providers") or {})
+                        .get("loomy") or {}).get("accounts") or []
+                for phone, g in _loomy_groups(accs).items():
+                    d, w = g.get("desktop"), g.get("web")
+                    rid = _account_id("Loomy", (d or w)[1], (d or w)[0])
+                    for half in (d, w):
+                        if half:
+                            loomy_rid_by_uid[str(half[1].get("userid") or "")] = rid
+            except Exception as e:  # noqa: BLE001
+                logger.warning("loomy 合并行映射失败: %s", e)
+        for ch, platform in CHANNEL_TO_PLATFORM.items():
+            if channel and channel != "all" and ch != channel:
+                continue
+            for uid, info in (by_platform.get(platform) or {}).items():
+                # Loomy 的映射目标已是完整合并行 id（`Loomy:<userid>`），
+                # 不能再套一层 `{ch}:` 前缀（会得到 Loomy:Loomy:...）
+                if ch == "Loomy" and str(uid) in loomy_rid_by_uid:
+                    key = loomy_rid_by_uid[str(uid)]
+                else:
+                    key = f"{ch}:{uid}"
+                out[key] = {
+                    "checkedIn": True,
+                    "amount": info["amount"],
+                    "kinds": info["kinds"],
+                    "ts": info["ts"],
+                }
+
+        # Loomy: 读按天状态缓存（loomy_client 写、这里只读，保持本端点零联网）。
+        # 缓存按 userid 记（web:<phone> / 桌面 userid），但界面是合并行 ——
+        # 把同手机号两条记录的凭证都挂到合并行的 id 上（master 指定：
+        # 签到/积分走 Web 通道），Web 缺席时用桌面自己的凭证兜底。
+        if not channel or channel == "all" or channel == "Loomy":
+            try:
+                lc = _loomy_client()
+                state = lc.load_daily_state(day) or {}
+                cfg = _read_config()
+                accs = ((cfg.get("providers") or {}).get("loomy") or {}) \
+                    .get("accounts") or []
+                for phone, g in _loomy_groups(accs).items():
+                    d, w = g.get("desktop"), g.get("web")
+                    rid = _account_id("Loomy", (d or w)[1], (d or w)[0])
+                    # Web 凭证优先；同组桌面自己的记录作为兜底
+                    entries = []
+                    for half in (w, d):
+                        if not half:
+                            continue
+                        uid = str(half[1].get("userid") or "")
+                        st = state.get(uid)
+                        if isinstance(st, dict) and st.get("claimed"):
+                            entries.append(st)
+                    if not entries:
+                        continue  # 该行今天没有任何领取凭证 → 前端按「未签到」
+                    best = entries[0]
+                    amount = 0.0
+                    for k in ("dailyBalance", "currentBalance"):
+                        try:
+                            v = best.get(k)
+                            if v is not None:
+                                amount = max(amount, float(v))
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                    kinds = ["daily-login"]
+                    if best.get("alreadyProcessed"):
+                        kinds = ["daily-login(已领过)"]
+                    out[rid] = {
+                        "checkedIn": True,
+                        "amount": amount,
+                        "kinds": kinds,
+                        "ts": int(best.get("ts") or 0),
+                    }
+            except Exception as e:  # noqa: BLE001
+                logger.warning("loomy 签到状态缓存读取失败: %s", e)
+
+        return {"signin": out, "day": day, "updatedAt": _now()}
+
+    return await _in_thread(_work)
+
+
 @router.post("/accounts/credits/refresh")
 async def refresh_account_credits(payload: dict = Body(default={})):
     """联网拉取各账号真实积分余额（通用 / Work 双池）。
@@ -237,6 +510,19 @@ async def refresh_account_credits(payload: dict = Body(default={})):
             domain = seg.get("domain") or ""
             product = seg.get("product") or ""
             default_dev = seg.get("device_id") or ""
+            # Loomy：按手机号合并成一行后再刷新（同手机号的桌面+Web 是同一个人，
+            # 积分只有一份），缓存键 = 界面行的 id，与 GET /accounts 直接对表。
+            if ch == "Loomy":
+                lc = _loomy_client()
+                for phone, g in _loomy_groups(accounts).items():
+                    d, w = g.get("desktop"), g.get("web")
+                    rid = _account_id(ch, (d or w)[1], (d or w)[0])
+                    total, err = _loomy_group_credits(lc, g)
+                    if err and total is None:
+                        errors.append(f"{rid}: {err}")
+                        continue
+                    result[rid] = {"credits": float(total or 0), "workCredits": 0.0}
+                continue
             for i, acc in enumerate(accounts):
                 aid = _account_id(ch, acc, i)
                 try:
@@ -270,7 +556,11 @@ async def refresh_account_credits(payload: dict = Body(default={})):
 
 @router.post("/accounts/toggle")
 async def toggle_account(payload: dict = Body(...)):
-    """启用/关闭账号（写 config.json）。body: {id}"""
+    """启用/关闭账号（写 config.json）。body: {id}
+
+    Loomy 合并行：id 对应同手机号的桌面+Web 两条记录，开关同时作用于
+    两条（积分走 Web、对话走桌面，只切一边会让行状态永远对不上）。
+    """
     acc_id = str(payload.get("id") or "")
     if ":" not in acc_id:
         raise HTTPException(status_code=400, detail="id 格式应为 '<channel>:<uid>'")
@@ -282,7 +572,27 @@ async def toggle_account(payload: dict = Body(...)):
         if not pkey:
             raise HTTPException(status_code=400, detail=f"未知通道 {channel}")
         seg = (cfg.get("providers") or {}).get(pkey) or {}
-        for i, acc in enumerate(seg.get("accounts") or []):
+        accs = seg.get("accounts") or []
+        if channel == "Loomy":
+            for phone, g in _loomy_groups(accs).items():
+                d, w = g.get("desktop"), g.get("web")
+                if _account_id(channel, (d or w)[1], (d or w)[0]) != acc_id:
+                    continue
+                new_enabled = None
+                for half in (d, w):
+                    if not half:
+                        continue
+                    idx, acc = half
+                    if new_enabled is None:
+                        # 以「行当前状态」取反：任一半边启用即视为启用
+                        new_enabled = not any(
+                            a.get("enabled", True) is not False
+                            for _i, a in (d, w) if a)
+                    acc["enabled"] = new_enabled
+                _write_config(cfg)
+                return {"ok": True, "id": acc_id, "enabled": bool(new_enabled)}
+            raise HTTPException(status_code=404, detail="账号不存在")
+        for i, acc in enumerate(accs):
             if _account_id(channel, acc, i) == acc_id:
                 acc["enabled"] = acc.get("enabled", True) is False
                 _write_config(cfg)
@@ -294,7 +604,11 @@ async def toggle_account(payload: dict = Body(...)):
 
 @router.post("/accounts/delete")
 async def delete_account(payload: dict = Body(...)):
-    """删除账号（写 config.json）。body: {id}"""
+    """删除账号（写 config.json）。body: {id}
+
+    Loomy 合并行：同手机号的桌面+Web 两条记录一并删除
+    （它们是同一个人，留半边会在界面重新长出一行孤儿账号）。
+    """
     acc_id = str(payload.get("id") or "")
     if ":" not in acc_id:
         raise HTTPException(status_code=400, detail="id 格式应为 '<channel>:<uid>'")
@@ -307,10 +621,21 @@ async def delete_account(payload: dict = Body(...)):
             raise HTTPException(status_code=400, detail=f"未知通道 {channel}")
         seg = (cfg.get("providers") or {}).get(pkey) or {}
         accs = seg.get("accounts") or []
-        keep = [a for i, a in enumerate(accs)
-                if _account_id(channel, a, i) != acc_id]
-        if len(keep) == len(accs):
+        drop: set[int] = set()
+        if channel == "Loomy":
+            for phone, g in _loomy_groups(accs).items():
+                d, w = g.get("desktop"), g.get("web")
+                if _account_id(channel, (d or w)[1], (d or w)[0]) == acc_id:
+                    drop = {d[0] for d in (d,) if d} | {w[0] for w in (w,) if w}
+                    break
+        else:
+            for i, acc in enumerate(accs):
+                if _account_id(channel, acc, i) == acc_id:
+                    drop = {i}
+                    break
+        if not drop:
             raise HTTPException(status_code=404, detail="账号不存在")
+        keep = [a for i, a in enumerate(accs) if i not in drop]
         seg["accounts"] = keep
         cfg.setdefault("providers", {})[pkey] = seg
         _write_config(cfg)
@@ -344,12 +669,23 @@ async def launch_login(payload: dict = Body(default={})):
         import subprocess
         import sys
         script = os.path.join(BASE, "scripts", script_name)
-        if not os.path.exists(script):
+        frozen = bool(getattr(sys, "frozen", False))
+        if not frozen and not os.path.exists(script):
             raise HTTPException(status_code=501,
                                 detail=f"{script_name} 不存在（该通道未提供登录脚本）")
-        exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
-        if not os.path.exists(exe):
-            exe = sys.executable
+        if frozen:
+            # ★ 打包态: 安装包不含 scripts\*.py, 也没有独立 python —— 与
+            #   signin/usage 同机制, 把脚本路径当「路由标记」传给 task exe,
+            #   由 task_main 按文件名路由到内置 login_* 模块 (playwright 驱动
+            #   已随包, 浏览器走系统 msedge, 用户机无需另装)。路径参数本身
+            #   不要求存在, 不可用 os.path.exists 拦截 (app_paths 的老警告)。
+            exe = os.path.join(BASE, "open-ai-task.exe")
+            cmd = [exe, script]
+        else:
+            exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
+            if not os.path.exists(exe):
+                exe = sys.executable
+            cmd = [exe, script]
 
         # ★ 必须 CREATE_NO_WINDOW：登录脚本本身只在终端里打印进度，
         #   真正的交互发生在它打开的浏览器里（扫码/密码）。原实现用
@@ -363,16 +699,74 @@ async def launch_login(payload: dict = Body(default={})):
         try:
             os.makedirs(logs_dir, exist_ok=True)
             log_path = os.path.join(logs_dir, f"login_{channel}.log")
+            # ★ 先量出当前文件长度再打开：这是本次登录输出的**起始偏移**。
+            #   日志文件是追加写的，历次登录的输出都在里面；前端从该偏移开始跟随，
+            #   才只会看到本次脚本的输出，而不是把上次登录的旧输出当成新的。
+            log_offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
             logf = open(log_path, "ab", buffering=0)
         except Exception:  # noqa: BLE001
-            logf, log_path = subprocess.DEVNULL, ""
+            logf, log_path, log_offset = subprocess.DEVNULL, "", 0
 
-        subprocess.Popen([exe, script], cwd=BASE,  # noqa: S603
-                         creationflags=flags,
-                         stdin=subprocess.DEVNULL,
-                         stdout=logf, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, cwd=BASE,  # noqa: S603
+                                creationflags=flags,
+                                stdin=subprocess.DEVNULL,
+                                stdout=logf, stderr=subprocess.STDOUT)
+        # 留句柄供 /accounts/login/log 判断「还在跑吗」（同通道重复登录则替换旧的）
+        _LOGIN_PROCS[channel] = proc
         return {"ok": True, "launched": script_name, "channel": channel,
-                "logFile": log_path}
+                "logFile": log_path, "logOffset": log_offset, "pid": proc.pid}
+
+    return await _in_thread(_work)
+
+
+@router.get("/accounts/login/log")
+async def login_log(channel: str, offset: int = 0, maxBytes: int = 131072):
+    """增量读取登录脚本输出（供桌面端把脚本输出实时贴进操作日志）。
+
+    参数
+    ----
+    channel : Trae / WorkBuddy / WorkBuddy_IE
+    offset  : 上次读到的字节偏移；首次跟随用 POST /accounts/login 返回的 logOffset
+    maxBytes: 单次最多返回多少字节（默认 128KB），防止一次拉回整份历史日志
+
+    返回 ``{text, offset, size, running, exists, exitCode}``：
+      * ``text``      —— 自 offset 起的新增内容（UTF-8 解码，坏字节用替换字符兜底）
+      * ``offset``    —— 下次该传的偏移（= 本次读到的位置）
+      * ``running``   —— 脚本是否仍在运行（前端据此决定继续跟随还是收尾）
+      * ``exitCode``  —— 已结束时的退出码（None 表示仍在跑或句柄已丢失）
+
+    注意 ``offset`` 是**字节**偏移，不是字符数：日志文件是 `open(path, "ab")`
+    追加写的，按字节定位才不会在中文内容上错位。
+    """
+    def _work() -> dict:
+        path = os.path.join(BASE, "logs", f"login_{channel}.log")
+        proc = _LOGIN_PROCS.get(channel)
+        running = proc is not None and proc.poll() is None
+        exit_code = None if (proc is None or running) else proc.returncode
+
+        if not os.path.exists(path):
+            return {"text": "", "offset": 0, "size": 0, "running": running,
+                    "exists": False, "exitCode": exit_code}
+
+        size = os.path.getsize(path)
+        start = max(0, int(offset))
+        # 文件被外部清空/轮转时 offset 会越过文件尾：夹回 0，否则永远读不到新内容
+        if start > size:
+            start = 0
+        cap = max(1, min(int(maxBytes), 4 * 1024 * 1024))
+        with open(path, "rb") as f:
+            f.seek(start)
+            chunk = f.read(cap)
+        new_offset = start + len(chunk)
+        return {
+            "text": chunk.decode("utf-8", errors="replace"),
+            "offset": new_offset,
+            "size": size,
+            # 还有积压时本轮不算读完，让前端立刻再拉一次而不是等下一个轮询周期
+            "running": running or new_offset < size,
+            "exists": True,
+            "exitCode": exit_code,
+        }
 
     return await _in_thread(_work)
 
@@ -542,6 +936,26 @@ def _model_rates() -> dict:
         except Exception as e:  # noqa: BLE001
             logger.warning("%s 异常: %s", fn_name, e)
 
+    # ── Loomy：静态倍率表 (逆向自 Loomy 客户端, 值来自上游) ──
+    # 键同时登记 上游id / lm- 前缀 / loomy- 历史前缀 / 显示名, 前端任取其一可匹配
+    loomy_rates = {
+        "deepseek-v4-flash-0731": 3.0,
+        "mimo-v2.5": 3.3,
+        "MiniMax-M3": 4.0,
+        "Kimi-k2.6": 6.5,
+        "qwen-3.8-max": 12.0,
+        "GLM-5.3-Flash": 0.8,
+        "qwen3.8-flash": 0.8,
+        "spark-x": 0.0,
+        "doubao-seed-2.0-mini": 0.8,
+        "qwen3.5-flash": 1.0,
+    }
+    table: dict[str, float] = {}
+    for mid, r in loomy_rates.items():
+        for k in (mid, f"lm-{mid}", f"loomy-{mid}"):
+            table[k] = r
+    out["Loomy"] = table
+
     # ── 配置别名回填 ──
     # config.json 里的别名（flash / pro / trae-flash / deepseek-flash …）本身
     # 不在上游倍率表里，但它们指向的模型有倍率，直接继承即可 ——
@@ -667,6 +1081,70 @@ async def refresh_models(payload: dict = Body(default={})):
 
 # ─────────────────────────── 积分 / 流水 ───────────────────────────
 
+# ─────────────────────────── Auto 路由连（虚拟模型路由链） ───────────────────────────
+# config.json:
+#   "auto_chain": {"enabled": true, "timeout": 120, "models": ["tr-...", "wb-...", "loomy-..."]}
+# 虚拟模型名与核心逻辑见 auto_router.py；本端点只做配置读写。
+
+def _load_auto_chain_cfg(cfg: dict | None = None) -> dict:
+    """读取 Auto 路由连配置（归一化后返回）。"""
+    cfg = cfg if cfg is not None else _read_config()
+    ch = cfg.get("auto_chain") or {}
+    try:
+        timeout = int(ch.get("timeout") or 120)
+    except (TypeError, ValueError):
+        timeout = 120
+    return {"enabled": bool(ch.get("enabled", True)),
+            "timeout": timeout,
+            "models": [m for m in (ch.get("models") or []) if m]}
+
+
+@router.get("/auto-chain")
+async def get_auto_chain():
+    """读取 Auto 路由连配置 + 当前全量可选模型（供链编辑界面下拉）。"""
+    chain = _load_auto_chain_cfg()
+    all_models: list[str] = []
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+        for prov in providers.values():
+            try:
+                all_models.extend(m.get("id") for m in prov.list_models() if m.get("id"))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception as e:  # noqa: BLE001
+        logger.warning("auto-chain 取模型列表失败: %s", e)
+    return {"chain": chain,
+            "availableModels": sorted(set(all_models)),
+            "ts": _now()}
+
+
+@router.post("/auto-chain")
+async def set_auto_chain(payload: dict = Body(...)):
+    """保存 Auto 路由连配置。body: {enabled, timeout, models[]}。"""
+    models = payload.get("models")
+    if not isinstance(models, list):
+        raise HTTPException(status_code=400, detail="models 必须是数组")
+    models = [str(m).strip() for m in models if str(m).strip()]
+    timeout = payload.get("timeout", 120)
+    try:
+        timeout = max(0, int(timeout))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="timeout 必须是整数秒")
+
+    def _work() -> dict:
+        cfg = _read_config()
+        cfg["auto_chain"] = {
+            "enabled": bool(payload.get("enabled", True)),
+            "timeout": timeout,
+            "models": models,
+        }
+        _write_config(cfg)
+        return {"ok": True, "chain": cfg["auto_chain"]}
+
+    return await _in_thread(_work)
+
+
 @router.get("/credits/today")
 async def credits_today(channel: str | None = None, limit: int = 500):
     """今日积分概况 + 逐笔流水（本地库聚合，不联网）。
@@ -742,7 +1220,8 @@ async def credits_week(offset: int = 0, channel: str | None = None):
         daily: dict[str, dict] = {}
         for d in range(7):
             day = (monday + _dt.timedelta(days=d)).isoformat()
-            daily[day] = {"day": day, "Trae": 0.0, "WorkBuddy": 0.0, "WorkBuddy_IE": 0.0}
+            daily[day] = {"day": day, "Trae": 0.0, "WorkBuddy": 0.0,
+                          "WorkBuddy_IE": 0.0, "Loomy": 0.0}
 
         stats = {"gained": 0.0, "used": 0.0}
         try:
@@ -768,6 +1247,145 @@ async def credits_week(offset: int = 0, channel: str | None = None):
             "offset": offset,
             "updatedAt": _now(),
         }
+
+    return await _in_thread(_work)
+
+
+# ─────────────────────────── Loomy 登录（图形化） ───────────────────────────
+# 两条通道都能出可用账号, 但**只有桌面通道的 session 能鉴权对话**:
+#   * 桌面通道 (讯飞账号服务 account.xfinfr.com, HMAC 签名): 短信登录 → session
+#     —— 这个 session 同时当 chat 的 Bearer 与 token 头, 积分从本账号扣。
+#   * Web 通道 (loomy.xunfei.cn): 短信登录 → cookie 会话, 仅 /web/api/* 可用,
+#     打 /api/v1/chat/completions 会回 100002。它的价值是查余额/签到。
+#
+# 鉴权整改后「一人一号、各扣各的」全靠桌面通道, 因此界面默认走桌面登录;
+# Web 通道作为补充保留 (历史账号仍可查积分)。
+# 结论来源: LOOMY_鉴权整改文档 + 本机实测 (见 MEMORY.md)。
+
+_PHONE_RE = re.compile(r"^1\d{10}$")
+
+
+def _loomy_client():
+    import sys
+    if os.path.join(BASE, "scripts") not in sys.path:
+        sys.path.insert(0, os.path.join(BASE, "scripts"))
+    import loomy_client  # type: ignore
+    return loomy_client
+
+
+@router.post("/accounts/loomy/desktop-send-code")
+async def loomy_desktop_send_code(payload: dict = Body(...)):
+    """桌面通道 (讯飞账号服务) 发送短信验证码。body: {phone} → {ok, messageId|error}。"""
+    phone = str(payload.get("phone") or "").strip()
+    if not _PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确（应为 1 开头的 11 位号码）")
+
+    def _work() -> dict:
+        lc = _loomy_client()
+        ok, r = lc.send_sms_code(phone)
+        if ok:
+            return {"ok": True, "messageId": str(r or "")}
+        return {"ok": False, "messageId": "", "error": str(r)[:200]}
+
+    return await _in_thread(_work)
+
+
+@router.post("/accounts/loomy/desktop-login")
+async def loomy_desktop_login(payload: dict = Body(...)):
+    """桌面通道短信登录。body: {phone, code, messageId}。
+
+    成功后把本账号的 session 写入 config.json providers.loomy.accounts,
+    该 session 即网关对话的 Bearer —— 积分记在该账号自己头上。
+    """
+    phone = str(payload.get("phone") or "").strip()
+    code = str(payload.get("code") or "").strip()
+    message_id = str(payload.get("messageId") or "")
+    if not _PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确")
+    if not re.match(r"^\d{4,8}$", code):
+        raise HTTPException(status_code=400, detail="验证码格式不正确")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="缺少 messageId（请先获取验证码）")
+
+    def _work() -> dict:
+        lc = _loomy_client()
+        ok, r = lc.login_by_sms(phone, code, message_id)
+        if not ok:
+            return {"ok": False, "error": str(r)[:200]}
+        acct = lc.save_session(r.get("userid", ""), r.get("session", ""), phone)
+        return {"ok": True, "userid": acct.get("userid", ""),
+                "name": acct.get("name", "")}
+
+    return await _in_thread(_work)
+
+
+@router.post("/accounts/loomy/send-code")
+async def loomy_send_code(payload: dict = Body(...)):
+    """Web 端发送短信验证码。body: {phone} → {ok, messageId|error}。"""
+    phone = str(payload.get("phone") or "").strip()
+    if not _PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确（应为 1 开头的 11 位号码）")
+
+    def _work() -> dict:
+        lc = _loomy_client()
+        ok, r = lc.web_send_sms_code(phone)
+        if ok and isinstance(r, dict):
+            return {"ok": True, "messageId": r.get("messageId") or ""}
+        return {"ok": False, "messageId": "", "error": str(r)[:200]}
+
+    return await _in_thread(_work)
+
+
+@router.post("/accounts/loomy/web-login")
+async def loomy_web_login(payload: dict = Body(...)):
+    """Web 端短信验证码登录。body: {phone, code, messageId}。
+
+    成功后 cookie 会话写入 config.json providers.loomy.accounts（kind=web）。
+    注意: Web cookie 仅能访问 /web/api/*（查余额/签到）, **不能鉴权对话** ——
+    对话请用 desktop-login 拿 session。
+    """
+    phone = str(payload.get("phone") or "").strip()
+    code = str(payload.get("code") or "").strip()
+    message_id = str(payload.get("messageId") or "")
+    if not _PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确")
+    if not re.match(r"^\d{4,8}$", code):
+        raise HTTPException(status_code=400, detail="验证码格式不正确")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="缺少 messageId（请先获取验证码）")
+
+    def _work() -> dict:
+        lc = _loomy_client()
+        ok, r = lc.web_login(phone, code, message_id)
+        if not ok:
+            return {"ok": False, "error": str(r)[:200]}
+        acct = lc.save_web_session(phone, r["cookies"], r.get("deviceId", ""), r.get("me"))
+        return {"ok": True, "userid": acct.get("userid", ""), "name": acct.get("name", "")}
+
+    return await _in_thread(_work)
+
+
+@router.get("/accounts/loomy/session")
+async def loomy_web_session(phone: str):
+    """校验某手机号的 Web 会话是否仍有效（GET /web/api/auth/me 探测）。"""
+    if not _PHONE_RE.match(phone):
+        raise HTTPException(status_code=400, detail="手机号格式不正确")
+
+    def _work() -> dict:
+        lc = _loomy_client()
+        for a in lc.load_web_accounts():
+            if a.get("phone") == phone:
+                ok, me = lc.web_me(a.get("cookies") or {})
+                nick = ""
+                if ok and isinstance(me, dict):
+                    d = me.get("data") or me
+                    for k in ("nickname", "nickName", "name", "phone"):
+                        if d.get(k):
+                            nick = str(d[k])
+                            break
+                return {"valid": bool(ok), "nickname": nick, "checkedAt": _now()}
+        return {"valid": False, "nickname": "", "checkedAt": _now(),
+                "error": "未找到该手机号的 Web 会话"}
 
     return await _in_thread(_work)
 
@@ -933,6 +1551,42 @@ def _startup_dir() -> str | None:
                         "Programs", "Startup")
 
 
+def _autostart_vbs() -> str:
+    r"""生成「开机自启」的 VBS 内容 —— 必须按安装形态分叉。
+
+    ★ 原来两侧都固定指向 `<安装根>\start_hidden.ps1`，那是**源码形态**的脚本:
+      它依赖 `.venv\` 与 `runtime\Scripts\`, 而 exe 打包安装里这两样都不存在,
+      且 start_hidden.ps1 本身也没有打进安装包 —— 于是用户在界面里打开自启开关,
+      VBS 写得漂漂亮亮, 开机时却什么都不发生 (静默失效, 无任何报错)。
+
+    打包形态改为两步, 都以隐藏窗口运行:
+      1) `open-ai.exe start`  —— 先把 Broker/网关/Trae/定时任务整棵树拉起来,
+         这样即使桌面端哪天又起不来, 后端仍然在跑 (别让界面成为唯一的启动路径);
+      2) `desktop\open-ai-desktop.exe --minimized` —— 再开界面并驻留托盘,
+         托盘图标必须由桌面端创建 (只拉 Broker 会得到「后端在跑但托盘没图标」)。
+    """
+    head = 'Set sh = CreateObject("WScript.Shell")\r\n'
+    packaged = os.path.isfile(os.path.join(BASE, "open-ai-gateway.exe"))
+    if packaged:
+        cli = os.path.join(BASE, "open-ai.exe")
+        app = os.path.join(BASE, "desktop", "open-ai-desktop.exe")
+        lines = []
+        if os.path.isfile(cli):
+            lines.append('sh.Run """%s"" start", 0, True' % cli)
+        if os.path.isfile(app):
+            lines.append('sh.Run """%s"" --minimized", 0, False' % app)
+        if not lines:
+            raise HTTPException(
+                status_code=500,
+                detail="安装目录里找不到 open-ai.exe 或 desktop\\open-ai-desktop.exe，"
+                       "无法配置开机自启（安装包可能不完整）")
+        return head + "\r\n".join(lines) + "\r\n"
+    # 源码形态：沿用隐藏 PowerShell 引导（它自己会建 shim 并调 bootstrap）
+    ps1 = os.path.join(BASE, "start_hidden.ps1")
+    return (head + 'sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass '
+            '-WindowStyle Hidden -File ""' + ps1 + '""", 0, False\r\n')
+
+
 def _autostart_target() -> str | None:
     """开机自启的落地点：启动文件夹下的 open-ai-autostart.vbs
 
@@ -1000,12 +1654,7 @@ async def set_autostart(payload: dict = Body(...)):
             raise HTTPException(status_code=500, detail="无法定位启动文件夹")
         try:
             if enable:
-                ps1 = os.path.join(BASE, "start_hidden.ps1")
-                vbs = (
-                    'Set sh = CreateObject("WScript.Shell")\r\n'
-                    'sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass '
-                    '-WindowStyle Hidden -File ""' + ps1 + '""", 0, False\r\n'
-                )
+                vbs = _autostart_vbs()
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 # 启动文件夹路径可能含中文 → 用 GBK 写入，WScript 才能正确读取
                 with open(dst, "w", encoding="gbk", newline="") as f:
@@ -1040,7 +1689,7 @@ async def check_update(payload: dict = Body(default={})):
         try:
             import urllib.request
             req_ = urllib.request.Request(
-                "https://api.github.com/repos/BOY-Chinese/open-ai/releases/latest",
+                "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO,
                 headers={"Accept": "application/vnd.github+json",
                          "User-Agent": "open-ai-gateway"})
             with urllib.request.urlopen(req_, timeout=8) as resp:  # noqa: S310

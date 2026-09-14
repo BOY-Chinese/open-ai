@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import {
   BarChart,
   Bar,
@@ -31,6 +31,7 @@ import { TableEmpty } from '@/components/ui/table'
 import { VirtualTable } from '@/components/data/VirtualTable'
 import { useToast } from '@/components/feedback/Toast'
 import { useAsync } from '@/hooks/useAsync'
+import { useTheme } from '@/hooks/useTheme'
 import { backend } from '@/lib/dataSource'
 import { cn, fmtCredit, fmtTime, shortDay, toDayKey } from '@/lib/utils'
 import {
@@ -39,7 +40,7 @@ import {
   type UsageRow,
   channelMeta,
 } from '@/types/domain'
-import { SERIES_COLORS, type SeriesColor } from '@/config/chart'
+import { seriesColors, type SeriesColor } from '@/config/chart'
 
 type ViewMode = 'today' | 'week'
 
@@ -149,6 +150,14 @@ export function CreditsPage() {
   const [view, setView] = useState<ViewMode>('today')
   const [channel, setChannel] = useState<ChannelFilter>('all')
   const [weekOffset, setWeekOffset] = useState(0)
+
+  /**
+   * 图表配色随主题切换：亮色系列在白底上不可见、暗色系列在白底上才够亮，
+   * 一套值无法同时满足两套主题（详见 config/chart.ts）。
+   * 图例 / Tooltip / 柱子共用这一个数组，保证三者配色同源。
+   */
+  const { resolved } = useTheme()
+  const colors = useMemo(() => seriesColors(resolved), [resolved])
 
   /* 今日数据 */
   const today = useAsync(() => backend.getToday(channel), [channel], null)
@@ -373,7 +382,7 @@ export function CreditsPage() {
             </span>
             <span className="ml-auto flex items-center gap-3">
               {/* 单通道筛选时只显示该通道图例，避免暗示图中有其他系列 */}
-              {SERIES_COLORS.filter((c) => channel === 'all' || c.key === channel).map((c) => (
+              {colors.filter((c) => channel === 'all' || c.key === channel).map((c) => (
                 <span key={c.key} className="flex items-center gap-1.5 text-sm text-fg-subtle">
                   <span
                     aria-hidden
@@ -416,9 +425,9 @@ export function CreditsPage() {
                   />
                   <RTooltip
                     cursor={{ fill: 'hsl(var(--bg-card-hover))' }}
-                    content={<ChartTooltip colors={SERIES_COLORS} />}
+                    content={<ChartTooltip colors={colors} />}
                   />
-                  {SERIES_COLORS.map((c) => (
+                  {colors.map((c) => (
                     <Bar
                       key={c.key}
                       dataKey={c.key}

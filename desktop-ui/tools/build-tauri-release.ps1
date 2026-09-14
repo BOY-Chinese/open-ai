@@ -5,13 +5,27 @@
 #   TAURI_ENV_DEBUG=false  → 生产（用 frontendDist 内嵌资源）
 #   unset / true           → 开发（连 devUrl 127.0.0.1:1420）
 $ErrorActionPreference = 'Continue'
-$Root      = 'D:\app\dsh_plugin\open-ai'
+# 仓库根 = 本脚本所在目录 (desktop-ui/tools) 上溯两级。
+# ★ 不再写死 D:\app\... —— 那是开发机的私有布局, 别人 clone 下来必然跑不通。
+$Root      = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Toolchain = "$Root\toolchain\bin"
 $TauriDir  = "$Root\desktop-ui\src-tauri"
-$CargoHome = 'C:\Users\Lenovo\.cargo'
+# CARGO_HOME 默认落在用户目录下, 而该目录名就是本机登录用户名 —— 不能写死
+$CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 
 $env:CARGO_HOME = $CargoHome
 $env:PATH = "$Toolchain;$CargoHome\bin;$env:PATH"
+
+# ★ 把构建期绝对路径从二进制里剥掉。
+#   rustc 会把 panic 位置等信息以**字符串字面量**留在 exe 里, 于是最终用户的
+#   安装包中会躺着 C:\Users\<name>\.cargo\registry\... 这类开发机路径
+#   (换机即失效, 且泄漏本机用户名 —— 隐私检查会拦它)。
+#   --remap-path-prefix 把这些前缀重写成中性名字, 不影响功能, 只影响 panic 回栈
+#   里显示的路径。两条都要: 依赖走 CargoHome, 本项目源码走 $Root。
+$env:RUSTFLAGS = (
+    "--remap-path-prefix=$CargoHome=/.cargo " +
+    "--remap-path-prefix=$Root=/open-ai"
+)
 
 # ★ 生产模式标志（这是「虚拟机打不开页面」那次失败的关键）
 $env:TAURI_ENV_DEBUG = 'false'

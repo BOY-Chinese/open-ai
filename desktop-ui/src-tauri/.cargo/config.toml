@@ -1,7 +1,10 @@
 # 指向手工组装的独立 Rust 工具链，避免经过 rustup shim
 # （本机 rustup 元数据不完整，shim 会报 "Missing manifest"）
+#
+# ★ 用**相对路径**而不是绝对路径: 绝对路径一旦写死, 换机器/换盘符就编译不了,
+#   而本仓库定位为可移植的开发副本。此处相对 src-tauri/ 上溯三级即仓库根。
 [build]
-rustc = "D:/app/dsh_plugin/open-ai/toolchain/bin/rustc.exe"
+rustc = "../../../toolchain/bin/rustc.exe"
 
 [net]
 git-fetch-with-cli = true

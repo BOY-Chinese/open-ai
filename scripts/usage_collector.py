@@ -45,10 +45,17 @@ try:
 except Exception:
     pass
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
-DB_PATH = os.path.join(BASE, '..', 'data', 'usage_history.db')
-LOG_PATH = os.path.join(BASE, '..', 'logs', 'collector.log')
+# ★ 同 credits_api: 打包态 __file__ 相对路径会跟着 CWD 走, 必须钉死安装根。
+try:
+    import app_paths as _ap
+    OPENAI_CFG = _ap.CONFIG_PATH
+    DB_PATH = os.path.join(_ap.DATA_DIR, 'usage_history.db')
+    LOG_PATH = os.path.join(_ap.LOGS_DIR, 'collector.log')
+except Exception:  # 源码态单独运行的兜底
+    BASE = os.path.dirname(os.path.abspath(__file__))
+    OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
+    DB_PATH = os.path.join(BASE, '..', 'data', 'usage_history.db')
+    LOG_PATH = os.path.join(BASE, '..', 'logs', 'collector.log')
 
 TRAE_URL = 'https://api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session'
 WB_REQ_URL = 'https://copilot.tencent.com/billing/meter/get-user-request-usage'
@@ -79,6 +86,15 @@ WB_DEFAULT_SPEC = WB_SPEC_BY_PLATFORM['workbuddy']
 COLLECT_INTERVAL = 5 * 60          # 采集周期: 5 分钟 (daemon 与 GUI 页面刷新同节奏)
 WINDOW_DAYS = 3                    # 每轮回看窗口 (天): 周期 5min << 3d, 覆盖停机补漏
 RETENTION_DAYS = 31                # 本地缓存保留 1 个月 (master 指定)
+
+# ---- Loomy 采集 (本账号凭据, 台账接口) ----
+# 消耗/获取统一走 loomyad.xunfei.cn 的 /api/v1/points/records 逐条台账:
+#   debit  = 模型调用扣分
+#   credit = 邀请/任务等发放 (每日登录发放不在台账, 由 signin 状态缓存补 gain)
+#
+# ⚠️ 鉴权整改: 早期版本用硬编码的共享 apiKey 读台账, 所有人的消耗都归到同一个
+# 陌生账号 (uid 取 key 前 8 位)。现在逐账号用各自的登录态读取, uid = 账号 userid,
+# 看板上每个账号的消耗各归各的。详见 LOOMY_鉴权整改文档。
 
 
 def now_ts():
@@ -192,19 +208,41 @@ def trae_checkin_status(acc, device_id):
     return d.get('credits'), bool(d.get('checked_in')), None
 
 
-def wb_checkin_status(headers, base='https://copilot.tencent.com'):
-    """WorkBuddy 系签到状态. 返回 (today_credit or None, checked_in, err)。
-    ⚠️ 实测: 账号 active=false 时该接口恒报 today_checked_in=False/today_credit=0,
-    与实际签到入账脱节 (签到其实成功, 积分以资源包形式入账)。勿以此接口为统计依据。"""
-    code, raw = _post_json(f'{base}/billing/meter/checkin-status', headers, {})
+def wb_checkin_activity_status(headers, base='https://copilot.tencent.com'):
+    """WorkBuddy 系签到活动状态 (官方在用接口 checkin-activity-status).
+    返回 (today_credit or None, checked_in, active, err)。
+
+    2026-09-13 切换: 旧 checkin-status 是废弃接口返回死数据 (国内账号实测
+    active=false/streak=0, 同一时刻新接口 active=true/streak=13); 官方 web/IDE
+    均只用本接口。active=false 表示活动对该账号未开启 (国际版无签到渠道,
+    账号恒为此形态), 此时今日积分记 0 而不是误报。"""
+    code, raw = _post_json(f'{base}/billing/meter/checkin-activity-status', headers, {})
     if code != 200:
-        return None, False, f'HTTP {code}'
+        return None, False, None, f'HTTP {code}'
     try:
         d = json.loads(raw)
     except Exception:
-        return None, False, '解析失败'
+        return None, False, None, '解析失败'
     st = d.get('data') or {}
-    return st.get('today_credit'), bool(st.get('today_checked_in')), None
+    return st.get('today_credit'), bool(st.get('today_checked_in')), \
+        bool(st.get('active')), None
+
+
+# 注册/订阅类礼包: 创建于注册当天的 "Free Plan Subscription" 等, 不是签到入账
+# (实测 2026-09-11 新账号注册当天收到 250+100 两个包, 被旧版误判为签到已入账,
+#  挡住当天真实签到 → 100 分没领)。 Bonus / 签到 / 活跃奖励类才是积分入账凭证。
+_REG_PACK_PATTERNS = (
+    'free plan', 'subscription', 'trial', 'register', 'signup', 'newuser',
+    '新手', '注册', '订阅', '体验计划',
+)
+
+
+def _is_registration_pack(pkg_name):
+    """判断资源包名是否注册/订阅类礼包 (大小写不敏感)。"""
+    name = (pkg_name or '').strip().lower()
+    if not name:
+        return False
+    return any(p in name for p in _REG_PACK_PATTERNS)
 
 
 def wb_today_packs(headers, base='https://copilot.tencent.com'):
@@ -241,8 +279,12 @@ def wb_today_packs(headers, base='https://copilot.tencent.com'):
 def collect_gains(conn, cfg):
     """采集"获取积分": 每账号当日签到入账, 写 gain 表 (当日多次采集取 max)。
     TRAE: checkin_credits/status (checked_in → 每日 200)
-    WorkBuddy: 扫 get-user-resource 今日入账的资源包 (每个资源包一条记录, ResourceId 去重)。
-      ⚠️ 不能用 checkin-status: active=false 账号恒报未签, 与实际入账脱节。"""
+    WorkBuddy: 官方 checkin-activity-status 为主 (today_checked_in),
+      资源包兜底但排除注册/订阅类礼包。
+      修复 (2026-09-13): 旧版把任意当日资源包都算签到入账, 注册当天的新手礼包
+      (Free Plan Subscription / Bonus Pack) 被误判 → 签到被跳过 + gain 表污染;
+      国际版无签到渠道 (active=false 恒定), 旧版兜底接口是废弃的 checkin-status,
+      导致 gain 表 workbuddy_intl 从建库起 0 行。"""
     day = time.strftime('%Y-%m-%d')
     rows = []
     # ---- TRAE ----
@@ -256,29 +298,40 @@ def collect_gains(conn, cfg):
             continue
         if checked:
             rows.append(('trae', str(acc.get('uid', '')), day, 200.0, 'checkin', now_ts()))
-    # ---- WorkBuddy 系 (国内 + 国际): 今日入账资源包 ----
+    # ---- WorkBuddy 系 (国内 + 国际): 官方活动状态为主, 资源包兜底 ----
     for spec in WB_SPECS:
         plat, short = spec['platform'], spec['short']
         wb_accounts, domain, product = load_wb(cfg, spec)
         for acc in wb_accounts:
             if not acc.get('accessToken') or acc.get('enabled') is False:
                 continue
+            uid8 = str(acc.get('userId', ''))[:8]
             headers = wb_headers(acc, domain, product, base=spec['base'])
+            # 1) 官方活动状态 (checkin-activity-status): active=false = 活动对
+            #    该账号未开启 (国际版无渠道的常态), 今日积分记 0, 不再误报。
+            credit, checked, active, err = wb_checkin_activity_status(
+                headers, base=spec['base'])
+            if err:
+                log(f'gain {short}[{uid8}]: {err}')
+                continue
+            if checked:
+                rows.append((plat, str(acc.get('userId', '')), day, _f(credit or 0),
+                             'checkin', now_ts()))
+                continue
+            # 2) active=true 但 today_checked_in=false → 真没签, 记 0 (不写行,
+            #    保持"gain 无记录=未签"语义, 但不再拿资源包冒充签到)。
+            if active:
+                continue
+            # 3) active=false (无渠道/未参与) → 资源包兜底, 但排除注册/订阅类
+            #    礼包, 只认 Bonus/签到类 (每日活跃奖励 +30 的延迟到账靠这条记录)。
             packs, err = wb_today_packs(headers, base=spec['base'])
             if err:
-                log(f'gain {short}[{acc.get("userId", "?")[:8]}]: {err}')
-                continue
-            if not packs:
-                # 无今日入账包 → 尝试签到状态兜底 (活动期账号 active=true 时有值)
-                credit, checked, err2 = wb_checkin_status(headers, base=spec['base'])
-                if not err2 and checked and credit:
-                    rows.append((plat, str(acc.get('userId', '')), day, _f(credit),
-                                 'checkin', now_ts()))
+                log(f'gain {short}[{uid8}]: {err}')
                 continue
             for rid, pkg, amount in packs:
-                if amount > 0:
-                    kind = f'pack:{pkg}'[:40]
-                    rows.append((plat, str(acc.get('userId', '')), day, amount, kind, now_ts()))
+                if amount > 0 and not _is_registration_pack(pkg):
+                    rows.append((plat, str(acc.get('userId', '')), day, amount,
+                                 f'pack:{pkg}'[:40], now_ts()))
             _ = rid  # rid 已并入 rows
     if rows:
         conn.executemany('''INSERT INTO gain (platform, uid, day, amount, kind, updated_at)
@@ -491,6 +544,138 @@ def collect_all_workbuddy(conn, cfg, collected_at, window_days=WINDOW_DAYS):
             for spec in WB_SPECS]
 
 
+# ============ Loomy 采集 (usage + gain) ============
+
+def loomy_rows(items, uid, collected_at):
+    """把某账号的 loomyad 台账条目转成 usage 表行 (只取 debit=模型调用扣分)。
+
+    uid = config 里该账号的 userid —— 鉴权整改后每个账号用自己的登录态调上游,
+    消耗天然归属到产生它的账号, 不再混在一个共享池里。
+    credit 方向 (邀请/任务奖励) 不是消耗, 不进 usage 表。
+    """
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or it.get('direction') != 'debit':
+            continue
+        ts = int(it.get('createdAt') or 0) or collected_at
+        model = str(it.get('modelName') or '') or '未知'
+        extra = {'description': it.get('description'),
+                 'consumeSource': it.get('consumeSource'),
+                 'dailyCycleDate': it.get('dailyCycleDate')}
+        out.append(('loomy', uid, str(it.get('ledgerId') or ''),
+                    ts, model, _f(it.get('pointsActual')), 0.0,
+                    0, 0, 0,
+                    it.get('consumeSource') or '', '', '',
+                    json.dumps(extra, ensure_ascii=False), collected_at))
+    return out
+
+
+def collect_loomy(conn, cfg, collected_at, window_days=WINDOW_DAYS):
+    """逐账号采集 Loomy 消耗流水 (各自台账, debit 方向) 写 usage 表。
+
+    台账是全量倒序分页, 按窗口天数本地过滤; 幂等 (ledgerId 主键 upsert)。
+    某账号凭据失效只影响它自己, 其余账号照常采集。
+    """
+    import loomy_client as lc
+    day_start = time.strftime('%Y-%m-%d', time.localtime(now_ts() - window_days * 86400))
+    results, errors = lc.ledger_all_accounts(page_size=100, max_pages=5)
+    if not results:
+        return 'loomy: 无可用账号 (请先在账号管理中登录)'
+    cutoff = now_ts() - window_days * 86400
+    total, added, per_acct = 0, 0, []
+    for acc, items in results:
+        uid = str(acc.get('userid') or '')
+        if not uid:
+            continue
+        rows = [r for r in loomy_rows(items, uid, collected_at) if r[3] >= cutoff]
+        a, _n = db_upsert(conn, rows)
+        total += len(rows)
+        added += a
+        label = acc.get('phone') or uid
+        per_acct.append(f'{label}={len(rows)}')
+    msg = f'loomy: 抓到 {total} 条 (窗口 {day_start} 起), 新增 {added} 条' \
+          f' [{", ".join(per_acct)}]'
+    if errors:
+        msg += f' (警告: {"; ".join(errors[:3])})'
+    return msg
+
+
+def loomy_gains(conn, cfg):
+    """Loomy 获取积分凭证 → gain 表。
+
+    两个来源:
+      1. 台账 credit 方向 (邀请奖励/新手任务等), kind=description;
+      2. 每日登录凭证 (data/loomy_signin_state.json, kind=daily-login) ——
+         每日登录发放不进台账, 只有签到状态缓存里有。
+    都按账号 uid 归属; 当日快照, upsert 主键 (platform, uid, day, kind) 幂等。
+    """
+    import loomy_client as lc
+    day = time.strftime('%Y-%m-%d')
+    n = 0
+    try:
+        results, errors = lc.ledger_all_accounts(page_size=100, max_pages=5)
+        for err in errors:
+            log(f'gain loomy: 台账抓取失败 ({err})')
+        for acc, items in results:
+            uid = str(acc.get('userid') or '')
+            if not uid:
+                continue
+            for it in items:
+                if not isinstance(it, dict) or it.get('direction') != 'credit':
+                    continue
+                if str(it.get('dailyCycleDate') or '') != day:
+                    continue  # gain 表按本地日聚合, 只写当日
+                conn.execute('''INSERT INTO gain (platform, uid, day, amount, kind, updated_at)
+                    VALUES (?,?,?,?,?,?)
+                    ON CONFLICT(platform, uid, day, kind) DO UPDATE SET
+                        amount=excluded.amount, updated_at=excluded.updated_at''',
+                             ('loomy', uid, day, _f(it.get('pointsActual')),
+                              str(it.get('description') or 'credit'), now_ts()))
+                n += 1
+    except Exception as e:  # noqa: BLE001
+        log(f'gain loomy: 台账读取异常 ({e})')
+    # 每日登录凭证 → gain 表。
+    # 同一手机号的桌面+Web 账号是同一个钱包（账号页已合并为一行），这里按
+    # 手机号归组：uid 一律用桌面 userid（与 usage 表的消耗归属一致，看板
+    # account_breakdown 收支才能对上）；**任一半边**有领取凭证就记一行，
+    # 金额取各凭证 dailyBalance 的最大值 —— 绝不写两行（同钱包重复计数）。
+    # ⚠️ 不能「有桌面账号就跳过 Web 凭证」：定时签到跑得早，凭证可能只在
+    # Web 半边（桌面账号当天下午才登录），整组跳过会让看板丢掉当日获取。
+    try:
+        accs = lc.load_accounts()
+        state = lc.load_daily_state() or {}
+        groups: dict = {}
+        for acc in accs:
+            key = str(acc.get('phone') or acc.get('userid') or '')
+            g = groups.setdefault(key, {'uid': '', 'entries': []})
+            if acc.get('session'):
+                # 桌面 userid 是该钱包的 canonical uid（后到覆盖 Web 的）
+                g['uid'] = str(acc.get('userid') or '') or g['uid']
+            elif not g['uid']:
+                g['uid'] = str(acc.get('userid') or '')
+            st = state.get(str(acc.get('userid') or ''))
+            if isinstance(st, dict) and st.get('claimed'):
+                g['entries'].append(st)
+        for g in groups.values():
+            if not g['entries'] or not g['uid']:
+                continue
+            amount = 0.0
+            for st in g['entries']:
+                try:
+                    amount = max(amount, float(st.get('dailyBalance') or 0))
+                except (TypeError, ValueError):
+                    pass
+            conn.execute('''INSERT INTO gain (platform, uid, day, amount, kind, updated_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(platform, uid, day, kind) DO UPDATE SET
+                    amount=excluded.amount, updated_at=excluded.updated_at''',
+                         ('loomy', g['uid'], day, amount, 'daily-login', now_ts()))
+            n += 1
+    except Exception as e:  # noqa: BLE001
+        log(f'gain loomy: 状态缓存读取失败 ({e})')
+    return n
+
+
 # ============ 汇总入口 ============
 
 def collect_all(window_days=WINDOW_DAYS):
@@ -508,7 +693,9 @@ def collect_all(window_days=WINDOW_DAYS):
         db_init(conn)
         msgs = [collect_trae(conn, cfg, collected_at, window_days)]
         msgs.extend(collect_all_workbuddy(conn, cfg, collected_at, window_days))
+        msgs.append(collect_loomy(conn, cfg, collected_at, window_days))
         n_gain = collect_gains(conn, cfg)
+        n_gain += loomy_gains(conn, cfg)
         msgs.append(f'获取积分记录 {n_gain} 条')
         db_prune(conn)
         conn.commit()

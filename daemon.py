@@ -18,7 +18,8 @@ daemon.py — open-ai 常驻进程入口 (v2.4 起 = 进程 Broker)
 import sys
 import os
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+import app_paths
+BASE = app_paths.ROOT          # 安装根 (打包态 = exe 所在目录)
 sys.path.insert(0, BASE)
 
 from app_runtime import main

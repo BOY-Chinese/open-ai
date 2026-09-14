@@ -39,6 +39,36 @@ def _resource_dir():
 
 RESOURCES_ZIP = os.path.join(_resource_dir(), 'resources.zip')
 SHELL_CONFIG = os.path.join(_resource_dir(), 'config.shell.json')
+# exe 打包方案: 品牌 exe 由 build_exe.bat 先生成在 installer/dist/,
+# 构建安装器时随 --add-data 打进资源目录; 安装时直接复制到安装根。
+DIST_DIR = os.path.join(_resource_dir(), 'exes')
+# dev 通道的品牌 exe:
+#   daemon  — Broker 独立入口 (开机自启 / 计划任务 / start.bat 走这条)
+#   gateway — 网关, 同时是 Broker 的另一个宿主 (main.py --broker)
+#   task    — 短命任务 (签到 / 采集 / 登录助手)
+#   open-ai — 控制 CLI (start|stop|restart|status|doctor); 桌面端与计划任务都调它
+#   trae    — node 品牌化副本 (Trae 通道的网络栈)
+#
+# ★ 这里既没有 open-ai-manager.exe 也没有 open-ai-launcher.exe —— 两者随旧
+#   tkinter GUI 一起废弃。v3.0 的界面是 Tauri 桌面端 desktop\open-ai-desktop.exe,
+#   它随 resources.zip 解压落位 (见 build_resources.py), 并且**自己就是启动器**:
+#   打开即拉起后端 + 驻留托盘, 不需要单独的 launcher.exe。
+#   清单里多写一个不存在的 exe = 安装时直接报「缺少程序文件」。
+BRAND_EXES = ('open-ai-daemon.exe', 'open-ai-gateway.exe', 'open-ai-task.exe',
+              'open-ai.exe', 'open-ai-trae.exe')
+# 可选品牌 exe: open-ai-trae.exe 是 node 的品牌化副本 (Trae 后端), 依赖存在;
+# 缺失时仅 Trae 通道禁用, 不应阻断整体安装 (WorkBuddy 不受影响)。
+OPTIONAL_EXES = {'open-ai-trae.exe'}
+
+# 历史 bat 里可能残留的旧安装根前缀 (供 _patch_autostart_bat 替换成真实安装路径)。
+# 只在**文本真的含有**这些串时才替换, 不匹配就原样跳过 —— 新生成的 bat 用
+# %~dp0 自解析, 根本不需要改写。
+# ★ 这里刻意不写任何开发机的私有目录: 那是发布者的本机布局, 写进来等于泄漏。
+LEGACY_ROOT_HINTS = (
+    r'C:\open-ai',
+    r'D:\open-ai',
+    r'C:\Program Files\open-ai',
+)
 # 图标: 打包后位于 _MEIPASS/ico/open-ai.ico; 开发时在 installer/ico/open-ai.ico
 ICON_ICO = os.path.join(_resource_dir(), 'ico', 'open-ai.ico')
 if not os.path.exists(ICON_ICO):
@@ -321,6 +351,22 @@ class InstallerApp:
             zf.extractall(target)
         self._log(f'✓ 资源解压完成 ({len(os.listdir(target))} 项)')
 
+        # 1b. 放置品牌化 exe (内嵌 Python, 用户机器无需安装 Python)
+        self._set_status('放置程序文件...', 8)
+        missing_exe = []
+        for name in BRAND_EXES:
+            src_exe = os.path.join(DIST_DIR, name)
+            if os.path.isfile(src_exe):
+                shutil.copy2(src_exe, os.path.join(target, name))
+                self._log(f'  ✓ {name}')
+            elif name in OPTIONAL_EXES:
+                self._log(f'  ⚠ {name} 缺失 (Trae 通道将禁用, WorkBuddy 不受影响)')
+            else:
+                missing_exe.append(name)
+        if missing_exe:
+            raise RuntimeError('安装包缺少程序文件: %s' % ', '.join(missing_exe))
+        self._log('✓ 全部程序文件就绪 (内嵌运行环境, 无需安装 Python)')
+
         # 2. 生成配置文件 (关键: 保留用户已有 config, 不覆盖!)
         self._set_status('生成配置文件...', 15)
         cfg_path = os.path.join(target, 'config.json')
@@ -341,62 +387,25 @@ class InstallerApp:
         # 3. 处理 open-ai-autostart.bat 硬编码路径
         self._patch_autostart_bat(target)
 
-        # 4. 检测/安装 Python (含架构校验: playwright 等仅发布 win_amd64 wheel,
-        #    ARM64/32 位 Python 会导致 pip 'from versions: none' 静默失败)
-        self._set_status('检测 Python...', 25)
-        py_cmd, py_ver = find_python()
-        if py_cmd:
-            arch, arch_str = check_python_arch(py_cmd)
-            if arch == 'x64':
-                self._log(f'✓ 检测到 Python {py_ver} ({arch_str})')
-            else:
-                self._log(f'⚠ Python {py_ver} 架构不兼容 ({arch_str}), playwright 等包无法安装')
-                self._log('正在自动补装 64 位 Python 3.12 (不影响已有 Python)...')
-                self._install_python(reason='架构纠正')
-                fixed = find_corrected_python()
-                if not fixed:
-                    raise RuntimeError('64 位 Python 3.12 补装失败, 请手动从 python.org'
-                                       ' 安装 3.12.10 (64-bit) 后重新运行安装器')
-                rc2, out2 = run_cmd(list(fixed) + ['--version'], timeout=15)
-                py_ver = (out2 or '').strip().split()[-1] if rc2 == 0 and out2.strip() else '3.12'
-                py_cmd = fixed
-                self._log(f'✓ 已启用 64 位 Python {py_ver}')
-        else:
-            self._log('未检测到 Python, 正在自动下载安装...')
-            self._install_python()
-
-        # 记录最终可用的 Python 前缀 (供 _setup_venv/_setup_playwright 复用,
-        # 避免架构纠正后又被 find_python() 抓回不合规的解释器)
-        self.python_prefix = py_cmd
-
-        # 5. 检测/安装 Node
+        # 5. 检测/安装 Node (trae 通道需要; exe 方案下唯一的外部运行时)
         self._set_status('检测 Node.js...', 40)
         node_cmd, node_ver = find_node()
         if node_cmd:
             self._log(f'✓ 检测到 Node.js {node_ver}')
         else:
-            self._log('未检测到 Node.js, 正在自动下载安装...')
-            self._install_node()
+            self._log('⚠ 未检测到 Node.js — trae 通道将禁用 (WorkBuddy 网关不受影响)')
 
-        # 6. 创建 venv + 装依赖
-        self._set_status('创建虚拟环境并安装依赖...', 55)
-        self._setup_venv(target)
+        # 6/7. (exe 打包方案) 依赖与 Playwright 均已内嵌到各品牌 exe,
+        #      无需 venv / pip 下载 / playwright install
+        self._log('✓ 运行环境由程序内置 (无 venv / 无 pip 依赖下载)')
 
-        # 7. 构建品牌化运行时 (procname.py -> runtime/Scripts/open-ai-*.exe)
-        self._set_status('构建品牌化运行时...', 68)
-        self._setup_runtime(target)
-
-        # 8. 安装 Playwright
-        self._set_status('安装 Playwright 浏览器...', 80)
-        self._setup_playwright(target)
-
-        # 9. 创建桌面快捷方式
-        self._set_status('创建桌面快捷方式...', 90)
+        # 8. 创建桌面快捷方式
+        self._set_status('创建桌面快捷方式...', 88)
         self._create_shortcuts(target)
 
-        # 10. 开机自启
+        # 9. 开机自启
         if self.autostart.get():
-            self._set_status('配置开机自启...', 96)
+            self._set_status('配置开机自启...', 94)
             self._setup_autostart(target)
 
         # 完成
@@ -417,27 +426,40 @@ class InstallerApp:
 
     def _patch_autostart_bat(self, target):
         """把 open-ai-autostart.bat 里的硬编码路径替换为目标路径。
-
-        字节级替换 (不依赖文件编码), 兼容 GBK/UTF-8 任意编码的 bat,
-        根治 "'gbk' codec can't encode character '\ufffd'"。
-        """
+        兼容 GBK / UTF-8 两种编码的 bat (exe 方案的新 bat 为 GBK, 历史 bat 为 GBK,
+        第三方编辑器可能存成 UTF-8); 无需替换时原样跳过, 绝不重写文件。"""
         bat = os.path.join(target, 'open-ai-autostart.bat')
         if not os.path.exists(bat):
             return
+        raw = open(bat, 'rb').read()
+        content = None
+        for enc in ('gbk', 'utf-8'):
+            try:
+                content = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if content is None:
+            self._log('⚠ open-ai-autostart.bat 编码无法识别, 跳过路径修正')
+            return
+        # 历史版本的 bat 里可能残留旧安装根 (形如 <盘>:\...\open-ai)。
+        # 这里不再写死开发机的私有目录, 改为按「配置过的旧前缀」替换。
+        changed = False
+        for needle in LEGACY_ROOT_HINTS:
+            if needle in content:
+                content = content.replace(needle, target)
+                changed = True
+        if not changed:
+            return                      # 无硬编码路径, 无需改写
+        # 以可编码的字节写回 (GBK 优先; 仍失败则 UTF-8, 保证安装不中断)
         try:
-            with open(bat, 'rb') as f:
-                raw = f.read()
-            import re
-            new_raw = re.sub(
-                rb'(?i)[a-z]:\\(?:[^\r\n"]*?\\)*[^\\\r\n"]*open-ai',
-                lambda m: target.encode('utf-8', errors='surrogateescape'),
-                raw)
-            if new_raw != raw:
-                with open(bat, 'wb') as f:
-                    f.write(new_raw)
-            self._log(f'✓ 已更新 open-ai-autostart.bat 路径 -> {target}')
-        except Exception as e:
-            self._log(f'⚠ 自启脚本路径适配失败: {e}')
+            data = content.encode('gbk')
+        except UnicodeEncodeError:
+            data = content.encode('utf-8')
+        if b'\r\n' not in data:            # 已是 CRLF 则不动, 防止 CRCRLF
+            data = data.replace(b'\n', b'\r\n')
+        open(bat, 'wb').write(data)
+        self._log(f'✓ 已更新 open-ai-autostart.bat 路径 -> {target}')
 
     def _install_python(self, reason=''):
         """下载并静默安装 Python (64 位 3.12.10, 官方安装器)。"""
@@ -503,22 +525,6 @@ class InstallerApp:
                 except Exception:
                     pass
         return os.path.isfile(venv_py)
-
-    def _setup_runtime(self, target):
-        """构建品牌化运行时 (procname.py): runtime/Scripts/open-ai-*.exe。
-
-        v2.4 Broker 架构必需: 让 open-ai-daemon/gateway/manager 等 exe 就位,
-        启动/托盘/Job 托管都依赖 runtime/Scripts 下的品牌化进程。
-        """
-        venv_py = os.path.join(target, '.venv', 'Scripts', 'python.exe')
-        procname = os.path.join(target, 'procname.py')
-        if os.path.exists(venv_py) and os.path.exists(procname):
-            self._log('构建品牌化进程 (procname.py)...')
-            rc, out = run_cmd([venv_py, procname], timeout=600)
-            if rc != 0:
-                self._log(f'⚠ 运行时构建失败 (可稍后运行 start.bat): {out[-300:]}')
-            else:
-                self._log('✓ 品牌化运行时就绪 (runtime/Scripts)')
 
     def _setup_venv(self, target):
         """创建 venv 并安装 requirements。
@@ -698,37 +704,31 @@ class InstallerApp:
             self._log('⚠ 未找到桌面目录, 跳过快捷方式')
             return
 
+        icon = os.path.join(target, 'pic', 'software_logo.png')  # 快捷方式图标(用PNG转的ico更好)
         icon_ico = os.path.join(target, 'pic', 'open-ai.ico')
         if not os.path.exists(icon_ico):
-            icon_ico = os.path.join(target, 'pic', 'software_logo.png')
+            icon_ico = icon
 
-        # 快捷方式指向 open-ai-launcher.exe (无窗口一键启动器)。
-        # 若资源包里没有 launcher (旧包), 退回生成的 启动 bat。
-        launcher_exe = os.path.join(target, 'open-ai-launcher.exe')
-        if os.path.isfile(launcher_exe):
-            launcher_target = launcher_exe
-            workdir = target
-        else:
-            launcher_bat = os.path.join(target, 'open-ai 启动.bat')
-            self._create_launcher_bat(target, launcher_bat)
-            launcher_target = launcher_bat
-            workdir = os.path.dirname(launcher_bat)
+        # 快捷方式指向 Tauri 桌面端 —— 它是唯一的界面入口, 且自带「拉起后端」:
+        # 打开时 start_backend 幂等地把 Broker/网关/Trae/定时任务整棵进程树带起来,
+        # 关窗口则收进系统托盘。旧的 open-ai-launcher.exe 与 tkinter 界面一并废弃。
+        app_exe = os.path.join(target, 'desktop', 'open-ai-desktop.exe')
+        if not os.path.isfile(app_exe):
+            self._log('⚠ 未找到 desktop\\open-ai-desktop.exe, 跳过桌面快捷方式')
+            self._log('  (资源包不完整: 需先 build-tauri-release.ps1 再 build_resources.py)')
+            return
 
         self._make_shortcut(
             os.path.join(desktop, 'open-ai.lnk'),
-            launcher_target, '', workdir,
-            'open-ai 本地AI聚合网关', icon_ico)
+            app_exe, '', target,
+            'open-ai 账号管理 (本地 AI 聚合网关)', icon_ico)
         self._log('✓ 已创建桌面快捷方式: open-ai')
 
     def _create_launcher_bat(self, target, launcher_bat):
-        """生成启动器: 先启动网关(后台), 再打开桌面端。自动隐藏自身控制台。
-
-        v3.0：界面只有桌面端（Tauri）。旧 tkinter GUI / 账号管理.bat 已删除，
-        因此这里不再调用 pythonw + scripts\\gui_account_manager.py。
-        """
+        """生成启动器: 先启动网关(后台), 再打开账号管理GUI。自动隐藏自身控制台。"""
         bat_content = (
             '@echo off\r\n'
-            'rem open-ai 一键启动: 先启网关(后台) 再开桌面端\r\n'
+            'rem open-ai 一键启动: 先启网关(后台) 再开账号管理\r\n'
             'rem 隐藏本控制台窗口\r\n'
             'if not "%1"=="hidden" (\r\n'
             '    start "" /min cmd /c "%~f0" hidden\r\n'
@@ -738,7 +738,7 @@ class InstallerApp:
             'start "" powershell.exe -NoProfile -ExecutionPolicy Bypass '
             '-WindowStyle Hidden -File "%~dp0start_hidden.ps1"\r\n'
             'timeout /t 3 /nobreak >nul\r\n'
-            'start "" "%~dp0desktop\\open-ai-desktop.exe"\r\n'
+            'start "" "%~dp0.venv\\Scripts\\pythonw.exe" "%~dp0scripts\\gui_account_manager.py"\r\n'
             'exit /b\r\n'
         )
         with open(launcher_bat, 'w', encoding='gbk', newline='\r\n') as f:
@@ -764,28 +764,26 @@ class InstallerApp:
             self._log(f'⚠ 快捷方式创建失败: {out[-200:]}')
 
     def _setup_autostart(self, target):
-        """开机自启: 写入隐藏 VBS 调 start_hidden.ps1 (无控制台窗口/无报错)。
-
-        不再直接把 open-ai-autostart.bat 拷进启动文件夹 —— bat 会闪现 cmd 控制台,
-        且 Broker 未就绪时会显示误导性的「未运行」。VBS 以 WindowStyle=0 隐藏启动,
-        卸载器会同步清理该文件。
-        """
+        """开机自启: 复制 open-ai-autostart.bat 到启动文件夹。"""
         startup = os.path.join(os.environ.get('APPDATA', ''),
-                               'Microsoft', 'Windows', 'Start Menu',
-                               'Programs', 'Startup')
-        self._log('配置开机自启 (隐藏启动, 无控制台窗口)...')
-        if os.path.isdir(startup):
-            ps1 = os.path.join(target, 'start_hidden.ps1')
-            vbs = ('Set sh = CreateObject("WScript.Shell")\r\n'
-                   'sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass '
-                   '-WindowStyle Hidden -File ""' + ps1 + '""", 0, False\r\n')
-            try:
-                with open(os.path.join(startup, 'open-ai-autostart.vbs'),
-                          'w', encoding='gbk', newline='') as f:
-                    f.write(vbs)
-                self._log('✓ 已配置开机自启')
-            except Exception as e:
-                self._log(f'⚠ 开机自启配置失败: {e}')
+                               'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+        src = os.path.join(target, 'open-ai-autostart.bat')
+        if os.path.exists(src) and os.path.isdir(startup):
+            # 自启拉「桌面端 --minimized」而不是裸 daemon:
+            #   托盘图标由桌面端创建 —— 只拉 daemon 会得到「后端在跑, 但托盘里
+            #   没有图标」, 用户 consequently 找不到退出入口 (v3.0 实测反馈)。
+            #   --minimized 让窗口不弹出, 只留托盘, 与「开机静默常驻」的预期一致。
+            bat = ('@echo off\r\n'
+                   'rem open-ai autostart (dev): tray app minimized + backend up\r\n'
+                   'cd /d "%s"\r\n'
+                   'if not exist "desktop\\open-ai-desktop.exe" (\r\n'
+                   '    echo [ERROR] desktop\\open-ai-desktop.exe not found. Reinstall open-ai.\r\n'
+                   '    exit /b 1\r\n'
+                   ')\r\n'
+                   'start "" "desktop\\open-ai-desktop.exe" --minimized\r\n' % target)
+            with open(os.path.join(startup, 'open-ai-autostart.bat'), 'w', encoding='gbk', newline='') as f:
+                f.write(bat)
+            self._log('✓ 已配置开机自启')
         else:
             self._log('⚠ 开机自启配置失败 (启动文件夹不可用)')
 

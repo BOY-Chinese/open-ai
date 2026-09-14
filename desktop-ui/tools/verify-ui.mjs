@@ -4,7 +4,7 @@
  * 为什么需要它：
  *   截图只能靠人眼/视觉模型判断，暗色低对比界面上极易漏看或看出幻觉
  *   （本项目已发生：视觉模型把 5 个账号表格读对了，却把侧边栏底部
- *     「系统日志 / 系统设置 / 网关运行中 / 版本号」整段漏报为空白）。
+ *     「操作日志 / 系统设置 / 网关运行中 / 版本号」整段漏报为空白）。
  *   DOM 断言是确定性的：有没有这段文字，一问便知。
  *
  * 前置：dev server 运行中（npm run dev，127.0.0.1:1420）
@@ -90,7 +90,7 @@ try {
     }
   })
 
-  for (const label of ['账号管理', 'API 管理', '模型列表', '积分看板', '系统日志', '系统设置']) {
+  for (const label of ['账号管理', 'API 管理', '模型列表', '积分看板', '操作日志', '系统设置']) {
     check(`侧边栏含导航「${label}」`, snap.asideText.includes(label))
   }
   check('侧边栏含网关状态「网关运行中」', snap.asideText.includes('网关运行中'),
@@ -108,7 +108,7 @@ try {
     ['api', 'API 管理'],
     ['models', '模型列表'],
     ['credits', '积分看板'],
-    ['logs', '系统日志'],
+    ['logs', '操作日志'],
     ['settings', '系统设置'],
   ]) {
     await page.goto(`${URL_BASE}/#/${hash}`, { waitUntil: 'networkidle2', timeout: 30000 })

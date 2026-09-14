@@ -7,18 +7,22 @@
 import type {
   Account,
   ApiKey,
+  AutoChain,
   Channel,
   ChannelFilter,
   DailyUsage,
   GatewayInfo,
-  LogLine,
-  LogLevel,
   ModelEntry,
+  SigninBundle,
+  SigninStatus,
   TodayBundle,
   UsageRow,
   WeekBundle,
 } from '@/types/domain'
 import { toDayKey } from '@/lib/utils'
+import { filterModelView } from '@/lib/modelCache'
+import { emitAccountsChanged } from '@/lib/accountEvents'
+import { followLoginLog, type LoginLogChunk } from '@/lib/loginStream'
 
 /* ═══════════════ 内部工具 ═══════════════ */
 
@@ -31,11 +35,16 @@ const LATENCY = 320
 
 /* ═══════════════ Mock 种子数据（取自真实界面截图） ═══════════════ */
 
+/* ⚠ 本文件是**演示数据源**，会被 Vite 原样打进前端产物 (dist/assets/*.js)。
+   因此这里的账号名与密钥**必须是编造的占位值**：
+   真实密钥只存在于 `config.json`，由 Tauri 的 `gateway_config` 命令在运行时
+   注入前端内存。曾经此处直接抄了真实截图里的密钥与账号 ID，等于把网关凭据
+   随安装包一起公开发布 —— 改回真值前请先想清楚这一条。 */
 let ACCOUNTS: Account[] = [
   {
     id: 'acc-trae-1',
     channel: 'Trae',
-    name: '网页登录账号(3190130595077593)',
+    name: '示例账号(Trae-1)',
     enabled: true,
     status: 'enabled',
     credits: 4334.54,
@@ -45,7 +54,7 @@ let ACCOUNTS: Account[] = [
   {
     id: 'acc-trae-2',
     channel: 'Trae',
-    name: '网页登录账号(850371773232857)',
+    name: '示例账号(Trae-2)',
     enabled: true,
     status: 'enabled',
     credits: 3550.0,
@@ -55,7 +64,7 @@ let ACCOUNTS: Account[] = [
   {
     id: 'acc-wb-1',
     channel: 'WorkBuddy',
-    name: 'a95fdb1a-4ba5-4938-bf16-aa2233de144e',
+    name: '示例账号(WorkBuddy-1)',
     enabled: true,
     status: 'enabled',
     credits: 1301.23,
@@ -65,7 +74,7 @@ let ACCOUNTS: Account[] = [
   {
     id: 'acc-wb-2',
     channel: 'WorkBuddy',
-    name: '93350cbf-2915-4a45-ab8f-8cc67168e383',
+    name: '示例账号(WorkBuddy-2)',
     enabled: true,
     status: 'enabled',
     credits: 2898.57,
@@ -75,7 +84,7 @@ let ACCOUNTS: Account[] = [
   {
     id: 'acc-wbie-1',
     channel: 'WorkBuddy_IE',
-    name: '国际版账号(boy-chinese)',
+    name: '示例账号(国际版-1)',
     enabled: true,
     status: 'enabled',
     credits: 350.0,
@@ -88,19 +97,19 @@ let API_KEYS: ApiKey[] = [
   {
     id: 'api-1',
     name: 'Trae_1',
-    key: 'df24c1a4b5620952c4e75b8d6e7b4bc3f997b7973ed696cb',
+    key: 'DEMO-KEY-NOT-REAL-0000000000000000000000000000',
     createdAt: Date.now() / 1000 - 86400 * 3,
   },
   {
     id: 'api-2',
     name: 'WorkBuddy_1',
-    key: 'sk-aMbhTe9SMRlykiE3zC7HgTbcvWWQFkVjvUZmJXvE7y4',
+    key: 'sk-DEMO-KEY-NOT-REAL-000000000000000000000000',
     createdAt: Date.now() / 1000 - 86400 * 2,
   },
   {
     id: 'api-3',
-    name: '鲸专属',
-    key: 'sk-TW7CWNt0fuVp2g8OZetsT2HIO1qVIdFewedP8GBwHE',
+    name: '演示密钥',
+    key: 'sk-DEMO-KEY-NOT-REAL-111111111111111111111111',
     createdAt: Date.now() / 1000 - 86400,
   },
 ]
@@ -172,26 +181,29 @@ let MODELS: ModelEntry[] = [
   { id: 'm-i18', channel: 'WorkBuddy_IE', name: 'fast-model', ratio: 0.5, ratioUnit: '×', routeModelId: 'wbie-fast-model', hidden: false, pinned: false },
   { id: 'm-i19', channel: 'WorkBuddy_IE', name: 'primary-model', ratio: 1.2, ratioUnit: '×', routeModelId: 'wbie-primary-model', hidden: false, pinned: false },
   { id: 'm-i20', channel: 'WorkBuddy_IE', name: 'default-model', ratio: 1.0, ratioUnit: '×', routeModelId: 'wbie-default-model', hidden: false, pinned: false },
+  // Loomy 模型不进演示数据：演示包只随三通道种子，Loomy 列表一律由真实网关提供
 ]
 
-/** 生成近 N 天流水（含历史日，便于今日/本周两个视图复用） */
-function seedUsage(): UsageRow[] {
+/** 生成近 N 天流水（含历史日，便于今日/本周两个视图复用） */function seedUsage(): UsageRow[] {
   const rows: UsageRow[] = []
   const now = new Date()
   const models: Record<Channel, string[]> = {
     Trae: ['deepseek-v4-flash-official', 'kimi-k3', 'DeepSeek-V4-Pro-Official'],
     WorkBuddy: ['deepseek-v4.1-flash', 'glm-5.3-flash'],
     WorkBuddy_IE: ['kimi-k2.6', 'deepseek-v4.1-flash'],
+    Loomy: [],
   }
   const accounts: Record<Channel, string[]> = {
     Trae: ['trae_3937', 'trae_2857'],
     WorkBuddy: ['WB_fea0', 'WB_e383'],
     WorkBuddy_IE: ['WB_IE_boy'],
+    Loomy: [],
   }
   for (let d = 0; d < 9; d++) {
     const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() - d)
-    for (const ch of ['Trae', 'WorkBuddy', 'WorkBuddy_IE'] as Channel[]) {
-      const count = ch === 'WorkBuddy_IE' ? 2 : 4 + (d % 3)
+    for (const ch of ['Trae', 'WorkBuddy', 'WorkBuddy_IE', 'Loomy'] as Channel[]) {
+      // Loomy 不造演示流水（主机同款账号/模型数据不进演示包），行数恒 0
+      const count = ch === 'WorkBuddy_IE' ? 2 : ch === 'Loomy' ? 0 : 4 + (d % 3)
       for (let i = 0; i < count; i++) {
         const t = new Date(day)
         t.setHours(d === 0 ? Math.max(0, now.getHours() - i) : 9 + i * 3, (i * 13) % 60, 0, 0)
@@ -213,16 +225,6 @@ function seedUsage(): UsageRow[] {
 
 let USAGE: UsageRow[] = seedUsage()
 
-let LOGS: LogLine[] = [
-  { id: 1, level: 'info', text: '正在启动 open-ai 网关 (127.0.0.1:8000) ...', ts: Date.now() / 1000 - 120 },
-  { id: 2, level: 'success', text: '[OK] 网关已就绪，监听 0.0.0.0:8000', ts: Date.now() / 1000 - 119 },
-  { id: 3, level: 'info', text: '正在拉取模型列表及积分倍率 ...', ts: Date.now() / 1000 - 90 },
-  { id: 4, level: 'success', text: '[Done] Trae 模型 12 个已载入', ts: Date.now() / 1000 - 88 },
-  { id: 5, level: 'warn', text: '[Warn] WorkBuddy 账号 a95fdb1a 心跳延迟 1.2s', ts: Date.now() / 1000 - 60 },
-  { id: 6, level: 'error', text: '[Err] WorkBuddy_IE 登录态失效，请重新连接', ts: Date.now() / 1000 - 30 },
-  { id: 7, level: 'info', text: '[Done] 22:50:24', ts: Date.now() / 1000 - 10 },
-]
-
 let gateway: GatewayInfo = {
   openaiBase: 'http://127.0.0.1:8000/v1',
   chatEndpoint: 'http://127.0.0.1:8000/v1/chat/completions',
@@ -234,7 +236,7 @@ let gateway: GatewayInfo = {
 /**
  * 以周偏移量 + 通道筛选生成堆叠柱状图数据（负数=过去，0=本周）
  *
- * 通道语义：`all` 返回三通道堆叠；指定通道时，该通道数据保留、其余通道置 0
+ * 通道语义：`all` 返回四通道堆叠；指定通道时，该通道数据保留、其余通道置 0
  * （等价于「只看该通道的柱子」），统计卡的消耗/获取同步按通道收窄。
  */
 function buildWeek(offset: number, channel: ChannelFilter = 'all'): WeekBundle {
@@ -251,31 +253,35 @@ function buildWeek(offset: number, channel: ChannelFilter = 'all'): WeekBundle {
     d.setDate(monday.getDate() + i)
     const key = toDayKey(d)
     const isFuture = d > now
-    // 三通道量级刻意错开：Trae 为主力（量最大），WorkBuddy 次之，国际版最小
+    // 四通道量级刻意错开：Trae 为主力（量最大），WorkBuddy 次之，国际版再次；
+    // Loomy 演示值恒 0（不造主机同款数据，真实值由网关提供）
     // 数值由日期确定性派生，保证切换周/刷新时数据稳定可比
     const seed = (d.getFullYear() * 372 + (d.getMonth() + 1) * 31 + d.getDate()) % 97
     const raw = {
       Trae: isFuture ? 0 : Number((seed * 4.2 + (offset === 0 ? 220 : 90)).toFixed(1)),
       WorkBuddy: isFuture ? 0 : Number((seed * 3.1 + (offset === 0 ? 150 : 60)).toFixed(1)),
       WorkBuddy_IE: isFuture ? 0 : Number((seed * 1.6 + 30).toFixed(1)),
+      Loomy: 0,
     }
     // 通道筛选：非选中通道归零，选中通道（或 all）保留
     const pick = (ch: Channel) => (channel === 'all' || channel === ch ? raw[ch] : 0)
     const trae = pick('Trae')
     const wb = pick('WorkBuddy')
     const wbie = pick('WorkBuddy_IE')
-    used += trae + wb + wbie
+    const loomy = pick('Loomy')
+    used += trae + wb + wbie + loomy
     gained += isFuture ? 0 : seed * 2.2 + 120
-    daily.push({ day: key, Trae: trae, WorkBuddy: wb, WorkBuddy_IE: wbie })
+    daily.push({ day: key, Trae: trae, WorkBuddy: wb, WorkBuddy_IE: wbie, Loomy: loomy })
   }
 
   // 本周获取积分：按通道等比分摊（Trae 贡献最大），保证切通道时数字随之变化
   const weekGainBase = offset === 0 ? 3200 : 2800 + ((offset * 137) % 900)
   const share: Record<ChannelFilter, number> = {
     all: 1,
-    Trae: 0.56,
-    WorkBuddy: 0.33,
-    WorkBuddy_IE: 0.11,
+    Trae: 0.52,
+    WorkBuddy: 0.31,
+    WorkBuddy_IE: 0.17,
+    Loomy: 0,
   }
 
   const last = new Date(monday)
@@ -294,6 +300,57 @@ function buildWeek(offset: number, channel: ChannelFilter = 'all'): WeekBundle {
   }
 }
 
+/* ═══════════════ 演示用的「登录脚本输出」 ═══════════════ */
+
+/**
+ * 模拟登录脚本输出：每个元素是**一次轮询**返回的一片。
+ *
+ * 分片而不是一次性给完，是为了让「输出实时滚动」在演示模式下真的看得见 ——
+ * 一次给完的话，跟随循环一轮就结束了，跟直接打印没区别。
+ */
+function mockScript(channel: Channel, host: string): string[] {
+  return [
+    `[演示 15:05:12] ============================================================\n`,
+    `[演示 15:05:12]   ${channel} 登录助手（演示数据，不会真的打开浏览器）\n` +
+      `[演示 15:05:12]   目标站点: ${host}\n`,
+    `[演示 15:05:13] 正在打开登录页 ...\n` +
+      `[演示 15:05:14] 等待用户在浏览器中完成登录 ...\n`,
+    `[演示 15:05:16] 已捕获 accessToken（长度 1302）\n`,
+    `[演示 15:05:16] 校验 token 可用性 ... 成功\n` +
+      `[演示 15:05:16] 账号已写入 config.json\n`,
+  ]
+}
+
+interface MockLoginState {
+  chunks: string[]
+  /** 已吐出的分片数 */
+  served: number
+  /** 已吐出的字符数（作为返回给前端的新偏移） */
+  offset: number
+}
+
+const MOCK_LOGIN: Record<string, MockLoginState> = {}
+
+/** 造一个演示账号（与原 addAccount 的账号形状一致） */
+function makeMockAccount(channel: Channel): Account {
+  const nameMap: Record<Channel, string> = {
+    Trae: `网页登录账号(${Math.floor(Math.random() * 9e14 + 1e14)})`,
+    WorkBuddy: crypto.randomUUID(),
+    WorkBuddy_IE: `国际版账号(user-${Math.floor(Math.random() * 9000 + 1000)})`,
+    Loomy: `Loomy(${Math.floor(Math.random() * 9e9 + 1.3e10)})`,
+  }
+  return {
+    id: uid('acc'),
+    channel,
+    name: nameMap[channel],
+    enabled: true,
+    status: 'enabled',
+    credits: 0,
+    workCredits: 0,
+    refreshedAt: Date.now() / 1000,
+  }
+}
+
 /* ═══════════════ 对外 API（页面唯一数据入口） ═══════════════ */
 
 export const mockBackend = {
@@ -302,6 +359,43 @@ export const mockBackend = {
     await sleep(LATENCY)
     const list = filter === 'all' ? ACCOUNTS : ACCOUNTS.filter((a) => a.channel === filter)
     return list.map((a) => ({ ...a }))
+  },
+
+  /**
+   * 今日签到结果（演示数据）。
+   *
+   * 刻意让「已签到/未签到」两种状态都出现（国际版账号今天未签到），
+   * 否则这列在演示模式下永远是同一个样子，等于没验证过。
+   */
+  async listSignin(filter: ChannelFilter = 'all'): Promise<SigninBundle> {
+    await sleep(LATENCY / 2)
+    const day = toDayKey(new Date())
+    const midnight = new Date()
+    midnight.setHours(0, 5, 0, 0)
+    const ts = Math.floor(midnight.getTime() / 1000)
+    const seed: Record<string, SigninStatus> = {
+      'acc-trae-1': { checkedIn: true, amount: 200, kinds: ['checkin'], ts },
+      'acc-trae-2': { checkedIn: true, amount: 200, kinds: ['checkin'], ts },
+      'acc-wb-1': {
+        checkedIn: true,
+        amount: 100,
+        kinds: ['pack:CodeBuddy个人版国内运营裂变包'],
+        ts,
+      },
+      'acc-wb-2': {
+        checkedIn: true,
+        amount: 100,
+        kinds: ['pack:CodeBuddy个人版国内运营裂变包'],
+        ts,
+      },
+      // acc-wbie-1（国际版）今日未签到：用于验证未签到态与提示文案
+    }
+    const signin: Record<string, SigninStatus> = {}
+    for (const a of ACCOUNTS) {
+      if (filter !== 'all' && a.channel !== filter) continue
+      if (seed[a.id]) signin[a.id] = { ...seed[a.id] }
+    }
+    return { day, signin }
   },
 
   /** 刷新指定通道账号状态（重新拉取积分） */
@@ -350,25 +444,78 @@ export const mockBackend = {
     ACCOUNTS = ACCOUNTS.filter((a) => a.id !== id)
   },
 
+  /**
+   * 添加账号（演示）：拉起一次**模拟的**登录脚本，并让跟随逻辑真实地跑一遍。
+   *
+   * 关键取舍：这里不直接 append 几行假日志了事，而是把脚本输出放进
+   * {@link MOCK_LOGIN_SCRIPTS}，由 `loginLog()` 一片一片吐出来，再交给
+   * 与真实后端**完全相同**的 `followLoginLog` 驱动。
+   * 这样演示模式验证的就是真实那条代码路径（轮询、分行、级别判定、
+   * 结束判定、结束回调），而不是一条平行实现的仿制品。
+   */
   async addAccount(channel: Channel): Promise<Account> {
+    const script =
+      channel === 'Trae' ? 'login_trae.py'
+        : channel === 'WorkBuddy' ? 'login_workbuddy.py'
+          : channel === 'Loomy' ? 'loomy_client.py'
+            : 'login_workbuddy_intl.py'
+    const host =
+      channel === 'Trae' ? 'www.trae.cn'
+        : channel === 'WorkBuddy' ? 'copilot.tencent.com'
+          : channel === 'Loomy' ? 'loomyad.xunfei.cn'
+            : 'www.workbuddy.ai'
+
     await sleep(LATENCY * 2)
-    const nameMap: Record<Channel, string> = {
-      Trae: `网页登录账号(${Math.floor(Math.random() * 9e14 + 1e14)})`,
-      WorkBuddy: crypto.randomUUID(),
-      WorkBuddy_IE: `国际版账号(user-${Math.floor(Math.random() * 9000 + 1000)})`,
-    }
-    const acc: Account = {
-      id: uid('acc'),
+    // 重放：同一通道再次登录时从头开始
+    MOCK_LOGIN[channel] = { chunks: mockScript(channel, host), served: 0, offset: 0 }
+
+    // 与真实实现同形状：等到脚本结束才返回（见 httpBackend.addAccount 的说明）
+    await followLoginLog({
+      fetchChunk: (offset) => this.loginLog(channel, offset),
+      startOffset: 0,
+      label: `${channel} 登录助手（${script}）`,
+      onFinished: () => {
+        // 演示：脚本结束 = 登录成功，新账号**此刻**才进列表
+        // （真实实现里账号是脚本自己写进 config.json 的，这里等价补上）
+        ACCOUNTS = [...ACCOUNTS, makeMockAccount(channel)]
+        emitAccountsChanged(channel)
+      },
+    })
+
+    // 与真实实现一致：立即返回占位对象，不等登录完成
+    return {
+      id: `${channel}:pending`,
       channel,
-      name: nameMap[channel],
-      enabled: true,
-      status: 'enabled',
+      name: '等待登录完成…',
+      enabled: false,
+      status: 'disconnected',
       credits: 0,
       workCredits: 0,
-      refreshedAt: Date.now() / 1000,
+      refreshedAt: 0,
     }
-    ACCOUNTS = [...ACCOUNTS, acc]
-    return acc
+  },
+
+  /** 演示用的脚本输出：每次调用吐一片，吐完即视为脚本结束 */
+  async loginLog(channel: Channel, _offset: number): Promise<LoginLogChunk> {
+    await sleep(LATENCY / 2)
+    const st = MOCK_LOGIN[channel]
+    if (!st) {
+      return { text: '', offset: 0, running: false, exists: false, exitCode: null }
+    }
+    const chunk = st.chunks[st.served] ?? ''
+    if (chunk) {
+      st.served += 1
+      st.offset += chunk.length
+    }
+    const running = st.served < st.chunks.length
+    return {
+      text: chunk,
+      offset: st.offset,
+      running,
+      exists: true,
+      // 演示脚本「登录成功」：退出码 0
+      exitCode: running ? null : 0,
+    }
   },
 
   /* ── API 密钥 ── */
@@ -417,12 +564,10 @@ export const mockBackend = {
   }): Promise<ModelEntry[]> {
     await sleep(LATENCY)
     const { channel = 'all', showHidden = false } = opts ?? {}
-    return MODELS.filter(
-      (m) => (channel === 'all' || m.channel === channel) && (showHidden || !m.hidden)
-    )
-      .slice()
-      .sort((a, b) => Number(b.pinned) - Number(a.pinned))
-      .map((m) => ({ ...m }))
+    // 与 httpBackend 同契约：返回全量列表的浅拷贝，筛选走同一个函数。
+    // 缓存由页面统一写入（见 lib/modelCache.ts），此处不落盘。
+    const all = MODELS.slice().sort((a, b) => Number(b.pinned) - Number(a.pinned))
+    return filterModelView(all, channel, showHidden).map((m) => ({ ...m }))
   },
 
   async refreshModels(): Promise<void> {
@@ -457,17 +602,104 @@ export const mockBackend = {
     return buildWeek(offset, channel)
   },
 
-  /* ── 日志 ── */
-  async listLogs(): Promise<LogLine[]> {
-    await sleep(LATENCY / 2)
-    return LOGS.map((l) => ({ ...l }))
+  /* ── Auto 路由连（演示） ── */
+  async getAutoChain(): Promise<{ chain: AutoChain; availableModels: string[] }> {
+    await sleep(LATENCY)
+    return {
+      chain: {
+        enabled: true,
+        timeout: 120,
+        models: [
+          'tr-DeepSeek-V4-Flash-Official',
+          'wb-deepseek-v4.1-flash',
+        ],
+      },
+      availableModels: MODELS.map((m) => m.routeModelId).sort(),
+    }
   },
 
-  /** 追加一条日志（用于演示自动滚动） */
-  appendLog(level: LogLevel, text: string): LogLine {
-    const line: LogLine = { id: ++seq, level, text, ts: Date.now() / 1000 }
-    LOGS = [...LOGS, line]
-    return line
+  async saveAutoChain(_chain: AutoChain): Promise<void> {
+    await sleep(LATENCY)
+  },
+
+  /* ── Loomy 登录（演示） ── */
+
+  async sendLoomyDesktopCode(
+    phone: string
+  ): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+    await sleep(LATENCY)
+    if (!/^1\d{10}$/.test(phone)) return { ok: false, error: '手机号格式不正确（演示校验）' }
+    return { ok: true, messageId: `demo-desktop-msg-${Date.now()}` }
+  },
+
+  async loomyDesktopLogin(
+    phone: string,
+    code: string
+  ): Promise<{ ok: boolean; userid?: string; name?: string; error?: string }> {
+    await sleep(LATENCY)
+    if (code === '000000') return { ok: false, error: '验证码错误（演示：任意 6 位数字均可）' }
+    const uid = `260913${String(Math.floor(Math.random() * 1e10)).padStart(10, '0')}`
+    ACCOUNTS = [
+      ...ACCOUNTS.filter((a) => a.id !== `Loomy:${uid}`),
+      {
+        id: `Loomy:${uid}`,
+        channel: 'Loomy',
+        name: `Loomy(${phone})`,
+        enabled: true,
+        status: 'enabled',
+        credits: 0,
+        workCredits: 0,
+        refreshedAt: Date.now() / 1000,
+      },
+    ]
+    emitAccountsChanged('Loomy')
+    return { ok: true, userid: uid, name: `Loomy(${phone})` }
+  },
+
+  async sendLoomyCode(
+    phone: string
+  ): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+    await sleep(LATENCY)
+    if (!/^1\d{10}$/.test(phone)) return { ok: false, error: '手机号格式不正确（演示校验）' }
+    return { ok: true, messageId: `demo-msg-${Date.now()}` }
+  },
+
+  async loomyWebLogin(
+    phone: string,
+    code: string
+  ): Promise<{ ok: boolean; userid?: string; name?: string; error?: string }> {
+    await sleep(LATENCY)
+    if (code === '000000') return { ok: false, error: '验证码错误（演示：任意 6 位数字均可）' }
+    // 演示：同手机号的 Web 半边并入既有合并行（桌面优先出 id/名字），
+    // 与真实后端 _loomy_groups 的「一行」语义一致
+    const desktop = ACCOUNTS.find(
+      (a) => a.channel === 'Loomy' && a.name === `Loomy(${phone})`
+    )
+    if (desktop) {
+      emitAccountsChanged('Loomy')
+      return { ok: true, userid: `web:${phone}`, name: desktop.name }
+    }
+    ACCOUNTS = [
+      ...ACCOUNTS.filter((a) => a.id !== `Loomy:web:${phone}`),
+      {
+        id: `Loomy:web:${phone}`,
+        channel: 'Loomy',
+        name: `Loomy Web(${phone})`,
+        enabled: true,
+        status: 'enabled',
+        credits: 0,
+        workCredits: 0,
+        refreshedAt: Date.now() / 1000,
+      },
+    ]
+    emitAccountsChanged('Loomy')
+    return { ok: true, userid: `web:${phone}`, name: `Loomy Web(${phone})` }
+  },
+
+  async checkLoomySession(phone: string): Promise<{ valid: boolean; nickname?: string }> {
+    await sleep(LATENCY / 2)
+    const hit = ACCOUNTS.find((a) => a.id === `Loomy:web:${phone}`)
+    return { valid: !!hit, nickname: hit ? '演示用户' : undefined }
   },
 
   /* ── 设置 ── */

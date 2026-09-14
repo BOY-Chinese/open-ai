@@ -1,4 +1,5 @@
 {
+  "api_key": "YOUR_API_KEY_HERE",
   "host": "0.0.0.0",
   "port": 8000,
   "max_req_per_min": 30,
@@ -66,8 +67,22 @@
         "tncHostFirst": "tnc3-bjlgy.zijieapi.com"
       },
       "trae_dir": "C:/Users/<USER>/AppData/Local/Programs/TRAE SOLO CN"
+    },
+    "workbuddy_intl": {
+      "enabled": true,
+      "domain": "www.workbuddy.ai",
+      "product": "workbuddy-ai",
+      "defaultModel": "deepseek-v4.1-flash",
+      "timeout": 300,
+      "switchEvery": 10,
+      "models": {
+        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+        "wbie-deepseek-v4.1-flash": "deepseek-v4.1-flash"
+      },
+      "accounts": []
     }
   },
+  "api_key_name": "",
   "api_keys": [],
   "runtime": {
     "heartbeat_interval": 10,

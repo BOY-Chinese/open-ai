@@ -49,9 +49,15 @@ except Exception:
 
 # Playwright 由 open-ai/.venv 提供
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
-LOG_PATH = os.path.join(HERE, '..', 'logs', 'login_workbuddy_intl.log')
+# ★ 打包态 __file__ 是相对路径, abspath 跟着 CWD 走 —— 钉死安装根。
+try:
+    import app_paths as _ap
+    OPENAI_CFG = _ap.CONFIG_PATH
+    LOG_PATH = os.path.join(_ap.LOGS_DIR, 'login_workbuddy_intl.log')
+except Exception:  # 源码态单独运行的兜底
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
+    LOG_PATH = os.path.join(HERE, '..', 'logs', 'login_workbuddy_intl.log')
 
 INTL_HOST = 'www.workbuddy.ai'
 INTL_DOMAIN = 'www.workbuddy.ai'

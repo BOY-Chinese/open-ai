@@ -12,3 +12,8 @@ APP_VERSION = 'v3.0-dev'
 # open-ai-installer-dev.exe; portable 便携版 (独立会话维护, APP_VERSION 形如
 # 'portable-v3.0') 走 portable 通道, 与本文件互不关联、各自独立发版。
 UPDATE_CHANNEL = 'dev'
+
+# 发布仓库 (owner/repo) —— 「检查更新」与「一键更新」查它的 latest release。
+# 保留为占位值是有意的: 仓库由发布者决定, 不该把某个人的 GitHub 账号写死进源码。
+# 部署时改这一处, 或设环境变量 OPEN_AI_UPDATE_REPO=<owner>/<repo> 覆盖。
+UPDATE_REPO = 'owner/open-ai'

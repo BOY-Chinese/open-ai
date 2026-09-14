@@ -32,7 +32,8 @@ import ctypes
 import subprocess
 import threading
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+import app_paths
+BASE = app_paths.ROOT          # 安装根; 打包态判定的唯一来源见 app_paths.py
 sys.path.insert(0, BASE)
 
 import procname
@@ -106,9 +107,9 @@ TASK_SHIM = lambda: procname.shim_for('task')
 SIGNIN_SCRIPT = os.path.join(BASE, 'scripts', 'signin_all.py')
 COLLECTOR_SCRIPT = os.path.join(BASE, 'scripts', 'usage_collector.py')
 SIGNIN_STATE = os.path.join(DATA_DIR, '.daemon_last_signin')
-SIGNIN_HOUR = 9
 TRAE_STATE = os.path.join(DATA_DIR, '.trae_signin_state')
 TRAE_RETRY_STATE = os.path.join(DATA_DIR, '.daemon_last_trae_retry')
+WB_RETRY_STATE = os.path.join(DATA_DIR, '.daemon_last_wb_retry')
 TRAE_RETRY_INTERVAL = 30 * 60
 USAGE_STATE = os.path.join(DATA_DIR, '.collector_last_run')
 USAGE_INTERVAL = 5 * 60
@@ -173,10 +174,20 @@ class TaskScheduler:
                 return rc
             except subprocess.TimeoutExpired:
                 log('[task] %s 超时(%ds), 终止' % (tag, TASK_TIMEOUT))
+                # ★ 别直接 p.kill(): 品牌 exe 是 PyInstaller onefile, Popen 起来的
+                #   是"父引导进程", kill() 把它打死 → 它没机会删 %TEMP%\_MEIxxxxxx,
+                #   而且真正的子进程会变成孤儿继续跑。先给它几秒自己收尾, 再兜底。
                 try:
-                    p.kill()
+                    _deadline = time.time() + 3.0
+                    while time.time() < _deadline and p.poll() is None:
+                        time.sleep(0.4)
                 except Exception:
                     pass
+                if p.poll() is None:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
                 return -2
         finally:
             self._running.pop(tag, None)
@@ -203,21 +214,34 @@ class TaskScheduler:
     def tick(self):
         """Broker 巡检循环里每轮调用。"""
         today = time.strftime('%Y-%m-%d')
-        # 每日签到
+        # 每日签到: 任务真正启动后才落状态。
+        # 修复 (2026-09-13): 旧版先写状态再启动, 若上一轮 --wb-only 恰在跑,
+        # 防重入会把本次跳过, 状态却已写死 → 当天全量签到(含 TRAE 续期)永不执行,
+        # 实测 2026-09-13 00:00 该竞态吞掉全量签到, TRAE token 过期无人续。
+        # 现在: 撞上 WB 补签在跑时不写状态, 下一轮巡检(5s)自动重试。
         if _read_state(SIGNIN_STATE) != today:
-            log('[task] 每日签到开始 (%s)' % today)
-            self.run_signin()
-            _write_state(SIGNIN_STATE, today)
-            _write_state(TRAE_RETRY_STATE, time.time())
-        elif _read_state(TRAE_STATE) != 'done':
-            # TRAE 9074 繁忙补试
+            if self._busy('signin'):
+                log('[task] 每日签到撞上 WB 补签在跑, 下一轮巡检重试')
+            else:
+                log('[task] 每日签到开始 (%s)' % today)
+                self.run_signin()
+                _write_state(SIGNIN_STATE, today)
+                _write_state(TRAE_RETRY_STATE, time.time())
+        elif _read_state(TRAE_STATE) != 'done:%s' % today:
+            # TRAE 9074 繁忙补试。
+            # 修复 (2026-09-13): 状态带日期 —— 旧版裸 'done' 是昨天的残留,
+            # 会把今天的补试也永久压制 (实测 09-13 全天没有一条 --trae-only)。
+            # 注意 --trae-only 里会顺带做 token 续期, token 过期也能自愈。
             if time.time() - float(_read_state(TRAE_RETRY_STATE, '0') or 0) >= TRAE_RETRY_INTERVAL:
                 log('[task] TRAE 仍未签上, 补试 (--trae-only)')
                 self.run_signin(['--trae-only'])
                 _write_state(TRAE_RETRY_STATE, time.time())
-        # WB 补签: 与 TRAE 补试同节奏 (--wb-only 幂等: 今日资源包已入账则秒退)
-        # 防 0 点跨天边界 daily-checkin 误报 10001 导致的漏签 (实测漏 100 分/账号)
-        if time.time() - float(_read_state(TRAE_RETRY_STATE, '0') or 0) >= TRAE_RETRY_INTERVAL:
+        # WB 补签: 独立节奏 (30 分钟一轮)。
+        # 修复 (2026-09-13): 旧版借用 TRAE_RETRY_STATE 判节拍且从不写回,
+        # 30 分钟后条件恒真 → 每 5 秒巡检 ×2 拍 = 每 10 秒拉起一次,
+        # 全天上万次无效请求。现在独立状态键, 启动即写时间戳。
+        if time.time() - float(_read_state(WB_RETRY_STATE, '0') or 0) >= TRAE_RETRY_INTERVAL:
+            _write_state(WB_RETRY_STATE, time.time())
             self.run_signin(['--wb-only'])
         # 逐笔流水
         try:

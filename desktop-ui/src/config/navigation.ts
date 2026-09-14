@@ -5,6 +5,7 @@ import {
   BarChart3,
   ScrollText,
   Settings,
+  Workflow,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -14,6 +15,7 @@ export type PageKey =
   | 'api'
   | 'models'
   | 'credits'
+  | 'auto_router'
   | 'logs'
   | 'settings'
 
@@ -28,7 +30,7 @@ export interface NavItem {
 
 /**
  * 导航分两组，中间由 flex spacer 撑开：
- *   顶部组 — 业务高频（账号 / API / 模型 / 积分）
+ *   顶部组 — 业务高频（账号 / API / 模型 / 积分 / Auto 路由连）
  *   底部组 — 低频工具（日志 / 设置）
  */
 export const NAV_TOP: NavItem[] = [
@@ -36,7 +38,7 @@ export const NAV_TOP: NavItem[] = [
     key: 'accounts',
     label: '账号管理',
     title: '账号管理',
-    description: 'Trae / WorkBuddy / WorkBuddy 国际三通道账号统一管理',
+    description: 'Trae / WorkBuddy / WorkBuddy 国际 / Loomy 四通道账号统一管理',
     icon: Users,
   },
   {
@@ -50,7 +52,7 @@ export const NAV_TOP: NavItem[] = [
     key: 'models',
     label: '模型列表',
     title: '模型列表',
-    description: '三通道模型与积分倍率、路由映射',
+    description: '四通道模型与积分倍率、路由映射',
     icon: Boxes,
   },
   {
@@ -60,14 +62,21 @@ export const NAV_TOP: NavItem[] = [
     description: '积分获取与消耗趋势',
     icon: BarChart3,
   },
+  {
+    key: 'auto_router',
+    label: 'Auto路由连',
+    title: 'Auto路由连',
+    description: '虚拟模型 Auto路由连：按顺序故障转移的模型路由链',
+    icon: Workflow,
+  },
 ]
 
 export const NAV_BOTTOM: NavItem[] = [
   {
     key: 'logs',
-    label: '系统日志',
-    title: '系统日志',
-    description: '网关与守护进程运行时输出',
+    label: '操作日志',
+    title: '操作日志',
+    description: '账号 / 密钥 / 模型等操作的执行记录',
     icon: ScrollText,
   },
   {

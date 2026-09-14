@@ -1,9 +1,34 @@
 <!doctype html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>open-ai 账号管理</title>
+    <script>
+      /* ── 主题防闪（必须内联、必须早于 <body> 渲染）────────────────────
+         外观设置存在 localStorage。若等 React 挂载后再切 <html class>，
+         用户会先看到一帧默认主题再跳到目标主题（深色系统上表现为白闪）。
+
+         规则与 src/lib/theme.ts 严格一致，改一处必须同步另一处：
+           key = 'open-ai.theme'，取值 light | dark | system，缺省 light
+           system → 读 prefers-color-scheme
+         解析失败一律回落到 light（需求规定的默认模式：白天）。 */
+      (function () {
+        var mode = 'light'
+        try {
+          var saved = localStorage.getItem('open-ai.theme')
+          if (saved === 'light' || saved === 'dark' || saved === 'system') mode = saved
+        } catch (e) {
+          /* localStorage 不可用（隐私模式）：用默认值 */
+        }
+        var dark =
+          mode === 'dark' ||
+          (mode === 'system' &&
+            window.matchMedia &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches)
+        if (dark) document.documentElement.classList.add('dark')
+      })()
+    </script>
   </head>
   <body class="bg-bg-app text-fg antialiased">
     <div id="root"></div>

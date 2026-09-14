@@ -13,7 +13,8 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
 
 ## v3.0 更新内容
 
-1. **全新桌面端（Tauri 2 + React 18）**：暗色主题、左侧导航、三通道统一表格；
+1. **全新桌面端（Tauri 2 + React 18）**：暗色主题、左侧导航、四通道统一表格
+   （Trae / WorkBuddy / WorkBuddy 国际 / Loomy）；
    安装包内置于 `desktop/`，桌面快捷方式默认拉起新桌面端。
 2. **前后端链路打通**：网关新增管理面 REST 接口 `/v1/admin/*`
    （账号 / API 密钥 / 模型 / 积分 / 日志），桌面端直接读取真实数据。
@@ -39,6 +40,13 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
    并清掉启动链里所有「回落到 Python GUI」的分支（`launcher_main.py`、
    `installer/launcher.py`、`start_hidden.ps1`、`installer.py` 生成的启动器）。
    界面**只有一个入口**：`desktop/open-ai-desktop.exe`。
+   > 后续清理：`launcher_main.py` 与其打包产物（`open-ai-launcher.exe` +
+   > `launcher_internal/`）**已一并删除** —— 桌面快捷方式早就直接指向
+   > `desktop/open-ai-desktop.exe`（见 `desktop-ui/tools/install-local-shortcut.ps1`），
+   > 开机自启走 `open-ai-autostart.vbs → start_hidden.ps1`，两条链路都不经过启动器。
+   > 若日后重建安装包链路需要「一键启动」入口，重写一个即可（原实现只做三件事：
+   > 建 runtime、`bootstrap.py start`、拉起桌面端）。
+   > `uninstall.exe` / `uninstall_internal/` **保留** —— 设置页「一键卸载」仍在调用它。
 11. **没有账号时模型列表为空**：Trae 的模型列表 = 动态上游模型 + 配置别名 + 默认模型，
     后两者是静态的，账号池为空时照样列出一堆调不通的模型。现按账号门控
     （判定口径与 `trae/server.js` 一致），无可用账号则不暴露任何模型。
@@ -61,6 +69,32 @@ OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼�
     重试一次**，所有管理面请求加 `no-store`。此前在界面开着时改 config.json，
     旧密钥失配 → 刷新失败 → 列表保持旧数据，看起来就像刷新按钮坏了。
 18. **「创建 API」按钮文案**：去掉与 `+` 图标重复的加号。
+19. **模型列表加本地缓存**：倍率接口要联网（秒级），此前每次进模型列表页都要空等一次。
+    现在把「四通道全量模型 + 已叠加视图偏好」的结果落一份到 `localStorage`，
+    首帧直接渲染、后台再拉最新数据；通道 / 显隐筛选同时改为**纯本地过滤**，
+    切换筛选不再触发网络请求（详见 `desktop-ui/src/lib/modelCache.ts`）。
+20. **「系统日志」改回 v2.3 的操作日志**：这一页原先读的是 `logs/gateway_out.log`
+    （网关自己在说什么），现改回 v2.3 的语义 —— 记录**用户在界面上做了什么**
+    （添加账号 / 刷新积分 / 重连 / 增删改密钥 / 改模型可见性 / 改自启 …）及结果与耗时，
+    格式沿用 v2.3 的 `────` 分隔 + `[账号]/[API]/[模型]/[设置]/[更新]` 领域标签 +
+    `[错误]` / `[完成]` 标记，并落盘保存。
+    埋点做在数据源层（`lib/oplogBackend.ts` 的 Proxy），新增写操作不会漏记。
+    **登录脚本输出实时跟随**（v2.3 `_subprocess_stream` 的等价物）：
+    新增 `GET /v1/admin/accounts/login/log` 增量读取 `logs/login_<通道>.log`，
+    前端每秒拉一段贴进日志，于是「添加账号」在日志里是**一个完整的操作块** ——
+    提示 → 脚本输出 → `[完成]`；脚本结束后自动刷新账号列表。
+    网关自身的运行输出仍可从本页「日志目录」按钮或托盘菜单查看。
+21. **新增外观设置（白天 / 夜间 / 跟随系统）**：系统设置 → 启动设置 → 「外观设置」。
+    此前界面是「暗色主题 First」且 `<html>` 写死 `class="dark"`；现在补了完整的
+    浅色令牌（逐项核算对比度，正文 17.9:1、语义色在同色 12% 底上 ≥4.5:1），
+    并把默认模式改为**白天**。跟随系统走 `prefers-color-scheme` 实时切换；
+    首帧由 `index.html` 内联脚本兜底，不会闪。图表配色随主题换（两套色板，
+    亮色系列在白底上会看不见，见 `src/config/chart.ts`）。
+22. **「每日签到」列改为只读的今日签到状态**：原先是可勾选的 Checkbox 且初值取
+    `a.enabled`，把「账号是否启用」当成了「今日是否签到」——勾选既不落库也不触发
+    任何签到动作。现在读 `data/usage_history.db` 的 gain 表（当日入账即签到成功的
+    客观凭证），显示「已签到 / 未签到」。新增只读接口 `GET /v1/admin/accounts/signin`；
+    接口不可用时显示「—」而非「未签到」（避免把接口故障渲染成「今天都没签」）。
 
 10. **修复模型列表「积分倍率」整列为 0**：三个根因 —— ① `admin_api` 里的 `import main`
    把网关**重复导入了一遍**，产生第二份 `PROVIDERS`，其 Trae 动态模型表为空
@@ -203,9 +237,11 @@ powershell -ExecutionPolicy Bypass -File desktop-ui\tools\check-tray.ps1 -Proces
 
 ```
 open-ai/
-├── main.py                 # FastAPI 网关入口 (--from-broker 启用心跳/优雅退出)
+├── app_paths.py            # ★ 安装根唯一定义处 (源码态=仓库根 / 打包态=exe 所在目录)
+├── main.py                 # FastAPI 网关入口 (--from-broker 心跳; --broker 兼当 Broker 宿主)
 ├── daemon.py               # Broker 薄入口 (兼容旧调用; 实际逻辑在 app_runtime.py)
 ├── app_runtime.py          # ★ Broker: Job 树/IPC 服务端/监督循环/定时任务
+├── auto_router.py          # 虚拟模型「Auto路由连」: 按 auto_chain.models 顺序故障转移
 ├── bootstrap.py            # ★ 统一控制 CLI: start/stop/restart/status/doctor
 ├── procname.py             # ★ 进程品牌注册表 + runtime 构建工厂 (图标/版本注入)
 ├── ipc.py                  # ★ 命名管道 IPC 协议 (帧编解码/心跳客户端/会话)
@@ -215,6 +251,8 @@ open-ai/
 ├── anthropic_api.py        # Anthropic 协议 ↔ OpenAI 协议转换
 ├── config.json             # ★ 核心配置 (含 runtime 节: 心跳/退避/内存限额)
 ├── MEMORY.md               # 关键事实记忆 (device_id 约束等, 打包必读)
+├── sanitize_check.py       # ★ 发布前隐私/凭据泄漏检查 (推 GitHub 前必跑)
+├── installer/              # ★ 一键安装包构建 (build_exe.bat [dev|portable] → open-ai-installer-<通道>.exe)
 ├── desktop/                # ★ v3.0 桌面端 (唯一界面): open-ai-desktop.exe (Tauri 2 + React)
 ├── desktop-ui/             # ★ 桌面端源码 (React + TypeScript + Tailwind; src-tauri = Rust 侧)
 ├── start.bat               # 一键启动 (建 venv / 装依赖 / 构建 runtime / 起 Broker)
@@ -230,23 +268,27 @@ open-ai/
 ├── providers/
 │   ├── __init__.py         # Provider 注册表 + 模型路由
 │   ├── workbuddy.py        # WorkBuddy (腾讯/混元) provider
+│   ├── loomy.py            # Loomy (讯飞) provider (静态 apiKey; lm-* 模型 + 动态模型目录)
 │   ├── base.py             # Provider 基类
 │   └── trae.py             # Trae provider (路由到本地 Node 后端)
 ├── trae/
 │   └── server.js           # Trae 内嵌 Node 后端 (:18787, 含 Broker IPC 客户端)
 ├── scripts/
 │   ├── api_store.py        # API 密钥存储管理 (create/rename/delete)
-│   ├── signin_all.py       # 统一签到脚本 (TRAE + WorkBuddy + token 续期)
+│   ├── signin_all.py       # 统一签到脚本 (TRAE + WorkBuddy + Loomy + token 续期)
+│   ├── loomy_client.py     # Loomy 通道客户端 (对话/模型目录/积分台账)
 │   ├── account_manager.py  # 账号读写与积分查询 (管理接口 admin_api.py 复用其逻辑)
 │   ├── usage_history.py    # ★ TRAE 逐笔积分消耗流水 (网页 dashboard 同款接口逆向)
 │   ├── wb_usage_history.py # ★ WorkBuddy 逐笔消耗流水 (官网个人中心同款接口逆向)
 │   ├── usage_collector.py  # ★ 逐笔流水自动采集 + 本地 SQLite 流水库 (Broker 调度)
 │   ├── login_trae.py       # 登录/添加 Trae 账号
+│   ├── task_main.py        # ★ open-ai-task.exe 入口 (按脚本名路由到已打包模块)
 │   └── login_workbuddy.py  # 登录/添加 WorkBuddy 账号
 ├── tests/                  # 单元测试 (unittest, 无第三方依赖)
 │   ├── test_api_store.py       # API 密钥管理逻辑测试
 │   ├── test_account_parse.py   # 账号解析逻辑测试
-│   └── test_procman.py         # ★ v2.4 进程管理测试 (Job/IPC/runtime)
+│   ├── test_procman.py         # ★ v2.4 进程管理测试 (Job/IPC/runtime)
+│   └── test_task_tick.py       # ★ TaskScheduler.tick 调度状态机回归测试
 ├── logs/  (*.log)          # ★ 运行日志 (broker/gateway_*/trae_*/signin/daemon_boot)
 ├── data/  (状态文件)       # ★ 运行状态 (runtime_state.json/PID/签到状态)
 └── .venv/                  # Python 虚拟环境
@@ -278,7 +320,7 @@ open-ai/
         "x-device-id": "<<真实 device_id>>" // ★ 必须与上面一致
       },
       "accounts": [{ "uid": "...", "token": "...", "cookie": "..." }],
-      "trae_dir": "C:/Users/Lenovo/AppData/Local/Programs/TRAE SOLO CN"
+      "trae_dir": "C:/Users/<用户>/AppData/Local/Programs/TRAE SOLO CN"
     }
   }
 }
@@ -307,20 +349,29 @@ open-ai/
 双击桌面 **`open-ai` 快捷方式**（或 `desktop\open-ai-desktop.exe`）打开管理界面。
 界面**只有这一个入口** —— 旧的 tkinter 界面（`账号管理.bat` 等）已在 v3.0 删除。
 
-六个页面：
-- **账号管理**：Trae / WorkBuddy / WorkBuddy 国际三通道合一表格，含每日签到、当前积分、
-  账号状态；底部可添加三类账号，右键行可复制账号名 / 重新连接 / 删除
+七个页面：
+- **账号管理**：Trae / WorkBuddy / WorkBuddy 国际 / Loomy 四通道合一表格，含每日签到（**今日是否
+  签到成功的只读状态**，以积分入账为凭证，不是可勾选的开关）、当前积分、账号状态；
+  底部可添加四类账号（Loomy 为图形化登录向导，全程无命令行），
+  右键行可复制账号名 / 重新连接 / 删除
 - **API 管理**：顶部展示网关地址（OpenAI 兼容 `http://127.0.0.1:8000/v1`、
   Anthropic 兼容 `http://127.0.0.1:8000`，按 config.json 的 host/port 生成），
   右键卡片可复制地址；下方创建 / 命名 / 复制 / 删除 API 密钥（改后立即生效）
-- **模型列表**：三通道合一，含积分倍率与「请求模型名称」（即实际路由表 ai 名称）；
-  右键行可复制请求模型名称 / 置顶 / 隐藏，支持多选批量操作
-- **积分看板**：今日情况（获取/消耗双卡片 + 逐笔流水）与每周情况（三通道堆叠柱状图，
+- **模型列表**：四通道合一，含积分倍率与「请求模型名称」（即实际路由表 ai 名称）；
+  右键行可复制请求模型名称 / 置顶 / 隐藏，支持多选批量操作。列表带**本地缓存**：
+  再次进入页面直接渲染上次结果并在后台拉取最新数据，不再空等联网的倍率接口
+- **Auto路由连**：虚拟模型「Auto路由连」的故障转移链配置页 —— 调整 `auto_chain.models`
+  的顺序（上移/下移）、启用开关与单模型超时；保存写入 `config.json` 的 `auto_chain` 段，
+  **立即生效无需重启**（网关每次请求都会重读配置）
+- **积分看板**：今日情况（获取/消耗双卡片 + 逐笔流水）与每周情况（四通道堆叠柱状图，
   可切通道与周次）
-- **系统日志**：网关与守护进程实时输出，级别着色、Ctrl+F 搜索、自动滚动
-- **系统设置**：启动设置（开机自动运行）、版本信息（一键更新，按 `UPDATE_CHANNEL`
+- **操作日志**：记录用户**在界面上做过的操作**（添加账号 / 刷新积分 / 重连 / 增删改密钥 /
+  改模型可见性 …）及其结果与耗时；等宽字体、级别着色、Ctrl+F 搜索、自动滚动，
+  本地保存（重启后仍在）。网关自身的运行输出仍可从「日志目录」按钮或托盘菜单查看
+- **系统设置**：启动设置（开机自动运行 + **外观设置**：白天 / 夜间 / 跟随系统，默认白天）、
+  版本信息（一键更新，按 `UPDATE_CHANNEL`
   在 GitHub Release Assets 精确匹配：dev → `open-ai-installer-dev.exe`；
-  portable → `open-ai-installer-portable.exe`；仓库 `BOY-Chinese/open-ai/releases`）、
+  portable → `open-ai-installer-portable.exe`；仓库 `<owner>/open-ai/releases`）、
   危险操作（一键卸载）
 
 ### 开发/手动启动
@@ -344,6 +395,36 @@ start.bat        # 首次建 .venv 装依赖 + 构建品牌化进程 (runtime/),
 - 开机自启：GUI「设置」页勾选「开机自动运行」（向启动文件夹写入隐藏启动脚本
   `open-ai-autostart.vbs`，以无窗口方式调用 `start_hidden.ps1` 拉起 Broker —— **开机无任何
   控制台窗口/报错闪现**，卸载时自动清理 `.vbs`/`.bat`/计划任务）
+
+### 构建一键安装包（dev / portable 通道）
+
+全部在 **Windows 侧**执行（PyInstaller 与 Tauri 都要产 Windows 二进制）。两步：
+
+```bat
+rem 1) 桌面端 (Tauri)。npm run build 产 dist, 再由 ps1 编译 Rust 并同步到 desktop\
+cd desktop-ui && npm install && npm run build
+powershell -ExecutionPolicy Bypass -File tools\build-tauri-release.ps1
+
+rem 2) 安装包: 构建 5 个品牌 exe + 资源包 + 安装器, 产物自动复制到桌面
+rem    通道决定产物名: 缺省 dev → open-ai-installer-dev.exe; 用户版 → portable
+installer\build_exe.bat portable
+```
+
+产物 `open-ai-installer-<通道>.exe` 内含 `daemon / gateway / task / open-ai.exe(CLI) /
+trae(node 副本) / desktop\open-ai-desktop.exe / uninstall.exe + trae\lib + pic`。
+**用户机器零 Python 依赖**（解释器都内嵌在 exe 里）。
+
+打包链路上有三道闸门，都是被真实事故逼出来的：
+
+| 闸门 | 拦的是 |
+|---|---|
+| `check_desktop_bundle.py` | 桌面端躺着**上一次**构建的 exe，而那次的前端还带着真实密钥 —— 用前端产物的内容哈希当指纹，指纹不对直接中止 |
+| `build_resources.py` 的 `REQUIRED` | 资源包缺 `trae/lib`（Trae 网络栈）也照样打包成功，装出来 Trae 通道静默不可用 |
+| `build_exe.bat` 的体积校验 | 只看「PyInstaller 没报错」而漏掉 `--add-data` 没生效的空壳包 |
+
+★ 安装根**不含任何 `.py` 源码**（exe 方案刻意不分发源码）。因此运行期那些
+「拉起某个 .py」的调用都改成「品牌 exe + 路径当路由参数」，由 exe 内打包好的
+模块**按文件名**接手 —— 见 `scripts/task_main.py` 与 `main.py` 的 `--broker`。
 
 ### 卸载
 GUI「设置」页点「一键卸载」，或运行安装目录下的 `uninstall.exe`：停止全部进程、
@@ -488,18 +569,43 @@ python scripts/signin_all.py --trae-only# 只补试 TRAE (供 Broker 白天反�
 | runtime 构建失败 | 删除 `runtime\` 目录后重新运行 `start.bat`（自动重建）；解释器需为 Store Python 3.13 或 python.org 3.10+（任选其一） |
 | 开机自启后**托盘没有图标** | v3.0 已修复：v2.4 自启只拉起 Broker，而托盘图标由 GUI 创建。现在自启会同时拉起界面（桌面端优先，回落 Python 托盘 GUI）。若仍是旧版，用「一键卸载」清理后重装 |
 | 开机自启弹控制台/报「daemon 未运行」 | v2.4 已修复：开机自启改为隐藏 VBS（无窗口）调用 `start_hidden.ps1`；若仍弹旧版残留的启动项/计划任务，用「一键卸载」清理后重装即可 |
-| 启动/卸载时弹 "Failed to remove temporary directory: ...\_MEIxxxxxx" | 已修复（launcher/uninstaller 改 PyInstaller onedir 打包，不再解压 `%TEMP%` 临时目录；onefile 引导器在 VM/杀软锁定文件时无法清理才会弹此框） |
+| 任务管理器/`%TEMP%` 里堆积 `_MEIxxxxxx` 残留 | **不是**"onedir 已修复"（此句曾误记：品牌 exe 与 uninstall.exe 至今都是 onefile，见 `installer/build_exe.bat`）。真实成因是停止流程把 onefile 父进程连同子进程一起强杀，父进程没机会清理临时目录；已改为"先轮询 leaf job 清空、超 12s 才强杀"（`bootstrap._wait_jobs_gone`），今后不再增长。存量用 `python installer\cleanup_temp.py --run` 清 —— 它先试 `os.rename`，有进程占用的目录必然重命名失败，因此不可能误删正在运行的实例 |
 
 ---
 
-## 9. 关键文件速查
+## 9. 推到 GitHub 之前（隐私闸门）
+
+本仓库的开发机上，`config.json` / `logs/` / `data/` 里是**真实可用的账号凭据**
+（accessToken、refreshToken、网关 api_key、cookie、device_id）。一次
+`git add -A` 就能把它们全部公开，而 GitHub 上改写历史极其麻烦。所以别靠记性：
+
+```bat
+python sanitize_check.py            "退出码 0 才算干净"
+git check-ignore -v config.json     "确认它真的被忽略"
+```
+
+检查器管三件事：① 敏感文件是否还躺在工作区；② 敏感**值**是否被写进任何会被
+提交的文件（JWT、`sk-` 密钥、已知账号 uid、个人标识、开发机私有绝对路径）；
+③ `.gitignore` 是否**确实**覆盖了这些路径（问 `git check-ignore`，而不是读文本
+—— 正则漏一条就等于没漏）。`--fix` 会清掉可再生的 `logs/ data/ runtime/`
+与配置备份，但 `config.json` 只提示不删（那是真实凭据，误删不可恢复）。
+
+**要改的东西一律用占位符**：`YOUR_DEVICE_ID` / `YOUR_API_KEY_HERE` /
+`DEMO-KEY-NOT-REAL-…`。真实值只留在本地 `config.json`，安装器另行生成的是
+`installer/config.shell.json` 那份空壳。特别注意
+`desktop-ui/src/lib/backend.ts` —— 它是**演示数据源**，会被 Vite 原样打进前端
+产物随安装包公开，那里的密钥与账号名必须是编造的。
+
+---
+
+## 10. 关键文件速查
 
 | 我想… | 看/改 |
 |---|---|
 | 管理账号/积分/API/自启/卸载 | 桌面端 `desktop\open-ai-desktop.exe`（源码 `desktop-ui/`） |
 | 窗口 X 后找不到界面了 | 没退出，最小化到了**系统托盘**（右下角 open-ai 图标）→ 左键点击即恢复 |
 | 托盘图标不见了 | 由桌面端（Rust `tray-icon`）创建。用 `desktop-ui\tools\check-tray.ps1 -ProcessName open-ai-desktop` 验证；图标不显示时先确认是否被 Win11 收进托盘溢出区（`^`） |
-| 托盘「退出」没退出 | 看 `logs\gui_exit.log`（退出链路逐步诊断）与 `logs\broker.log`（应出现 `gui-shutdown`）；退出流程有多重兜底（IPC→Job 清理→抑制标记→5s 看门狗硬退出），正常必退 |
+| 托盘「退出」没退出 | 看 `logs\broker.log`（应出现 `gui-shutdown`）；退出流程有多重兜底（IPC→Job 清理→抑制标记→5s 看门狗硬退出），正常必退。<br>（原先还让看 `logs\gui_exit.log` —— 那份日志由**已删除的 Python GUI** 写入，v3.0 起不会再产生，排查请只看 `broker.log`） |
 | 管理 API 密钥 | GUI「API管理」页 → `scripts/api_store.py` |
 | 换模型/加别名 | `config.json` → `providers.workbuddy.models` |
 | 修签到失败(9074) | `config.json` → `providers.trae.device_id` / `headers.x-device-id`（填真实 machineid） |

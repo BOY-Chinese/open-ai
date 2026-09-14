@@ -175,9 +175,25 @@ export async function ensureGateway(opts: EnsureOptions = {}): Promise<GatewayPr
 
   const rt = await gatewayRuntime()
   if (!rt.canStart) {
-    // 浏览器开发态 / 找不到安装根：无法代劳，交由界面提示手工启动
+    // 无法代为拉起后端。这个分支有两种完全不同的成因，**必须分开报**：
+    // 静默返回会让界面只剩一句「无法连接网关」，把「装不完整 / 找不到安装根」
+    // 这种一手问题伪装成网络问题 —— 虚拟机上就是这么白排查了一轮。
     onPhase?.('offline')
-    return first
+    if (!rt.inTauri) {
+      return { ...first, reason: '浏览器预览模式不代为启动后端，请手动运行网关。' }
+    }
+    if (!rt.root) {
+      return {
+        ...first,
+        reason:
+          '未找到 open-ai 安装目录（桌面端需与品牌 exe 同级，或位于其 desktop\\ 子目录下）。' +
+          '请确认安装包已完整安装到目录，而不是单独拷贝了桌面端 exe。',
+      }
+    }
+    return {
+      ...first,
+      reason: `已找到安装目录 ${rt.root}，但缺少可拉起的后端入口（open-ai.exe / open-ai-daemon.exe）。`,
+    }
   }
 
   onPhase?.('starting')

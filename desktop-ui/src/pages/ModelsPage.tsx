@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   RefreshCw,
   Boxes,
@@ -11,6 +11,8 @@ import {
   Square,
   X,
   Layers,
+  Database,
+  TriangleAlert,
 } from 'lucide-react'
 import {
   PageShell,
@@ -26,6 +28,7 @@ import { Switch } from '@/components/ui/switch'
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select'
 import { TableSkeleton } from '@/components/ui/skeleton'
 import { TableEmpty } from '@/components/ui/table'
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -38,7 +41,8 @@ import { VirtualTable } from '@/components/data/VirtualTable'
 import { useToast } from '@/components/feedback/Toast'
 import { useAsync, useSelection } from '@/hooks/useAsync'
 import { backend } from '@/lib/dataSource'
-import { cn } from '@/lib/utils'
+import { filterModelView, readModelCache, writeModelCache } from '@/lib/modelCache'
+import { cn, fmtTime } from '@/lib/utils'
 import { CHANNELS, type ChannelFilter, type ModelEntry, channelMeta } from '@/types/domain'
 
 /** 基础列（多选模式会额外插入勾选列，故宽度动态计算）
@@ -59,11 +63,62 @@ export function ModelsPage() {
   const [selectionMode, setSelectionMode] = useState(false)
   const [busy, setBusy] = useState(false)
 
-  const { data: models, loading, reload, setData } = useAsync(
-    () => backend.listModels({ channel, showHidden }),
-    [channel, showHidden],
-    [] as ModelEntry[]
+  /**
+   * 本地缓存快照 —— **同步**读取，首次 render 就有内容可画。
+   *
+   * 惰性初始化保证整页只读一次 localStorage；页面随导航卸载/重挂载会再读一次，
+   * 因此「离开模型列表页再回来」同样是秒开，而不是又一轮骨架屏。
+   * 缓存的由来见 `lib/modelCache.ts`（倍率端点要联网，是首屏等待的根源）。
+   */
+  const [cache] = useState(readModelCache)
+
+  const {
+    status,
+    data: allModels,
+    reload,
+    setData,
+  } = useAsync(
+    // ★ 只拉一次全量：通道 / 显隐筛选改在本地做（见下方 useMemo）。
+    //   原先是把 channel 塞进依赖，切一次筛选就多一次秒级网络往返 + 一次骨架屏。
+    () => backend.listModels({ channel: 'all', showHidden: true }),
+    [],
+    cache?.list ?? ([] as ModelEntry[])
   )
+
+  /** 当前视图 = 全量 ∩ 通道 ∩ 显隐（与写入缓存使用同一个过滤函数） */
+  const models = useMemo(
+    () => filterModelView(allModels, channel, showHidden),
+    [allModels, channel, showHidden]
+  )
+
+  /** 已经成功拿到过一次服务端数据（此后不再是「纯缓存视图」） */
+  const [everLoaded, setEverLoaded] = useState(false)
+  useEffect(() => {
+    if (status === 'success') setEverLoaded(true)
+  }, [status])
+
+  /**
+   * 缓存落盘 —— 全页唯一的写入点。
+   *
+   * 只在 `status === 'success'` 时写：否则「首帧用的是缓存」这件事会把缓存
+   * 原样回写一遍并刷新 savedAt，等于用旧数据冒充新数据（陈旧提示就永远不会出现）。
+   * 隐藏/置顶这类本地乐观修改会让 allModels 变化，故它们同样会顺带更新缓存。
+   */
+  useEffect(() => {
+    if (status === 'success' && allModels.length > 0) writeModelCache(allModels)
+  }, [status, allModels])
+
+  /** 首帧来自缓存、且新数据尚未就绪 —— 用「本地缓存」提示替代骨架屏 */
+  const showingCache = cache !== null && !everLoaded
+  /** 最新一次拉取失败（此时界面上的内容是缓存，需要如实标注而非假装正常） */
+  const loadFailed = status === 'error'
+  /** 首屏仍在加载（无缓存可显示时才真正空屏） */
+  const initialLoading = status === 'idle' || status === 'loading'
+  const showSkeleton = initialLoading && models.length === 0
+
+  /** 最新全量列表（回滚用）—— 渲染期同步到 ref，避免把它塞进 patch 的依赖 */
+  const allRef = useRef(allModels)
+  allRef.current = allModels
 
   const ids = useMemo(() => models.map((m) => m.id), [models])
   const sel = useSelection(ids)
@@ -74,23 +129,29 @@ export function ModelsPage() {
     sel.clear()
   }, [sel])
 
-  /** 统一的行数据变更入口：乐观更新 + 失败回滚 */
+  /**
+   * 统一的行数据变更入口：乐观更新 + 失败回滚。
+   *
+   * 回滚用的是**整份全量列表快照**，而不是当前视图 —— 视图是筛选后的子集，
+   * 拿它 setData 会把未显示的通道整段抹掉（曾是个真实隐患）。
+   *
+   * 另外：隐藏后不再需要重新拉取。视图由 `models` 本地派生，`hidden` 一变，
+   * 「显示隐藏模型」未勾选时该行会立即从列表消失，效果与刷新一致但无网络等待。
+   */
   const patch = useCallback(
     async (targetIds: string[], next: Partial<ModelEntry>, label: string) => {
-      const prev = models
+      const snapshot = allRef.current
       const set = new Set(targetIds)
       setData((list) => list.map((m) => (set.has(m.id) ? { ...m, ...next } : m)))
       try {
         await backend.updateModels(targetIds, next)
         toast(label, 'success')
-        // 隐藏操作会改变筛选结果，需要重新拉取
-        if (next.hidden !== undefined) await reload()
       } catch {
-        setData(prev)
+        setData(snapshot)
         toast('操作失败，已回滚', 'error')
       }
     },
-    [models, setData, reload, toast]
+    [setData, toast]
   )
 
   const onToggleHidden = useCallback(
@@ -191,7 +252,29 @@ export function ModelsPage() {
           刷新
         </Button>
 
-        <span className="ml-auto text-sm text-fg-subtle tabular">
+        <span className="ml-auto flex items-center gap-2 text-sm text-fg-subtle tabular">
+          {/* 缓存状态：让「为什么一进来就有数据 / 数据是不是旧的」有明确交代 */}
+          {showingCache && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex">
+                  <Badge variant={loadFailed ? 'warning' : 'outline'}>
+                    {loadFailed ? (
+                      <TriangleAlert className="size-3" />
+                    ) : (
+                      <Database className="size-3" />
+                    )}
+                    {loadFailed ? '离线 · 本地缓存' : '本地缓存'}
+                  </Badge>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                {loadFailed
+                  ? '网关暂时不可达，当前显示的是上一次缓存的模型列表'
+                  : `已先用本地缓存渲染${cache?.savedAt ? `（缓存于 ${fmtTime(cache.savedAt / 1000)}）` : ''}，正在后台拉取最新数据`}
+              </TooltipContent>
+            </Tooltip>
+          )}
           {models.length} 个模型
           {sel.count > 0 && <span className="ml-2 text-primary">已选 {sel.count}</span>}
         </span>
@@ -227,7 +310,7 @@ export function ModelsPage() {
       )}
 
       <PageBody>
-        {loading ? (
+        {showSkeleton ? (
           <TableSkeleton rows={8} cols={columns.length} />
         ) : (
           <VirtualTable
@@ -236,12 +319,26 @@ export function ModelsPage() {
             rowKey={(m) => m.id}
             threshold={50}
             empty={
-              <TableEmpty
-                colSpan={columns.length}
-                icon={Boxes}
-                title="没有匹配的模型"
-                description={showHidden ? '换个通道筛选试试' : '当前筛选下无可见模型，可开启「显示隐藏模型」'}
-              />
+              /* 拉取失败 ≠ 没有模型。此前两者共用「没有匹配的模型」文案，
+                 网关连不上时用户会读成「我模型怎么全没了」—— 一个看起来
+                 完全正常的错误结论。失败时给出原因与重试入口。 */
+              loadFailed && models.length === 0 ? (
+                <TableEmpty
+                  colSpan={columns.length}
+                  icon={TriangleAlert}
+                  title="模型列表加载失败"
+                  description="网关暂时不可达，当前没有可用数据。可点「刷新」重试；若网关刚重启，稍候几秒再试。"
+                />
+              ) : (
+                <TableEmpty
+                  colSpan={columns.length}
+                  icon={Boxes}
+                  title="没有匹配的模型"
+                  description={
+                    showHidden ? '换个通道筛选试试' : '当前筛选下无可见模型，可开启「显示隐藏模型」'
+                  }
+                />
+              )
             }
             rowProps={(m) => ({ 'data-selected': selectionMode && sel.has(m.id) ? true : undefined })}
             wrapRow={(m, _i, content) => (
@@ -337,7 +434,7 @@ export function ModelsPage() {
       </PageBody>
 
       {/* 表头全选（多选模式）：置于底部操作栏左侧，避免与 sticky 表头冲突 */}
-      {selectionMode && !loading && models.length > 0 && (
+      {selectionMode && !initialLoading && models.length > 0 && (
         <div className="mt-3 flex items-center gap-3">
           <label className="flex cursor-pointer items-center gap-2 text-base text-fg-muted">
             <Checkbox

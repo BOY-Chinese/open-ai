@@ -31,8 +31,10 @@ import json
 import ctypes
 import subprocess
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+import app_paths
+BASE = app_paths.ROOT          # 安装根 (打包态 = exe 所在目录)
 sys.path.insert(0, BASE)
+sys.path.insert(0, app_paths.SCRIPTS_DIR)
 
 import procname
 import ipc
@@ -192,6 +194,38 @@ def _kill_pid_tree(pid):
             _terminate_pid(v)
 
 
+def _wait_jobs_gone(names, timeout=12.0):
+    """轮询等待这些 Job 里的进程自己退干净, 返回还剩的 pid。
+
+    ★ 为什么不能"发完优雅关闭请求就睡 3 秒然后 TerminateJobObject":
+      品牌 exe 是 PyInstaller **onefile** —— Popen 起来的其实是"父引导进程",
+      真跑业务的是它解包到 %TEMP%\\_MEIxxxxxx 后再生出的子进程。父进程必须
+      **活着等到子进程退出**, 才有机会把 _MEI 目录删掉。
+      TerminateJobObject 会把父子**一起**干掉 → 父进程被剥夺执行机会 →
+      _MEI 目录永久遗留。每次 stop 漏一个, 实测一台机器攒了 11~28 个。
+      (对应 issue: %TEMP% 下 _MEI* 堆积)
+
+    所以这里先等, 等不动了才强杀 —— 强杀仍保留为兜底, 不能因为怕留垃圾
+    就把停止流程变成"可能永远停不下来"。
+    """
+    deadline = time.time() + timeout
+    leftover = []
+    while time.time() < deadline:
+        leftover = []
+        for nm in names:
+            try:
+                j = jobmgmt.open_job(nm)
+                if j:
+                    leftover.extend(j.pids())
+                    j.close()
+            except Exception:
+                pass
+        if not leftover:
+            return []
+        time.sleep(0.5)
+    return leftover
+
+
 def cmd_stop():
     _console_utf8()
     print('[stop] 开始优雅关闭...')
@@ -202,19 +236,20 @@ def cmd_stop():
                 'pid': os.getpid(), 'reason': 'bootstrap stop'})
         c.close()
         print('[stop] 已向 Broker 发送优雅关闭请求')
-        time.sleep(3.0)
     except Exception:
         print('[stop] 管道不可用 (Broker 可能未运行), 走 Job 清理')
-    # 1) leaf job 收尾 (优雅超时后仍存活的)
+    # 1) leaf job 收尾: **先等子进程自然退出**, 让 onefile 父进程能清理 _MEI;
+    #    超过耐心值仍赖着不走的才强杀 (兜底, 宁可留一个临时目录也不能停不掉)。
     leaf_map = {'gateway': 'open-ai.gateway', 'trae': 'open-ai.trae',
                 'task': 'open-ai.task'}
+    stuck = _wait_jobs_gone(list(leaf_map.values()), timeout=12.0)
+    if stuck:
+        print('[stop] 优雅退出超时, 仍存活: %s — 强制终止' % stuck)
     for role, name in leaf_map.items():
         try:
             j = jobmgmt.open_job(name)
             if j:
-                pids = j.pids()
-                if pids:
-                    print('[stop] %s (job %s): %s' % (role, name, pids))
+                if j.pids():
                     j.terminate()
                 j.close()
         except Exception as e:
@@ -354,7 +389,27 @@ def cmd_daemon():
     return app_runtime.main()
 
 
+def _normalise_argv():
+    """丢掉 argv[1] 里那个「路由用的脚本路径」。
+
+    源码形态 `python bootstrap.py start`: argv = ['bootstrap.py', 'start'],
+    argv[1] 就是子命令, 一切正常。
+
+    打包形态 `open-ai-daemon.exe <安装根>\bootstrap.py start`: exe 本身就是
+    bootstrap.py, 但所有调用方 (桌面端 lib.rs 的 stop_all_backends、计划任务、
+    start.bat) 沿用「解释器 + 脚本路径」这套 argv, 于是那个路径落到 argv[1],
+    子命令被挤到 argv[2] —— 结果是把路径当命令名, 打印用法后返回 2,
+    表现为「托盘退出没反应」「开机自启没起来」, 而且完全不报错。
+
+    判据很稳: 真正的子命令 (start|stop|restart|status|doctor|daemon)
+    永远不会以 .py 结尾, 所以遇到 .py 就当成路由标记丢掉。
+    """
+    while len(sys.argv) > 1 and sys.argv[1].lower().endswith('.py'):
+        sys.argv.pop(1)
+
+
 def main():
+    _normalise_argv()
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'status'
     fn = {'start': cmd_start, 'stop': cmd_stop, 'restart': None,
           'status': cmd_status, 'doctor': cmd_doctor, 'daemon': cmd_daemon}.get(cmd)

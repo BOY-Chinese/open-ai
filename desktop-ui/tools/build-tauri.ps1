@@ -4,10 +4,12 @@
 # 本机 rustup 的 manifest 拉取在国内网络下反复中断，shim 会报 Missing manifest。
 $ErrorActionPreference = 'Continue'
 
-$Root      = 'D:\app\dsh_plugin\open-ai'
+# 仓库根 = 本脚本所在目录 (desktop-ui/tools) 上溯两级。
+$Root      = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Toolchain = "$Root\toolchain\bin"
 $TauriDir  = "$Root\desktop-ui\src-tauri"
-$env:CARGO_HOME = 'C:\Users\Lenovo\.cargo'
+# CARGO_HOME 默认落在用户目录下, 而该目录名就是本机登录用户名 —— 不能写死
+$env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 
 Write-Host "=== 工具链 ==="
 if (-not (Test-Path "$Toolchain\rustc.exe")) {

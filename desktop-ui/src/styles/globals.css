@@ -3,13 +3,98 @@
 @tailwind utilities;
 
 /* ═══════════════════════════════════════════════════════════════
-   open-ai 暗色主题令牌 (Dark Mode First)
+   open-ai 主题令牌（双主题）
    所有颜色仅在此处定义，组件内一律通过 Tailwind 语义类引用。
-   色值区间遵循设计规范：背景 #0F0F0F~#1A1A1A，卡片 #1E1E1E~#252525
-   HSL 分量写法（无 hsl() 包裹）以便 Tailwind 调节透明度。
+
+   主题切换机制
+   ------------
+   * 白天（浅色）= 默认，`:root` 令牌生效
+   * 夜间（深色）= `<html class="dark">`，由 `.dark` 块覆盖
+     两者特异性相同（:root 与 .dark 都是 0,1,0），故 **顺序即优先级**：
+     `.dark` 必须写在 `:root` 之后。
+   * 用户在「系统设置 → 启动设置 → 外观设置」里选择 白天 / 夜间 / 跟随系统，
+     由 `src/lib/theme.ts` 负责读写并切换 class；首帧前的防闪由
+     `index.html` 里的内联脚本完成（不能等 React 挂载，否则会闪一帧）。
+
+   色值以 HSL 分量书写（无 hsl() 包裹），便于 Tailwind 以
+   `hsl(var(--x) / <alpha>)` 调整透明度。
+
+   对比度（WCAG AA，已逐项核算，不是估的）
+   ------------------------------------
+   浅色主题：正文 17.9:1 / 次要 6.0:1 / 弱化 4.8:1 / 极弱 3.4:1；
+             语义色在同色 12% 底上 ≥4.5:1（success 4.8 / warning 4.9 / danger 4.8 / primary 5.6）
+   深色主题：正文 19.2:1 / 次要 7.4:1 / 弱化 4.0:1 / 极弱 2.5:1
    ═══════════════════════════════════════════════════════════════ */
 @layer base {
-  :root,
+  /* ─────────────── 白天（浅色）— 默认主题 ─────────────── */
+  :root {
+    /* 层级：越「靠前」越亮（与深色主题相反方向，语义一致：
+       应用底 < 侧边栏 < 内容区 < 卡片 = 越高越突出） */
+    --bg-app: 220 16% 95%;        /* #F0F2F4  应用底 */
+    --bg-sidebar: 220 20% 97%;    /* #F6F7F9  侧边栏 */
+    --bg-content: 220 25% 98%;    /* #F9F9FB  内容区 */
+    --bg-card: 0 0% 100%;         /* #FFFFFF  卡片 */
+    --bg-card-hover: 220 16% 96%; /* #F3F4F6  卡片悬停 */
+    --bg-input: 0 0% 100%;        /* #FFFFFF  输入框 */
+    --bg-log: 220 20% 98%;        /* #F9FAFB  日志底 */
+
+    /* 边框 */
+    --border: 220 13% 91%;        /* #E5E7EB */
+    --border-subtle: 220 16% 95%; /* #F0F2F4 */
+    --border-strong: 220 9% 84%;  /* #D3D5DA */
+
+    /* 文字 */
+    --fg: 222 47% 11%;            /* #0F1729  17.9:1 */
+    --fg-muted: 220 9% 40%;       /* #5D636F   6.0:1 */
+    --fg-subtle: 220 9% 46%;      /* #6B7280   4.8:1 */
+    --fg-faint: 220 8% 56%;       /* #868C98   3.4:1 */
+
+    /* 主色（白底 6.8:1，同色 12% 底 5.6:1） */
+    --primary: 221 83% 45%;       /* #1450D2 */
+    --primary-hover: 221 83% 38%;
+    --primary-fg: 0 0% 100%;
+    --primary-soft: 221 83% 45%;
+
+    /* 状态色（均按「同色 12% 底 ≥4.5:1」选定，深色主题的亮色值在白底上不够用） */
+    --success: 142 72% 27%;       /* #137638   4.8:1 */
+    --success-soft: 142 72% 27%;
+    --warning: 35 92% 30%;        /* #935806   4.9:1 */
+    --warning-soft: 35 92% 30%;
+    --danger: 0 72% 45%;          /* #C52020   4.8:1（白字实底 5.8:1） */
+    --danger-hover: 0 72% 38%;
+    --danger-soft: 0 72% 45%;
+
+    /* 四通道品牌色（表格圆点，需对白底 ≥3:1） */
+    --channel-trae: 220 9% 46%;   /* #6B7280  4.8:1 */
+    --channel-wb: 142 72% 36%;    /* #1A9E4A  3.5:1 */
+    --channel-wbie: 32 95% 38%;   /* #BD6705  4.1:1 */
+    --channel-loomy: 258 83% 54%; /* #7C3AED  3.9:1 紫 */
+
+    /* 图表专用：Trae 系列。深色主题用 #71717A，浅色主题下同值仍达 4.8:1，可复用 */
+    --chart-trea: 220 9% 46%;
+
+    /* 控件「关闭」态底色（Switch 轨道）：白滑块需要足够深的轨道才看得见 */
+    --control-off: 220 8% 56%;    /* #868C98 → 白滑块对其 3.4:1 */
+
+    /* 遮罩：浅色主题下 60% 黑过重，降低到 45% */
+    --overlay: 222 47% 11%;
+
+    /* 滚动条 */
+    --scrollbar: 220 9% 78%;
+    --scrollbar-hover: 220 9% 66%;
+
+    /* 骨架屏微光：浅色下必须是暗色微光，白色的在白底上不可见 */
+    --skeleton-glow: 0 0% 0%;
+
+    /* 阴影：浅色主题要「轻而散」，纯黑阴影会显脏 */
+    --shadow-card: 0 1px 2px 0 hsl(220 20% 20% / 0.06);
+    --shadow-popup: 0 6px 16px -4px hsl(220 20% 20% / 0.16);
+
+    /* 原生控件（滚动条、输入框光标）跟随主题 */
+    color-scheme: light;
+  }
+
+  /* ─────────────── 夜间（深色）— 由 <html class="dark"> 激活 ─────────────── */
   .dark {
     /* ── 背景层级 ── */
     --bg-app: 0 0% 6%;            /* #0F0F0F  应用底 */
@@ -25,7 +110,7 @@
     --border-subtle: 0 0% 14%;    /* #242424 */
     --border-strong: 0 0% 26%;    /* #424242 */
 
-    /* ── 文字（深色模式对比度实测：fg 15.8:1 / muted 7.2:1 / subtle 4.6:1）── */
+    /* ── 文字（对比度实测：fg 19.2:1 / muted 7.4:1 / subtle 4.0:1）── */
     --fg: 0 0% 100%;              /* #FFFFFF */
     --fg-muted: 0 0% 63%;         /* #A1A1AA */
     --fg-subtle: 0 0% 45%;        /* #737373 */
@@ -35,7 +120,7 @@
     --primary: 217 91% 60%;       /* #3B82F6 */
     --primary-hover: 217 91% 66%;
     --primary-fg: 0 0% 100%;
-    --primary-soft: 217 91% 60%;  /* 配 /10~/15 透明度做高亮底 */
+    --primary-soft: 217 91% 60%;
 
     /* ── 状态色 ── */
     --success: 142 71% 45%;       /* #22C55E */
@@ -46,15 +131,31 @@
     --danger-hover: 0 84% 66%;
     --danger-soft: 0 84% 60%;
 
-    /* ── 三通道品牌色（与需求一致，图表与徽标共用）── */
+    /* ── 四通道品牌色（图表与徽标共用）── */
     --channel-trae: 0 0% 10%;     /* #1A1A1A 深灰 */
     --channel-wb: 142 71% 45%;    /* #22C55E 绿 */
     --channel-wbie: 48 96% 53%;   /* #EAB308 黄 */
+    --channel-loomy: 258 90% 76%; /* #A78BFA 亮紫（深色底） */
 
     /* 图表专用：Trae 系列。
        需求指定 #1A1A1A，但在同色卡片底上对比度 1:1 完全不可见，
        故提升到中性灰以满足「图形元素对背景 ≥3:1」的无障碍要求。 */
     --chart-trea: 240 4% 46%;     /* #71717A zinc-500 */
+
+    /* 深色下轨道本来就够深，白滑块清晰可见 */
+    --control-off: 0 0% 26%;      /* #424242 */
+
+    --overlay: 0 0% 0%;
+
+    --scrollbar: 0 0% 24%;
+    --scrollbar-hover: 0 0% 34%;
+
+    --skeleton-glow: 0 0% 100%;
+
+    --shadow-card: 0 1px 2px 0 hsl(0 0% 0% / 0.24);
+    --shadow-popup: 0 4px 12px -2px hsl(0 0% 0% / 0.5);
+
+    color-scheme: dark;
   }
 }
 
@@ -82,7 +183,7 @@
     outline-offset: 1px;
   }
 
-  /* 滚动条：细窄暗色 */
+  /* 滚动条：细窄，跟随主题 */
   ::-webkit-scrollbar {
     width: 10px;
     height: 10px;
@@ -91,13 +192,13 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: hsl(0 0% 24%);
+    background: hsl(var(--scrollbar));
     border: 2px solid transparent;
     background-clip: content-box;
     border-radius: 8px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(0 0% 34%);
+    background: hsl(var(--scrollbar-hover));
     background-clip: content-box;
   }
   ::-webkit-scrollbar-corner {
@@ -135,7 +236,7 @@
     background: linear-gradient(
       90deg,
       transparent,
-      hsl(0 0% 100% / 0.04),
+      hsl(var(--skeleton-glow) / 0.05),
       transparent
     );
   }

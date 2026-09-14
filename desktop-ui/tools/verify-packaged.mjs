@@ -67,7 +67,7 @@ try {
   check('未出现网关错误门', !body.includes('无法连接后端网关'))
 
   const aside = await page.evaluate(() => document.querySelector('aside')?.innerText ?? '')
-  for (const label of ['账号管理', 'API 管理', '模型列表', '积分看板', '系统日志', '系统设置']) {
+  for (const label of ['账号管理', 'API 管理', '模型列表', '积分看板', '操作日志', '系统设置']) {
     check(`侧边栏含「${label}」`, aside.includes(label))
   }
   check('侧边栏显示网关运行中', aside.includes('网关运行中'))
@@ -78,7 +78,7 @@ try {
     api: (t) => /API 管理/.test(t),
     models: (t) => /模型列表/.test(t),
     credits: (t) => /积分看板/.test(t),
-    logs: (t) => /系统日志/.test(t),
+    logs: (t) => /操作日志/.test(t),
     settings: (t) => /系统设置/.test(t),
   }
   for (const [hash, test] of Object.entries(SUMMARY)) {

@@ -7,6 +7,7 @@ Open-API — 统一 OpenAI 兼容聚合网关 (open-ai, 端口 8000)
   * workbuddy      — 腾讯 WorkBuddy 网关 (copilot.tencent.com 内置 DeepSeek 等)
   * workbuddy-intl — WorkBuddy 国际版网关 (www.workbuddy.ai, wbie-* 模型)
   * trae           — TRAE 内嵌 Node 后端 (trae/server.js, 转发 18787, Work 积分通道, DeepSeek-V4-Flash-Official)
+  * loomy          — 讯飞 Loomy 办公助手 (loomyad.xunfei.cn, lm-* 模型, 静态 apiKey)
 
 端点:
   GET  /v1/models                 所有提供商模型列表
@@ -16,10 +17,15 @@ Open-API — 统一 OpenAI 兼容聚合网关 (open-ai, 端口 8000)
 鉴权: Authorization: Bearer <api_key> (config.json 的 api_key, 默认 open-api-key)
 
 模型路由 (providers/__init__.py route_provider):
+  模型名以 "lm-" 开头或含 "loomy"      → loomy provider (lm-<上游模型名>)
   模型名以 "tr-" 开头或含 "trae"      → trae provider (tr-<上游模型名>, Work 积分通道)
   模型名以 "wbie" 开头或含 "intl"     → workbuddy-intl provider (wbie-<上游模型名>)
   模型名含 "workbuddy" 或以 "wb-" 开头 → workbuddy provider
   其他 → 第一个 provider (workbuddy)
+
+虚拟模型 Auto路由连 (auto_router.py):
+  model == "Auto路由连" (兼容历史名 "Auto-mode") 时按 config.json 的
+  auto_chain.models 顺序做故障转移, 与上游内置 auto 别名无关。
 
 模型列表: 三通道均每日自动同步上游 (/v1/models 无需改代码跟随上游更新)。
   国际版走 /v2/enterprises/personal/models 目录接口。
@@ -40,13 +46,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from providers import build_providers, route_provider
 from anthropic_api import (anthropic_to_openai, openai_to_anthropic,
                            openai_stream_to_anthropic, aggregate_stream)
+from auto_router import (is_auto_model, auto_chat, auto_stream, AutoExhausted,
+                         AUTO_MODEL, load_auto_chain)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("openapi")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+from app_paths import ROOT as BASE_DIR, CONFIG_PATH  # 安装根: 见 app_paths.py
 
 
 def load_config() -> dict:
@@ -114,16 +121,28 @@ async def _refresh_trae_models(force: bool = False):
             logger.warning("trae 模型刷新异常: %s", e)
 
 
+async def _refresh_loomy_models(force: bool = False):
+    """Loomy 模型目录每日刷新 (上游 GET /models, token 头鉴权)。"""
+    lm = PROVIDERS.get("loomy")
+    if lm is not None and hasattr(lm, "sync_models"):
+        try:
+            await lm.sync_models(force=force)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("loomy 模型刷新异常: %s", e)
+
+
 async def _model_refresh_loop():
-    """启动时先刷新, 之后每 24h 刷新一次 (workbuddy + 国际版 + trae 动态模型)。"""
+    """启动时先刷新, 之后每 24h 刷新一次 (workbuddy + 国际版 + trae + loomy 动态模型)。"""
     await _refresh_workbuddy_models(force=True)
     await _refresh_workbuddy_intl_models(force=True)
     await _refresh_trae_models()
+    await _refresh_loomy_models()
     while True:
         await asyncio.sleep(MODEL_REFRESH_INTERVAL)
         await _refresh_workbuddy_models()
         await _refresh_workbuddy_intl_models()
         await _refresh_trae_models()
+        await _refresh_loomy_models()
 
 
 @app.on_event("startup")
@@ -237,6 +256,11 @@ async def list_models(request: Request):
     data = []
     for p in PROVIDERS.values():
         data.extend(p.list_models())
+    # Auto 路由连: 自定义路由链 (仅当已配置链时暴露)
+    chain = load_auto_chain()
+    if chain.get("enabled", True) and (chain.get("models") or []):
+        data.append({"id": AUTO_MODEL, "object": "model", "created": 0,
+                     "owned_by": "auto-chain"})
     return {"object": "list", "data": data}
 
 
@@ -258,6 +282,45 @@ async def chat_completions(request: Request):
                                        "type": "invalid_request_error"}}, status_code=400)
 
     model = body.get("model", "")
+
+    # Auto 路由连: 自定义模型路由链 (与平台内置 auto 无关)
+    if is_auto_model(model):
+        if not body.get("messages"):
+            return JSONResponse({"error": {"message": "messages 不能为空",
+                                           "type": "invalid_request_error"}}, status_code=400)
+        stream_auto = bool(body.get("stream", False))
+
+        async def run_auto_stream():
+            try:
+                async for kind, payload in auto_stream(route_provider, PROVIDERS, body):
+                    if kind == "meta":
+                        continue
+                    yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            except AutoExhausted as e:
+                logger.warning("Auto 路由连 全部模型失败: %s", e)
+                err = {"error": {"message": f"Auto路由连 全部模型失败: {e}",
+                                 "type": "upstream_error"}}
+                yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Auto 路由连 流式失败")
+                err = {"error": {"message": str(e)[:300], "type": "upstream_error"}}
+                yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+        if stream_auto:
+            return StreamingResponse(run_auto_stream(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache",
+                                              "X-Accel-Buffering": "no"})
+        try:
+            return JSONResponse(await auto_chat(route_provider, PROVIDERS, body))
+        except AutoExhausted as e:
+            return JSONResponse({"error": {"message": f"Auto路由连 全部模型失败: {e}",
+                                           "type": "upstream_error"}}, status_code=502)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Auto 路由连 非流式失败")
+            return JSONResponse({"error": {"message": str(e)[:300],
+                                           "type": "upstream_error"}}, status_code=502)
+
     provider = route_provider(model, PROVIDERS)
     if provider is None:
         return JSONResponse({"error": {"message": "该模型提供商未配置或未注册, 请检查 config.json",
@@ -395,7 +458,8 @@ async def reload_providers(request: Request):
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
-if __name__ == "__main__":
+def _run_gateway():
+    """网关本体 (uvicorn)。--from-broker 时额外挂 IPC 心跳 + 优雅退出协议。"""
     import sys
     import uvicorn
 
@@ -436,3 +500,33 @@ if __name__ == "__main__":
                 heartbeat.stop(reason="gateway exit")
             except Exception:
                 pass
+
+
+def _run_broker():
+    """Broker 本体 (进程监督 + 定时任务 + IPC 服务端)。
+
+    ★ 为什么 Broker 要能跑在**网关进程**里 (而不仅是 open-ai-daemon.exe):
+      exe 打包方案下, 子进程是「品牌化 exe + 一个脚本路径参数」启动的
+      (见 app_runtime.SUPERVISED / bootstrap.spawn_broker, 两处都写死了
+      `<脚本>.py` 路径)。这种启动方式在源码安装里成立, 在 exe 安装里不成立 ——
+      安装目录只有 exe, 没有那些 .py。于是网关必须能被当作"脚本"启动:
+        open-ai-gateway.exe <安装根>\\main.py --broker
+      参数里的路径只是路由标记, 真正跑的是 exe 里打包好的模块。
+
+    单实例: daemon.py 内已有 mutex + 状态文件双保险, 重复拉起是空操作。
+    存活语义: 本函数返回前不退出 —— 进程活着 = Broker 活着, 退出 = 全树清空。
+    """
+    import daemon
+    try:
+        daemon.main()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    import sys
+    if "--broker" in sys.argv:
+        _run_broker()
+    else:
+        _run_gateway()
+

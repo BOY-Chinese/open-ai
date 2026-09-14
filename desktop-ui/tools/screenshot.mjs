@@ -58,7 +58,7 @@ const PAGES = [
   { label: 'API 管理', file: '02-api' },
   { label: '模型列表', file: '03-models' },
   { label: '积分看板', file: '04-credits' },
-  { label: '系统日志', file: '05-logs' },
+  { label: '操作日志', file: '05-logs' },
   { label: '系统设置', file: '06-settings' },
 ]
 

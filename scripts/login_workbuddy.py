@@ -39,8 +39,13 @@ except Exception:
 
 # Playwright 由 open-ai/.venv 提供
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
+# ★ 打包态 __file__ 是相对路径, abspath 跟着 CWD 走 —— config 必须钉死安装根。
+try:
+    import app_paths as _ap
+    OPENAI_CFG = _ap.CONFIG_PATH
+except Exception:  # 源码态单独运行的兜底
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
 LOGIN_URL_TMPL = ('https://www.workbuddy.cn/login/?platform=workbuddy'
                   '&state={state}&version=5.3.12&loginSessionId={lsid}')
 ENTERPRISE_MARK = '/console/login/enterprise'

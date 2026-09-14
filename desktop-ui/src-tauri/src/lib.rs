@@ -39,16 +39,26 @@ const MAIN_WINDOW: &str = "main";
 
 // ─────────────────────────── 安装根目录定位 ───────────────────────────
 
-/// 判断目录是否是 open-ai 根目录：同时存在后端入口脚本与网关配置
+/// 判断目录是否是 open-ai 根目录（两种安装形态各自成立）
 fn is_root(p: &Path) -> bool {
-    // 判据只要求 bootstrap.py + main.py（后端入口）。
+    //   源码形态：仓库根下 bootstrap.py + main.py 都在，python 直接跑。
+    //
+    //   exe 打包形态：安装根**故意不带 .py 源码**（只有品牌 exe + trae\ + pic\
+    //   + version.py）。若仍只看上面那条判据，find_root() 会从 desktop\ 一路
+    //   上溯到盘根都匹配不到 → 返回 None → gateway_config 给出 can_start=false，
+    //   start_backend 报「未找到 open-ai 安装目录」→ **没有任何人拉起 Broker**，
+    //   网关端口永远不监听；用户只看到「无法连接网关」，而网关本体是好的
+    //   （手动 start open-ai-gateway.exe 立刻 200）。虚拟机实测踩过这条。
+    //   打包形态因此改用品牌 exe 本身当标记 —— 它们由安装器放在安装根，布局固定。
     //
     // ★ 不要把 config.json 列为必需：它是**可缺**的 —— 用户可能在手动换配置、
     //   卸载残留、或正处在「没有账号/没有密钥」的测试场景里。一旦要求它存在，
-    //   find_root() 会返回 None，界面直接报「未找到 open-ai 安装目录」，
-    //   连网关都连不上，把一个「缺配置文件」的小问题放大成「应用不可用」。
+    //   一个「缺配置文件」的小问题会被放大成「应用不可用」。
     //   （本机实测踩到：用户删掉 config.json 后，桌面端整个失效。）
-    p.join("bootstrap.py").is_file() && p.join("main.py").is_file()
+    let source_layout = p.join("bootstrap.py").is_file() && p.join("main.py").is_file();
+    let packaged_layout = p.join("open-ai-gateway.exe").is_file()
+        && (p.join("open-ai-daemon.exe").is_file() || p.join("open-ai.exe").is_file());
+    source_layout || packaged_layout
 }
 
 /// 定位 open-ai 根目录。
@@ -147,10 +157,19 @@ fn stop_all_backends(root: &Path) {
         .unwrap_or(0.0);
     let _ = std::fs::write(data.join(".gui_exit_suppress"), format!("{ts}"));
 
-    let cli = root.join("runtime").join("Scripts").join("open-ai.exe");
+    // 控制入口的三种安装形态, 按可用性依次尝试 (找到即停):
+    //   1. <安装根>\open-ai.exe            —— exe 打包方案 (品牌 CLI, 无控制台窗口闪烁)
+    //   2. runtime\Scripts\open-ai.exe     —— 源码方案下 procname 生成的 shim
+    //   3. .venv\Scripts\python.exe + bootstrap.py —— 全新 clone、还没建 runtime
+    // ★ 第 1 条必须有: 打包安装里既没有 runtime\ 也没有 .venv\, 只列后两条会让
+    //   托盘「退出」静默无效 —— 后端全留在后台, 用户以为已经退了 (实测踩过)。
+    let cli_root = root.join("open-ai.exe");
+    let cli_runtime = root.join("runtime").join("Scripts").join("open-ai.exe");
     let py = root.join(".venv").join("Scripts").join("python.exe");
-    let entry = if cli.is_file() {
-        cli
+    let entry = if cli_root.is_file() {
+        cli_root
+    } else if cli_runtime.is_file() {
+        cli_runtime
     } else if py.is_file() {
         py
     } else {
@@ -191,11 +210,17 @@ fn launch_uninstaller(root: &Path) -> Result<PathBuf, String> {
 }
 
 /// 后端启动入口优先级：
-///   1. 品牌化 shim（runtime\Scripts\open-ai-daemon.exe，任务管理器显示 open-ai）
-///   2. venv 里的 python.exe（全新安装、尚未生成 shim 时）
-///   3. venv 里的 pythonw.exe（无控制台版本，最后兜底）
+///   1. 品牌化 CLI（<安装根>\open-ai.exe，exe 打包方案）
+///   2. 品牌化 shim（runtime\Scripts\open-ai-daemon.exe，源码方案，任务管理器显示 open-ai）
+///   3. venv 里的 python.exe / pythonw.exe（全新 clone、尚未生成 shim 时）
+///
+/// ★ 第 1 条不能省：exe 安装里既没有 runtime\ 也没有 .venv\, 只列后面几条会让
+///   `gateway_config.can_start` 返回 false —— 界面直接判定「无法拉起后端」,
+///   哪怕同一个目录里就躺着能用的 open-ai-daemon.exe。
 fn backend_entry(root: &Path) -> Option<PathBuf> {
     let candidates = [
+        root.join("open-ai.exe"),
+        root.join("open-ai-daemon.exe"),
         root.join("runtime").join("Scripts").join("open-ai-daemon.exe"),
         root.join(".venv").join("Scripts").join("python.exe"),
         root.join(".venv").join("Scripts").join("pythonw.exe"),

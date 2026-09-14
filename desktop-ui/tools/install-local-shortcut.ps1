@@ -6,10 +6,17 @@
 #   (Tauri + React) the shortcut silently kept opening the OLD window.
 #   This script repoints it at the desktop build and keeps the icon.
 #
+# NOTE (later cleanup)
+#   open-ai-launcher.exe + launcher_internal/ + launcher_main.py have since been
+#   deleted entirely -- nothing in the startup chain referenced them any more.
+#   If you rebuild the installer chain and want a "one-click start" entry again,
+#   write a new one; it only needs three steps:
+#     build runtime (procname.py) -> bootstrap.py start -> spawn desktop\open-ai-desktop.exe
+#
 # The target path mirrors the INSTALLED layout (<root>\desktop\open-ai-desktop.exe),
 # so the local machine and a fresh VM install run the exact same entry point.
 param(
-    [string]$Root = 'D:\app\dsh_plugin\open-ai',
+    [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
     [string]$ShortcutName = 'open-ai.lnk'
 )
 

@@ -49,9 +49,17 @@ try:
 except Exception:
     pass
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
-DB_PATH = os.path.join(BASE, '..', 'data', 'usage_history.db')
+# ★ 路径必须钉死在安装根: 打包态 (PyInstaller onefile) 里 __file__ 是相对路径,
+#   abspath() 会跟着进程 CWD 走 —— VM 实测踩过: 网关 CWD 在 %TEMP% 时, data/ 被
+#   解析到 %TEMP%\data\, 重装后仍把陈旧流水库当现役库读 (2026-09-14 事故)。
+try:
+    import app_paths as _ap  # 打包态/由网关导入: 安装根唯一定义处
+    OPENAI_CFG = _ap.CONFIG_PATH
+    DB_PATH = os.path.join(_ap.DATA_DIR, 'usage_history.db')
+except Exception:  # 源码态单独运行 (python scripts/credits_api.py): __file__ 是绝对路径, 安全
+    BASE = os.path.dirname(os.path.abspath(__file__))
+    OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
+    DB_PATH = os.path.join(BASE, '..', 'data', 'usage_history.db')
 
 # 平台枚举: 前端用它渲染下拉/图例/表头, 不要自己写死中文。
 #   key      —— 稳定标识, 与 usage.platform / gain.platform 一致
@@ -66,6 +74,8 @@ PLATFORMS = (
      'provider': 'workbuddy', 'color': '#4a7fe0'},
     {'key': 'workbuddy_intl', 'label': 'WorkBuddy 国际', 'short': 'WB国际',
      'provider': 'workbuddy_intl', 'color': '#2fa87a'},
+    {'key': 'loomy', 'label': 'Loomy', 'short': 'Loomy',
+     'provider': 'loomy', 'color': '#A78BFA'},
 )
 PLATFORM_KEYS = tuple(p['key'] for p in PLATFORMS)
 _BY_KEY = {p['key']: p for p in PLATFORMS}
@@ -174,6 +184,21 @@ def accounts():
     for p in PLATFORMS:
         seg = prov.get(p['provider']) or {}
         items = []
+        if p['key'] == 'loomy':
+            # Loomy 账号字段是小写 userid（讯飞协议），且同名手机号的
+            # 桌面+Web 两条在账号页已合并成一行 —— 这里只出桌面半边
+            # （uid 与 usage/gain 表的归属一致），Web 半边跳过避免重名。
+            seen_uid = set()
+            for a in (seg.get('accounts') or []):
+                uid = str(a.get('userid') or '')
+                if not uid or uid in seen_uid or not a.get('session'):
+                    continue
+                seen_uid.add(uid)
+                items.append({'uid': uid,
+                              'name': a.get('name') or uid,
+                              'enabled': a.get('enabled', True) is not False})
+            out[p['key']] = items
+            continue
         for a in (seg.get('accounts') or []):
             uid = str(a.get('uid') or a.get('userId') or '')
             items.append({'uid': uid,
@@ -358,6 +383,43 @@ def gains_daily(start=None, end=None, platform=None):
              'platform_label': platform_label(r['platform']),
              'amount': round(float(r['a'] or 0), 4),
              'kinds': kmap.get((r['day'], r['platform']), [])} for r in rows]
+
+
+def gains_accounts(day=None):
+    """某一天「各账号」的获取积分明细 (签到 / 资源包入账的凭证)。
+
+    为什么需要它：gain 表里的记录就是**今日签到成功的客观证据** ——
+    TRAE 写 kind='checkin'，WorkBuddy 系写今日入账的资源包
+    （见 usage_collector.collect_gains 的注释：WB 的 checkin-status 在
+    active=false 的账号上恒报未签，只有资源包入账才可信）。
+    因此「今日是否签到成功」不去问上游，直接查这张表。
+
+    返回 {platform: {uid: {'amount','kinds','ts','checked'}}};
+    库不存在 / 该日无记录返回 {}。`checked` 恒为 True —— 有记录即签到成功，
+    调用方只需判断 uid 是否出现在结果里，不必再解析 kind。
+    """
+    if day is None:
+        day = day_str(time.time())
+    s = day_str(parse_day(day))
+    conn = _connect()
+    if conn is None:
+        return {}
+    try:
+        rows = _rows(conn, 'SELECT platform, uid, amount, kind, updated_at '
+                           'FROM gain WHERE day = ? ORDER BY updated_at ASC', (s,))
+    finally:
+        conn.close()
+    out = {}
+    for r in rows:
+        slot = out.setdefault(r['platform'], {})
+        item = slot.setdefault(str(r['uid']), {
+            'amount': 0.0, 'kinds': [], 'ts': int(r['updated_at'] or 0), 'checked': True,
+        })
+        item['amount'] = round(item['amount'] + float(r['amount'] or 0), 4)
+        if r['kind'] and r['kind'] not in item['kinds']:
+            item['kinds'].append(r['kind'])
+        item['ts'] = max(item['ts'], int(r['updated_at'] or 0))
+    return out
 
 
 def gains_summary(start=None, end=None, platform=None):

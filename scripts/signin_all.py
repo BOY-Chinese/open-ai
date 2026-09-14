@@ -231,90 +231,81 @@ def _wb_headers(acc, domain, product):
     return headers
 
 
-def _wb_pack_credited_today(acc, domain, product,
-                            base='https://copilot.tencent.com'):
-    """检查该 WB 账号今天是否有入账的资源包 (签到积分到账的真实凭证)。"""
-    headers = _wb_headers(acc, domain, product)
-    code, raw = post_json(base + '/billing/meter/get-user-resource', headers)
-    if code != 200:
-        return True   # 查询失败时保守放行, 不阻断正常流程
+def _wb_post_result(base, path, headers):
+    """POST 并返回 (ok, result_dict, http_code)。
+
+    ⚠️ 只有「HTTP 200 + JSON 解析成功」才 ok=True。
+    传输失败 (HTTP 0, 如超时) / 非 200 非 JSON / 解析失败一律 ok=False ——
+    修复旧版"兜底 {'code': 0} 把超时记成签到成功"的假成功 bug
+    (实测 2026-09-12 16:22/16:28 两条假成功, 耗时均为 15s 超时整)。
+    """
+    code, raw = post_json(base + path, headers)
+    if code == 0:
+        return False, {'_error': f'传输失败: {raw[:120]}'}, 0
     try:
         d = json.loads(raw)
-        accounts = d['data']['Response']['Data']['Accounts']
     except Exception:
-        return True
-    today = time.strftime('%Y-%m-%d')
-    for a in accounts:
-        ct = a.get('CreateTime')
-        try:
-            if time.strftime('%Y-%m-%d', time.localtime(float(ct) / 1000)) == today:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return False
+        return False, {'_error': f'响应非 JSON: {raw[:120]}'}, code
+    if not isinstance(d, dict):
+        return False, {'_error': f'响应结构异常: {str(d)[:120]}'}, code
+    return True, d, code
 
 
 def wb_checkin_one(acc, domain, product,
                    base='https://copilot.tencent.com', tag='WB签到'):
     """WorkBuddy 系签到 (国内 host=copilot.tencent.com, 国际版 host=www.workbuddy.ai)。
 
-    国际版与国内版接口路径完全一致, 差异只有 host 与 X-Product-Code,
-    故用 base/tag 参数化复用同一套补领与资源包校验逻辑。
+    2026-09-13 按"深扒国际版签到"实测结论重写 (详见 MEMORY.md):
+    1. 状态接口切换到官方在用的 checkin-activity-status:
+       旧 checkin-status 是废弃接口, 返回死数据 (国内账号实测 active=false/streak=0,
+       同一时刻新接口 active=true/streak=13/total=1300), 官方 web/IDE 均只用新接口。
+    2. active=false 时跳过领取: 官方 UI 在 active=false 时连签到入口都不渲染,
+       此时 daily-checkin 必返回 10001"签到活动未开启或已过期"。
+       国际版 (workbuddy.ai) 目前无签到渠道, 账号恒为该形态 —— 每天只打 1 次状态
+       探测, 不再每 10 秒白打领取请求。
+    3. 10001 是终态 (官方错误映射: 1001=已领 1002=无资格 1003=活动结束,
+       其余未知), 不再"补领"—— 补领 100% 失败, 只是刷日志。
+    4. 仅 HTTP 200 + JSON 解析成功 + code==0 才算签到成功。
     """
     uid = acc.get('userId', '?')
+    if acc.get('enabled') is False:
+        log(tag, f'账号{uid} enabled=false, 跳过')
+        return
     headers = _wb_headers(acc, domain, product)
-    code, raw = post_json(base + '/billing/meter/checkin-status', headers)
-    if code != 200:
-        log(tag, f'账号{uid} 状态查询失败 HTTP {code}')
+
+    # 1) 活动状态 (官方真实接口)
+    ok, d, code = _wb_post_result(base, '/billing/meter/checkin-activity-status', headers)
+    if not ok:
+        # 状态查询失败不瞎领: 宁可等 daemon 下轮补试 (30 分钟), 也不盲打领取
+        log(tag, f'账号{uid} 活动状态查询失败 HTTP {code} ({d.get("_error", "")})')
         return
-    try:
-        d = json.loads(raw)
-        st = d.get('data') or {}
-    except Exception:
-        log(tag, f'账号{uid} 状态解析失败: {raw[:100]}')
-        return
+    st = d.get('data') or {}
     if st.get('today_checked_in'):
         log(tag, f'账号{uid} 今日已签到 (streak={st.get("streak_days", 0)})')
         return
-    # 注意: 不依赖 status 的 active 字段判断是否跳过 —— 实测即使 active=false,
-    # daily-checkin 也照常返回 code:0/credit:100 (每日基础积分可领)。
-    # 若 active=false 就跳过, 会漏签。改为始终调用 daily-checkin,
-    # 由服务端幂等处理 (重复领取返回 400 / 已签)。
     if not st.get('active'):
-        log(tag, f'账号{uid} active=false 但仍尝试直接领取')
-    code, raw = post_json(base + '/billing/meter/daily-checkin', headers)
-    try:
-        result = json.loads(raw)
-    except Exception:
-        result = {'code': code, 'raw': raw[:100]}
-    c = result.get('code')
+        # 活动对该账号未开启/未参与 (终态): 打 daily-checkin 必 10001, 直接跳过
+        log(tag, f'账号{uid} 签到活动未参与 (active=false), 今日跳过领取')
+        return
+
+    # 2) 领取 (仅 active=true 且今日未签时才会走到这里)
+    ok, d, code = _wb_post_result(base, '/billing/meter/daily-checkin', headers)
+    if not ok:
+        log(tag, f'账号{uid} 领取请求失败 HTTP {code} ({d.get("_error", "")})')
+        return
+    c = d.get('code')
     if c == 0:
-        credit = (result.get('data') or {}).get('credit', '')
-        streak = (result.get('data') or {}).get('streak_days', '')
+        credit = (d.get('data') or {}).get('credit', '')
+        streak = (d.get('data') or {}).get('streak_days', '')
         log(tag, f'账号{uid} 签到成功! credit={credit} streak={streak}')
     elif c == 10001:
-        # ⚠️ 10001 不能盲信为"已签": 实测 0 点跨天边界服务端会误报 10001,
-        # 而实际积分没到账 (当日无入账资源包)。用资源包校验, 无入账则补领一次。
-        if _wb_pack_credited_today(acc, domain, product, base=base):
-            log(tag, f'账号{uid} 今日已签到(10001, 资源包已入账)')
-        else:
-            log(tag, f'账号{uid} 10001 但无入账包(疑似跨天误报), 补领...')
-            time.sleep(3)
-            code2, raw2 = post_json(base + '/billing/meter/daily-checkin', headers)
-            try:
-                r2 = json.loads(raw2)
-            except Exception:
-                r2 = {}
-            if r2.get('code') == 0:
-                credit2 = (r2.get('data') or {}).get('credit', '')
-                log(tag, f'账号{uid} 补领成功! credit={credit2}')
-            else:
-                log(tag, f'账号{uid} 补领仍失败 code={r2.get("code")} '
-                         f'(若持续, 检查 {today_str()} 资源包是否入账)')
+        # 服务端终态拒绝 (已领过/活动未开启): 不补领
+        log(tag, f'账号{uid} 服务端判定不可领取 (code=10001), 视为终态')
     elif c == 400:
         log(tag, f'账号{uid} 今日已签到(HTTP 400/重复领取)')
     else:
-        log(tag, f'账号{uid} 签到失败 code={c} message={result.get("message") or result.get("msg") or ""} raw={raw[:200]}')
+        log(tag, f'账号{uid} 签到失败 code={c} '
+                 f'message={d.get("message") or d.get("msg") or ""}')
 
 
 # 国际版 host (与国内版接口路径完全一致)
@@ -324,6 +315,72 @@ WB_INTL_BASE = 'https://www.workbuddy.ai'
 def wb_intl_checkin_one(acc, domain, product):
     """WorkBuddy 国际版签到 (www.workbuddy.ai)。"""
     wb_checkin_one(acc, domain, product, base=WB_INTL_BASE, tag='WB国际签到')
+
+
+# ================= Loomy 每日登录积分 =================
+# Loomy (讯飞) 每日首次登录领取: POST /api/v1/points/first-login (头 token: <session>)
+# Web 账号 (kind=web, 凭据 cookies) 无显式领取端点 —— 积分随当日登录由服务端
+# 自动发放, 故「签到」语义 = 会话有效 + 拉到 points-summary。
+# 两条路径的结果都写入 data/loomy_signin_state.json (按天覆盖), 供
+# admin_api /accounts/signin 渲染账号页「每日签到」列 —— Loomy 不进流水库,
+# 这份缓存就是「今天领没领到」的本地唯一凭证。
+
+def loomy_daily_one(acc):
+    import loomy_client as lc
+    userid = acc.get('userid', '')
+    phone = acc.get('phone', '?')
+    if not acc.get('enabled', True):
+        log('Loomy', f'账号{phone} 已禁用, 跳过')
+        return
+
+    # ---- Web 账号 (cookies): 登录即领取 ----
+    cookies = acc.get('cookies')
+    if cookies:
+        ok, me = lc.web_me(cookies)
+        if not ok:
+            lc.record_daily_result(userid, False, error='Web 会话失效, 请重新添加账号')
+            log('Loomy', f'账号{phone} Web 会话失效, 未领取')
+            return
+        pok, ps = lc.web_request_json('GET', '/web/api/auth/points-summary', cookies)
+        if pok and isinstance(ps, dict):
+            d = ps.get('data') or {}
+            lc.record_daily_result(userid, True, data={
+                'currentBalance': d.get('permanent'),
+                'dailyBalance': d.get('daily'),
+                'dailyQuota': d.get('daily'),
+            })
+            log('Loomy', f"账号{phone} 今日登录成功! 永久={d.get('permanent')} "
+                         f"每日额度={d.get('daily')}")
+        else:
+            lc.record_daily_result(userid, True, data=None,
+                                   error=f'积分查询失败: {str(ps)[:120]}')
+            log('Loomy', f'账号{phone} 登录成功但积分查询失败: {str(ps)[:120]}')
+        return
+
+    # ---- 桌面账号 (session): 显式领取 first-login ----
+    session = acc.get('session', '')
+    if not session:
+        log('Loomy', f'账号{phone} 无 session, 跳过')
+        return
+    try:
+        ok, r = lc.first_login_reward(session)
+    except Exception as e:
+        lc.record_daily_result(userid, False, error=str(e))
+        log('Loomy', f'账号{phone} 领取异常: {e}')
+        return
+    if not ok or not isinstance(r, dict):
+        lc.record_daily_result(userid, False, error=str(r)[:200])
+        log('Loomy', f'账号{phone} 领取失败: {r}')
+        return
+    if r.get('code') != '000000':
+        lc.record_daily_result(userid, False, error=f"code={r.get('code')} desc={r.get('desc')}")
+        log('Loomy', f"账号{phone} 领取失败 code={r.get('code')} desc={r.get('desc')}")
+        return
+    d = r.get('data') or {}
+    lc.record_daily_result(userid, True, data=d)
+    log('Loomy', f"账号{phone} 领取成功! 当前余额={d.get('currentBalance')} "
+                 f"每日={d.get('dailyBalance')}/{d.get('dailyQuota')} "
+                 f"已领={d.get('alreadyProcessed')}")
 
 
 # ================= TRAE 签到 =================
@@ -430,16 +487,18 @@ def main():
 
     # --wb-only: 仅供 daemon 白天补签 WorkBuddy (跳过续期与 TRAE)
     if wb_only:
+        # 2026-09-13 重写: 旧版用资源包预检 (_wb_pack_credited_today) 判"今日已入账",
+        # 会把注册/订阅礼包误判为签到入账 (实测新账号注册当天被挡, 100 分没领),
+        # 且查询失败时 fail-open 也跳过领取。现在统一交给 wb_checkin_one:
+        # 其内部用官方 checkin-activity-status 的 today_checked_in/active 判定,
+        # 幂等 (已签/未参与都直接返回), 重复调用无副作用。
         wb = providers.get('workbuddy') or {}
         wb_accs = wb.get('accounts') or []
         domain = wb.get('domain', 'www.workbuddy.cn')
         product = wb.get('product', 'SaaS')
         log('WB签到', f'--wb-only 补签检查 ({len(wb_accs)} 个账号)')
         for acc in wb_accs:
-            if not _wb_pack_credited_today(acc, domain, product):
-                wb_checkin_one(acc, domain, product)
-            else:
-                log('WB签到', f"账号{acc.get('userId', '?')} 今日已入账, 跳过")
+            wb_checkin_one(acc, domain, product)
         # 国际版同样走 --wb-only 补签 (daemon 白天补试也覆盖国际版账号)
         wbai = providers.get('workbuddy_intl') or {}
         wbai_accs = wbai.get('accounts') or []
@@ -448,28 +507,29 @@ def main():
         if wbai_accs:
             log('WB国际签到', f'--wb-only 补签检查 ({len(wbai_accs)} 个账号)')
             for acc in wbai_accs:
-                if not _wb_pack_credited_today(acc, i_domain, i_product, base=WB_INTL_BASE):
-                    wb_intl_checkin_one(acc, i_domain, i_product)
-                else:
-                    log('WB国际签到', f"账号{acc.get('userId', '?')} 今日已入账, 跳过")
+                wb_intl_checkin_one(acc, i_domain, i_product)
         log('WB补签', '本轮补签检查完成')
         sys.exit(0)
 
-    # --trae-only: 仅供 daemon 白天补试 TRAE, 跳过续期与 WB
-    if not trae_only:
-        # 1) TRAE token 续期
-        if do_renew:
-            log('续期', f'TRAE token 自动续期 ({len(trae_accs)} 个账号, 阈值 {RENEW_THRESHOLD // 3600}h)')
-            changed = renew_trae_tokens(trae, force, device_id)
-            if changed:
-                openai_cfg['providers']['trae'] = trae
-                save_json(OPENAI_CFG, openai_cfg)
-                log('续期', '已保存新 token (重启 open-ai 后生效)')
-            else:
-                log('续期', '所有 token 均在有效期内')
-            results.append(('TRAE续期', 'done'))
+    # --trae-only: 仅供 daemon 白天补试 TRAE, 跳过 WB
+    # 修复 (2026-09-13): --trae-only 现在也做 token 续期。旧版跳过续期, 一旦
+    # 0 点全量签到被竞态吞掉, 无人续期 → token 过期 → 签到/采集全 401
+    # (实测 09-13 04:29 过期, 采集器 401 持续到 12:54 才由侧车 cookie 兜底)。
 
-        # 2) WorkBuddy 签到
+    # 1) TRAE token 续期 (全量与 --trae-only 补试都做)
+    if do_renew:
+        log('续期', f'TRAE token 自动续期 ({len(trae_accs)} 个账号, 阈值 {RENEW_THRESHOLD // 3600}h)')
+        changed = renew_trae_tokens(trae, force, device_id)
+        if changed:
+            openai_cfg['providers']['trae'] = trae
+            save_json(OPENAI_CFG, openai_cfg)
+            log('续期', '已保存新 token (重启 open-ai 后生效)')
+        else:
+            log('续期', '所有 token 均在有效期内')
+        results.append(('TRAE续期', 'done'))
+
+    # 2) WorkBuddy 签到 (--trae-only 补试时跳过, WB 走 --wb-only 独立节奏)
+    if not trae_only:
         wb = providers.get('workbuddy') or {}
         wb_accs = wb.get('accounts') or []
         domain = wb.get('domain', 'www.workbuddy.cn')
@@ -478,7 +538,7 @@ def main():
         for acc in wb_accs:
             wb_checkin_one(acc, domain, product)
 
-        # 2.5) WorkBuddy 国际版签到 (host=www.workbuddy.ai, 接口路径同国内版)
+        # 2.5) WorkBuddy 国际版签到 (host=www.workbuddy.ai)
         wbai = providers.get('workbuddy_intl') or {}
         wbai_accs = wbai.get('accounts') or []
         i_domain = wbai.get('domain', 'www.workbuddy.ai')
@@ -486,6 +546,16 @@ def main():
         log('WB国际签到', f'WorkBuddy 国际版签到 ({len(wbai_accs)} 个账号)')
         for acc in wbai_accs:
             wb_intl_checkin_one(acc, i_domain, i_product)
+
+        # 2.6) Loomy 每日登录积分 (providers.loomy.accounts)
+        try:
+            import loomy_client as lc
+            loomy_accs = lc.load_accounts()
+            log('Loomy', f'Loomy 每日登录 ({len(loomy_accs)} 个账号)')
+            for acc in loomy_accs:
+                loomy_daily_one(acc)
+        except Exception as e:
+            log('Loomy', f'Loomy 签到异常: {e}')
 
     # 3) TRAE 签到 (始终执行)
     log('TRAE签到', f'TRAE 签到 ({len(trae_accs)} 个账号)')
@@ -496,7 +566,9 @@ def main():
             trae_ok = False
 
     if trae_ok:
-        set_trae_state('done')
+        # 状态带日期: daemon 按 'done:<今天>' 判断是否需要补试,
+        # 避免昨天的裸 'done' 残留压制今天的补试 (实测 09-13 踩坑)
+        set_trae_state('done:' + today_str())
         log('TRAE签到', '今日 TRAE 签到已完成 (state=done)')
     else:
         set_trae_state('pending')

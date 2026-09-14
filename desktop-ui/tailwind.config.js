@@ -45,11 +45,18 @@ export default {
           hover: 'hsl(var(--danger-hover))',
           soft: 'hsl(var(--danger-soft))',
         },
-        /* 三通道品牌色（图表/徽标共用，避免逐处硬编码） */
+        /* 四通道品牌色（图表/徽标共用，避免逐处硬编码） */
         channel: {
           trae: 'hsl(var(--channel-trae))',
           wb: 'hsl(var(--channel-wb))',
           wbie: 'hsl(var(--channel-wbie))',
+          loomy: 'hsl(var(--channel-loomy))',
+        },
+        /* 模态遮罩：深浅两套主题下浓度不同，故走令牌而非 bg-black/60 */
+        overlay: 'hsl(var(--overlay))',
+        /* 控件「关闭」态底色（Switch 轨道）：深浅主题取值不同 */
+        control: {
+          off: 'hsl(var(--control-off))',
         },
       },
       borderRadius: {
@@ -88,9 +95,11 @@ export default {
         slow: '200ms',
       },
       boxShadow: {
-        /* 轻阴影，不要重阴影 */
-        card: '0 1px 2px 0 hsl(0 0% 0% / 0.24)',
-        popup: '0 4px 12px -2px hsl(0 0% 0% / 0.5)',
+        /* 轻阴影，不要重阴影。
+           具体值放在 CSS 令牌里：浅色主题需要「轻而散」，深色主题需要更实的黑，
+           同一组数值无法兼顾两套主题。 */
+        card: 'var(--shadow-card)',
+        popup: 'var(--shadow-popup)',
       },
       keyframes: {
         'fade-in': { from: { opacity: '0' }, to: { opacity: '1' } },

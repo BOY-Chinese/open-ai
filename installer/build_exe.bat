@@ -1,127 +1,189 @@
 @echo off
-rem open-ai ä¸€é”®å®‰è£…åŒ… æ„å»ºè„šæœ¬ (Windows + PyInstaller) â€” v2.4 æ–°æ¶æ„
-rem å‰ç½®: å·²å®‰è£… Python 3.10+ å¹¶åŠ å…¥ PATH (è„šæœ¬è‡ªåŠ¨è£… pyinstaller + ä¾èµ–)
-rem ç”¨æ³•: åŒå‡»æœ¬è„šæœ¬ (æˆ–æ ¹ç›®å½• ä¸€é”®æ„å»º.bat)
-rem äº§å‡º: dist\open-ai-installer-dev.exe (+ uninstall.exe + open-ai-launcher.exe)
-rem æ—¥å¿—: installer\build_installer.log
-setlocal
+chcp 936 >nul
+rem =====================================================
+rem open-ai Ò»¼ü°²×°°ü ¹¹½¨½Å±¾ (Windows + PyInstaller)
+rem ÓÃ·¨: build_exe.bat [dev^|portable]  È±Ê¡ dev; portable ²úÓÃ»§°æ°²×°°ü
+rem =====================================================
+rem ²ú³ö: dist\open-ai-installer-%CHANNEL%.exe (+ ×Ô¶¯¸´ÖÆµ½×ÀÃæ)
+rem ÈÕÖ¾: installer\build_installer.log
+rem
+rem ´ò°ü·½°¸: Æ·ÅÆ exe È«²¿ÄÚÇ¶ Python/Node ½âÊÍÆ÷, ÓÃ»§»úÆ÷ÁãÒÀÀµ¡£
+rem   open-ai-daemon.exe   Broker ¶ÀÁ¢Èë¿Ú (start.bat / ×ÔÆô)
+rem   open-ai-gateway.exe  Íø¹Ø :8000, ¼æ Broker ËŞÖ÷ (main.py --broker)
+rem   open-ai-task.exe     ¶ÌÃüÈÎÎñ (Ç©µ½ / ²É¼¯ / µÇÂ¼)
+rem   open-ai.exe          ¿ØÖÆ CLI (start|stop|restart|status|doctor)
+rem   open-ai-trae.exe     node Æ·ÅÆ»¯¸±±¾ (Trae Í¨µÀ)
+rem   desktop\open-ai-desktop.exe   Tauri ½çÃæ (Ëæ resources.zip ÂäÎ», ²»ÔÚ´Ë¹¹½¨)
+rem
+rem ¡ï ×ÀÃæ¶Ë±ØĞëÏÈ¹¹½¨ºÃ, ÅÜ:
+rem     cd desktop-ui && npm run build
+rem     powershell -ExecutionPolicy Bypass -File tools\build-tauri-release.ps1
+rem   ±¾½Å±¾µÚ 0 ²½»á¼ì²éËü´æÔÚ, ²¢ÓÃ¡¸Ç°¶Ë bundle Ö¸ÎÆ¡¹È·ÈÏÄÚÇ¶µÄÊÇÒÑÇåÏ´°æ±¾¡£
+rem =====================================================
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
+rem ---- Í¨µÀ²ÎÊı: build_exe.bat [dev^|portable] ----
+rem ¾ö¶¨²úÎïÃû open-ai-installer-<Í¨µÀ>.exe Óë°æ±¾×ÊÔ´ InternalName¡£
+set CHANNEL=%~1
+if "%CHANNEL%"=="" set CHANNEL=dev
+
 set LOGFILE=%~dp0build_installer.log
-echo [%date% %time%] ==== open-ai installer build start ==== > "%LOGFILE%"
+echo [%date% %time%] ==== open-ai installer build start (channel=%CHANNEL%) ==== > "%LOGFILE%"
 
 echo ====================================================
-echo  open-ai ä¸€é”®å®‰è£…åŒ… æ„å»º
+echo  open-ai Ò»¼ü°²×°°ü (%CHANNEL% Í¨µÀ) ¹¹½¨
 echo ====================================================
 
-rem ---- 0. å‡†å¤‡ python + pyinstaller ----
+rem ---- 0a. python + pyinstaller ----
 set PY=python
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] æœªæ‰¾åˆ° python, è¯·å…ˆå®‰è£… Python 3.10+
+    echo [ERROR] Î´ÕÒµ½ python, ÇëÏÈ°²×° Python 3.10+
     goto :err
 )
 %PY% --version >> "%LOGFILE%" 2>&1
 %PY% -m pip show pyinstaller >nul 2>nul
 if errorlevel 1 (
-    echo [INFO] å®‰è£… pyinstaller...
+    echo [INFO] °²×° pyinstaller...
     %PY% -m pip install pyinstaller -q >> "%LOGFILE%" 2>&1
     if errorlevel 1 goto :err
 )
-%PY% -m pip show pefile >nul 2>nul
+for %%D in (pefile pywin32-ctypes) do (
+    %PY% -m pip show %%D >nul 2>nul
+    if errorlevel 1 %PY% -m pip install %%D -q >> "%LOGFILE%" 2>&1
+)
+
+rem ---- 0b. Ç°ÖÃ¼ì²é: ×ÀÃæ¶Ë´æÔÚ + ÄÚÇ¶Ç°¶ËÊÇÒÑÇåÏ´°æ±¾ ----
+echo [0/7] ¼ì²é×ÀÃæ¶Ë²úÎï...
+if not exist "..\desktop\open-ai-desktop.exe" (
+    echo [ERROR] È±ÉÙ ..\desktop\open-ai-desktop.exe
+    echo         ÏÈÖ´ĞĞ: powershell -ExecutionPolicy Bypass -File desktop-ui\tools\build-tauri-release.ps1
+    goto :err
+)
+rem ¡ï ¹â¿´¡¸ÎÄ¼şÔÚ²»ÔÚ¡¹²»¹» ¡ª¡ª ×ÀÃæÉÏ¿ÉÄÜÌÉ×ÅÉÏÒ»´Î¹¹½¨µÄ exe, ¶øÄÇ´ÎÓÃµÄ
+rem   ÊÇÇåÏ´Ç°µÄÑİÊ¾Êı¾İ (º¬ÕæÊµÍø¹Ø api_key)¡£Ç°¶Ë²úÎïÃûÊÇÄÚÈİ¹şÏ£, ÄÃËüµ±
+rem   Ö¸ÎÆ¾ÍÄÜÎ¨Ò»È·¶¨ÄÚÇ¶µÄÊÇÄÄÒ»°æ dist; Ö¸ÎÆ²»¹ıÖ±½ÓÖĞÖ¹, ²»²ú°ë³ÉÆ·°ü¡£
+%PY% check_desktop_bundle.py "..\desktop\open-ai-desktop.exe" >> "%LOGFILE%" 2>&1
 if errorlevel 1 (
-    echo [INFO] å®‰è£… pefile...
-    %PY% -m pip install pefile -q >> "%LOGFILE%" 2>&1
+    echo [ERROR] ×ÀÃæ¶ËÄÚÇ¶µÄÇ°¶Ë²»ÊÇÒÑÇåÏ´°æ±¾ ^(Ïê¼û build_installer.log^)
+    echo         ÖØÅÜ: cd desktop-ui ^&^& npm run build ^&^& powershell -File tools\build-tauri-release.ps1
+    goto :err
 )
-%PY% -m pip show pywin32-ctypes >nul 2>nul
-if errorlevel 1 (
-    echo [INFO] å®‰è£… pywin32-ctypes...
-    %PY% -m pip install pywin32-ctypes -q >> "%LOGFILE%" 2>&1
-)
+echo   [OK] desktop\open-ai-desktop.exe ¾ÍÎ» (Ç°¶ËÖ¸ÎÆĞ£ÑéÍ¨¹ı)
 
-rem ---- 1. æ„å»º uninstall.exe (onedir) ----
-rem onedir è€Œé onefile: æ—  %TEMP%\_MEI ä¸´æ—¶ç›®å½•, æ ¹æ²»é€€å‡ºæ—¶
-rem "Failed to remove temporary directory" å¼¹çª— (VM/æ€è½¯é”æ–‡ä»¶åœºæ™¯), å¯åŠ¨ä¹Ÿæ›´å¿«ã€‚
-echo.
-echo [1/5] æ„å»º uninstall.exe (onedir)...
+rem ---- 1. °æ±¾×ÊÔ´ ----
+echo [1/7] Éú³É°æ±¾×ÊÔ´...
+%PY% verblock.py %CHANNEL% >> "%LOGFILE%" 2>&1
+if errorlevel 1 goto :err
+
+rem ---- 2. uninstall.exe (¶ÀÁ¢Ğ¶ÔØ³ÌĞò) ----
+echo [2/7] ¹¹½¨ uninstall.exe...
 if exist "ico\open-ai.ico" (
-    %PY% -m PyInstaller --noconfirm --clean --noupx --windowed ^
-        --contents-directory "uninstall_internal" ^
-        --name "uninstall" --icon "ico\open-ai.ico" uninstaller.py >> "%LOGFILE%" 2>&1
+    %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
+        --name "uninstall" --icon "ico\open-ai.ico" ^
+        --version-file ver_uninstall.py ^
+        uninstaller.py >> "%LOGFILE%" 2>&1
 ) else (
-    %PY% -m PyInstaller --noconfirm --clean --noupx --windowed ^
-        --contents-directory "uninstall_internal" ^
-        --name "uninstall" uninstaller.py >> "%LOGFILE%" 2>&1
+    %PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
+        --name "uninstall" --version-file ver_uninstall.py uninstaller.py >> "%LOGFILE%" 2>&1
 )
 if errorlevel 1 goto :err
-echo [OK] uninstall.exe (dist\uninstall\)
+copy /y "dist\uninstall.exe" "uninstall.exe" >nul
+echo   [OK] uninstall.exe
 
-rem ---- 1b. æ„å»º open-ai-launcher.exe (onedir) ----
-echo.
-echo [1b] æ„å»º open-ai-launcher.exe (onedir)...
-if exist "ico\open-ai.ico" (
-    %PY% -m PyInstaller --noconfirm --clean --noupx --windowed ^
-        --contents-directory "launcher_internal" ^
-        --name "open-ai-launcher" --icon "ico\open-ai.ico" launcher.py >> "%LOGFILE%" 2>&1
-) else (
-    %PY% -m PyInstaller --noconfirm --clean --noupx --windowed ^
-        --contents-directory "launcher_internal" ^
-        --name "open-ai-launcher" launcher.py >> "%LOGFILE%" 2>&1
+rem ---- 3. Æ·ÅÆ exe (daemon / gateway / task / cli) ----
+echo [3/7] ¹¹½¨ open-ai-daemon / gateway / task / cli ... (Òª¼¸·ÖÖÓ)
+for %%S in (open-ai-daemon open-ai-gateway open-ai-task open-ai-cli) do (
+    echo   - %%S ...
+    %PY% -m PyInstaller --noconfirm --clean %%S.spec >> "%LOGFILE%" 2>&1
+    if errorlevel 1 goto :err
 )
-if errorlevel 1 goto :err
-echo [OK] open-ai-launcher.exe (dist\open-ai-launcher\)
+rem spec ÀïµÄ name ²ÅÊÇ²úÎïÎÄ¼şÃû: open-ai-cli.spec ²ú³ö open-ai.exe, µ¥¶À°áÒ»´Î
+copy /y "dist\open-ai-daemon.exe" "open-ai-daemon.exe" >nul
+copy /y "dist\open-ai-gateway.exe" "open-ai-gateway.exe" >nul
+copy /y "dist\open-ai-task.exe" "open-ai-task.exe" >nul
+copy /y "dist\open-ai.exe" "open-ai.exe" >nul
+echo   [OK] daemon / gateway / task / open-ai.exe (CLI)
 
-rem ---- 2. æ‰“åŒ…èµ„æº zip ----
-echo.
-echo [2/5] æ‰“åŒ… open-ai èµ„æº...
-python build_resources.py >> "%LOGFILE%" 2>&1
+rem ---- 3b. open-ai-trae.exe (node Æ·ÅÆ»¯¸±±¾, Trae ºó¶Ë) ----
+echo [3b/7] ¹¹½¨ open-ai-trae.exe (node ¸±±¾)...
+%PY% build_trae_shim.py >> "%LOGFILE%" 2>&1
+if errorlevel 1 echo   [WARN] Ê§°Ü ¡ª Trae Í¨µÀ½«½ûÓÃ, WorkBuddy ²»ÊÜÓ°Ïì
+
+rem ---- 4. ×ÊÔ´°ü (trae/ + pic/ + desktop/ + Ğ¶ÔØÆ÷ + ÎÄµµ) ----
+echo [4/7] ´ò°ü open-ai ×ÊÔ´...
+%PY% build_resources.py >> "%LOGFILE%" 2>&1
 if errorlevel 1 goto :err
 
-rem ---- 3. æ„å»ºå®‰è£…å™¨ exe ----
-echo.
-echo [3/5] PyInstaller æ„å»ºå®‰è£…å™¨ exe...
+rem ---- 5. °²×°Æ÷ exe ----
+echo [5/7] PyInstaller ´ò°ü°²×°Æ÷ exe...
+if not exist "exes" mkdir "exes"
+for %%E in (open-ai-daemon open-ai-gateway open-ai-task open-ai open-ai-trae) do (
+    if exist "%%E.exe" copy /y "%%E.exe" "exes\" >nul
+)
 if exist "ico\open-ai.ico" (
-    %PY% -m PyInstaller --noconfirm --clean --noupx --onefile --windowed --uac-admin ^
-        --name "open-ai-installer-dev" --icon "ico\open-ai.ico" ^
+    %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+        --name "open-ai-installer-%CHANNEL%" ^
+        --icon "ico\open-ai.ico" ^
+        --version-file ver_installer.py ^
         --add-data "resources.zip;." ^
         --add-data "config.shell.json;." ^
+        --add-data "exes;exes" ^
         --add-data "ico\open-ai.ico;ico" ^
         installer.py >> "%LOGFILE%" 2>&1
 ) else (
-    %PY% -m PyInstaller --noconfirm --clean --noupx --onefile --windowed --uac-admin ^
-        --name "open-ai-installer-dev" ^
+    %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
+        --name "open-ai-installer-%CHANNEL%" ^
         --add-data "resources.zip;." ^
         --add-data "config.shell.json;." ^
+        --add-data "exes;exes" ^
         installer.py >> "%LOGFILE%" 2>&1
 )
 if errorlevel 1 goto :err
 
-rem ---- 4. å¤åˆ¶åˆ°æ¡Œé¢ ----
-echo.
-echo [4/5] å¤åˆ¶å®‰è£…åŒ…åˆ°æ¡Œé¢...
-set DESKTOP=%USERPROFILE%\Desktop
-if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\Desktop
-if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\OneDrive\æ¡Œé¢
-if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\æ¡Œé¢
-copy /y "dist\open-ai-installer-dev.exe" "%DESKTOP%\open-ai-installer-dev.exe" >nul
-if errorlevel 1 (
-    echo [WARN] å¤åˆ¶åˆ°æ¡Œé¢å¤±è´¥, å®‰è£…åŒ…åœ¨ dist\ ç›®å½•
-) else (
-    echo [OK] å®‰è£…åŒ…å·²å¤åˆ¶åˆ°æ¡Œé¢: %DESKTOP%\open-ai-installer-dev.exe
+rem ---- 6. ²ú³öĞ£Ñé (Ìå»ıÕ¢ÃÅ: Ö»¿´¡¸Ã»±¨´í¡¹»á·Å¹ıÒ»¸ö¿Õ¿Ç°ü) ----
+echo [6/7] Ğ£Ñé°²×°°ü...
+if not exist "dist\open-ai-installer-%CHANNEL%.exe" (
+    echo [ERROR] dist\open-ai-installer-%CHANNEL%.exe Î´Éú³É
+    goto :err
+)
+for %%F in ("dist\open-ai-installer-%CHANNEL%.exe") do set SIZE=%%~zF
+echo   °²×°°ü´óĞ¡: !SIZE! ×Ö½Ú
+if !SIZE! LSS 100000000 (
+    echo [ERROR] °²×°°üÌå»ıÒì³£Æ«Ğ¡ ^(!SIZE! ×Ö½Ú, Ô¤ÆÚ ^> 100 MB^) ¡ª¡ª ×ÊÔ´ºÜ¿ÉÄÜÃ»´ò½øÈ¥
+    goto :err
 )
 
-rem ---- 5. æ”¶å°¾ ----
-echo.
+rem ---- 7. ¸´ÖÆµ½×ÀÃæ ----
+echo [7/7] ¸´ÖÆ°²×°°üµ½×ÀÃæ...
+rem ¡ï ²»ÒªÓÃ %USERPROFILE%\Desktop ²Â×ÀÃæ: ×ÀÃæ±» OneDrive / ×é²ßÂÔÖØ¶¨Ïòºó, ¸ÃÄ¿Â¼
+rem   **´æÔÚµ«ÒÑ·ÏÆú**, ¸´ÖÆ¹ıÈ¥ÓÃ»§¸ù±¾¿´²»¼û¡£
+rem   ±¾ÏîÄ¿Êµ²â²È¹ı: °üÂä½øÁËÔçÒÑ·ÏÆúµÄ %USERPROFILE%\Desktop, ÕæÊµ×ÀÃæÔÚ±ğµÄÅÌ¡£
+rem   ±ØĞëÎÊ Windows ÒªÕæÊµÂ·¾¶¡£
+set DESKTOP=
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set DESKTOP=%%D
+if not defined DESKTOP set DESKTOP=%USERPROFILE%\Desktop
+if not exist "%DESKTOP%" set DESKTOP=%USERPROFILE%\Desktop
+echo   ×ÀÃæÂ·¾¶: %DESKTOP%
+copy /y "dist\open-ai-installer-%CHANNEL%.exe" "%DESKTOP%\open-ai-installer-%CHANNEL%.exe" >nul
+if errorlevel 1 (
+    echo [WARN] ¸´ÖÆµ½×ÀÃæÊ§°Ü, °²×°°üÔÚ dist\ Ä¿Â¼
+) else (
+    echo   [OK] ÒÑ¸´ÖÆµ½×ÀÃæ: %DESKTOP%\open-ai-installer-%CHANNEL%.exe
+)
+
 echo ====================================================
-echo  [å®Œæˆ] æ„å»ºç»“æœ:
-echo    - installer\dist\open-ai-installer-dev.exe  (å®‰è£…åŒ…, onefile)
-echo    - installer\dist\uninstall\             (å¸è½½ç¨‹åº, onedir)
-echo    - installer\dist\open-ai-launcher\      (ä¸€é”®å¯åŠ¨å™¨, onedir)
-echo    è¯¦ç»†æ—¥å¿—: installer\build_installer.log
+echo  ¹¹½¨Íê³É!
+echo  °²×°°ü:   %DESKTOP%\open-ai-installer-%CHANNEL%.exe
+echo  ÏêÏ¸ÈÕÖ¾: build_installer.log
 echo ====================================================
-pause
+echo [%date% %time%] ==== BUILD OK ==== >> "%LOGFILE%"
+endlocal
 exit /b 0
+
 :err
 echo.
-echo [ERROR] æ„å»ºå¤±è´¥, è¯·æŸ¥çœ‹æ—¥å¿—: installer\build_installer.log
-pause
+echo [ERROR] ¹¹½¨Ê§°Ü, Çë²é¿´ build_installer.log
+echo [%date% %time%] ==== BUILD FAILED ==== >> "%LOGFILE%"
+endlocal
 exit /b 1

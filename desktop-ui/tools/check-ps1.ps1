@@ -15,9 +15,10 @@
 #
 # USAGE
 #   powershell -NoProfile -ExecutionPolicy Bypass -File check-ps1.ps1
-#   powershell ... -File check-ps1.ps1 -Root 'D:\app\dsh_plugin\open-ai'
+#   powershell ... -File check-ps1.ps1 -Root 'D:\some\path\open-ai'
 # Exit code 0 = all clean, 1 = at least one file is broken.
-param([string]$Root = 'D:\app\dsh_plugin\open-ai')
+# 默认根 = 本脚本所在目录 (desktop-ui/tools) 上溯两级 = 仓库根
+param([string]$Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path)
 
 $ErrorActionPreference = 'Continue'
 

@@ -33,8 +33,13 @@ except Exception:
 
 # Playwright 由 open-ai/.venv 提供
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
+# ★ 打包态 __file__ 是相对路径, abspath 跟着 CWD 走 —— config 必须钉死安装根。
+try:
+    import app_paths as _ap
+    OPENAI_CFG = _ap.CONFIG_PATH
+except Exception:  # 源码态单独运行 (python scripts/login_trae.py) 的兜底
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
 LOGIN_URL = 'https://www.trae.cn/login'
 GET_TOKEN_URL = 'https://api.trae.cn/cloudide/api/v3/common/GetUserToken'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0'

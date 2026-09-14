@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { AlertTriangle, Download, Info, Power, Trash2 } from 'lucide-react'
+import { AlertTriangle, Download, Info, Palette, Power, Trash2 } from 'lucide-react'
 import { PageHeader, PageShell } from '@/components/layout/PageShell'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -13,10 +13,21 @@ import {
 } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { Skeleton } from '@/components/ui/skeleton'
+import { AppearanceDialog, THEME_MODE_LABEL } from '@/components/settings/AppearanceDialog'
 import { useToast } from '@/components/feedback/Toast'
 import { useAsync } from '@/hooks/useAsync'
+import { useTheme } from '@/hooks/useTheme'
 import { backend } from '@/lib/dataSource'
 import { inTauri } from '@/lib/gateway'
+
+/**
+ * 发布仓库（owner/repo）—— 仅用于「检查更新」的提示文案。
+ *
+ * 保持占位值是有意的：仓库归属由发布者决定，把某个人的 GitHub 账号写死进
+ * 前端产物就等于把身份信息随安装包公开。发布时改这一处即可。
+ * （后端查询最新的仓库名走 version.py 的 UPDATE_REPO，两者改一处要同步。）
+ */
+const UPDATE_REPO = 'owner/open-ai'
 
 /** 版本号统一展示格式：后端返回 "2.4.0" / "v2.4.0" 均归一为 v 前缀 */
 function formatVersion(raw: string): string {
@@ -28,12 +39,16 @@ function formatVersion(raw: string): string {
  * 系统设置页
  *
  * 结构（纵向单列，max-w-3xl 限制超宽）：
- *   1. 启动设置 —— 开机自启动开关
+ *   1. 启动设置 —— 开机自启动开关 + 外观设置（白天 / 夜间 / 跟随系统）
  *   2. 版本信息 —— 当前版本 + 一键更新
  *   3. 危险操作 —— 一键卸载（自带二次确认弹窗）
  */
 export function SettingsPage() {
   const { toast } = useToast()
+  const { mode } = useTheme()
+
+  /* ── 外观设置弹窗开关 ── */
+  const [appearanceOpen, setAppearanceOpen] = useState(false)
 
   /* ── 第 1 块：开机自启动 ── */
   const {
@@ -173,7 +188,7 @@ export function SettingsPage() {
                 <CardTitle>启动设置</CardTitle>
               </div>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-4">
               <CardSection
                 label="开机自动运行"
                 hint="勾选后，每次登录 Windows 自动启动网关和守护进程（无需人工打开）。"
@@ -199,6 +214,25 @@ export function SettingsPage() {
                         已关闭
                       </Badge>
                     ))}
+                </div>
+              </CardSection>
+
+              {/* 外观设置：入口放在启动设置卡片内，与需求一致 */}
+              <CardSection
+                label="外观设置"
+                hint="选择界面配色：白天（浅色）／夜间（深色）／跟随系统。默认白天模式。"
+              >
+                <div className="flex items-center gap-2">
+                  {/* 回显当前模式，省得为一个只读信息点开弹窗 */}
+                  <Badge variant="outline">{THEME_MODE_LABEL[mode]}</Badge>
+                  <Button
+                    variant="secondary"
+                    size="default"
+                    onClick={() => setAppearanceOpen(true)}
+                  >
+                    <Palette />
+                    外观设置
+                  </Button>
                 </div>
               </CardSection>
             </CardContent>
@@ -230,7 +264,7 @@ export function SettingsPage() {
 
               <CardSection
                 label="检查更新"
-                hint="检查并更新到 GitHub 最新发布版本 (github.com/BOY-Chinese/open-ai/releases)。"
+                hint={`检查并更新到 GitHub 最新发布版本 (github.com/${UPDATE_REPO}/releases)。`}
               >
                 <Button
                   variant="default"
@@ -276,10 +310,13 @@ export function SettingsPage() {
         </div>
       </div>
 
+      {/* ═══════════ 外观设置对话框 ═══════════ */}
+      {appearanceOpen && <AppearanceDialog onClose={() => setAppearanceOpen(false)} />}
+
       {/* ═══════════ 卸载二次确认对话框 ═══════════ */}
       {confirmOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 animate-fade-in"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-overlay/60 animate-fade-in"
           role="dialog"
           aria-modal="true"
           aria-labelledby="uninstall-title"

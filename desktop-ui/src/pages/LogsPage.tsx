@@ -4,17 +4,19 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
 import {
   ArrowDown,
   ArrowDownToLine,
   Eraser,
-  RefreshCw,
+  FolderOpen,
   ScrollText,
   Search,
   X,
 } from 'lucide-react'
+import { invoke } from '@tauri-apps/api/core'
 import {
   PageShell,
   PageHeader,
@@ -25,7 +27,6 @@ import {
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
-import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
   SelectTrigger,
@@ -35,22 +36,28 @@ import {
 } from '@/components/ui/select'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useToast } from '@/components/feedback/Toast'
-import { useAsync } from '@/hooks/useAsync'
-import { backend } from '@/lib/dataSource'
+import { inTauri } from '@/lib/gateway'
+import { clear, getSnapshot, subscribe, type OpLogLine } from '@/lib/oplog'
 import { cn, fmtTime } from '@/lib/utils'
-import type { LogLevel, LogLine } from '@/types/domain'
+import type { LogLevel } from '@/types/domain'
 
 /* ═══════════════ 常量 ═══════════════ */
 
-/** 筛选值：日志级别 + 全部 */
+/**
+ * 筛选值。
+ *
+ * 与 v2.2「系统日志」的四级筛选相比，这里收敛成「全部 / 成功 / 警告 / 失败」：
+ * 操作日志的记录绝大多数是 info 的过程行与 success/error 的结果行，
+ * 保留 info 单独可筛的意义不大，而「只看失败」是排障时最常用的动作。
+ */
 type LevelFilter = LogLevel | 'all'
 
 const LEVEL_OPTIONS: { value: LevelFilter; label: string }[] = [
-  { value: 'all', label: '全部级别' },
-  { value: 'info', label: '信息' },
+  { value: 'all', label: '全部' },
   { value: 'success', label: '成功' },
   { value: 'warn', label: '警告' },
-  { value: 'error', label: '错误' },
+  { value: 'error', label: '失败' },
+  { value: 'info', label: '过程' },
 ]
 
 /** 级别 → 文字色（语义令牌，禁止硬编码 hex） */
@@ -61,21 +68,19 @@ const LEVEL_CLASS: Record<LogLevel, string> = {
   error: 'text-danger',
 }
 
-/** 距底部多少像素内仍视为“贴底”，超过则判定用户手动上滑 */
+/** 距底部多少像素内仍视为"贴底"，超过则判定用户手动上滑 */
 const BOTTOM_THRESHOLD = 40
-
-/** 加载骨架行的宽度（确定性，避免每帧重排时抖动） */
-const SKELETON_WIDTHS = ['72%', '48%', '80%', '56%', '64%', '40%']
 
 /* ═══════════════ 单行日志 ═══════════════ */
 
 /**
- * LogLineRow — 日志单行渲染
+ * LogLineRow — 操作日志单行渲染
  *
  * 左固定宽时间戳 + 右自适应正文；正文允许换行（长报文不丢内容）。
  * 时间戳用 tabular-nums 保持等宽，避免滚动时列抖动。
  */
-function LogLineRow({ line }: { line: LogLine }) {
+function LogLineRow({ line }: { line: OpLogLine }) {
+  const isSeparator = /^─+$/.test(line.text)
   return (
     <div className="flex items-start gap-3">
       <span className="shrink-0 select-none font-mono text-sm tabular text-fg-faint">
@@ -84,7 +89,7 @@ function LogLineRow({ line }: { line: LogLine }) {
       <span
         className={cn(
           'min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-sm',
-          LEVEL_CLASS[line.level]
+          isSeparator ? 'text-fg-faint' : LEVEL_CLASS[line.level]
         )}
       >
         {line.text}
@@ -93,21 +98,7 @@ function LogLineRow({ line }: { line: LogLine }) {
   )
 }
 
-/** 加载态骨架：模拟 6 行日志的时间戳 + 正文结构 */
-function LogSkeleton() {
-  return (
-    <div className="space-y-2 p-3" aria-busy="true" aria-live="polite">
-      {SKELETON_WIDTHS.map((width, i) => (
-        <div key={i} className="flex items-center gap-3">
-          <Skeleton className="h-4 w-28 shrink-0" />
-          <Skeleton className="h-4" style={{ width }} />
-        </div>
-      ))}
-    </div>
-  )
-}
-
-/** 空态：无数据 / 过滤无结果 / 已清空 */
+/** 空态：无操作记录 / 过滤无结果 */
 function LogEmpty({
   icon: Icon,
   title,
@@ -128,6 +119,18 @@ function LogEmpty({
 
 /* ═══════════════ 页面 ═══════════════ */
 
+/**
+ * 操作日志页（v3.0 由「系统日志」改回 v2.3 的操作日志）
+ *
+ * 记录的是**用户在界面上做了什么**及其结果，不是网关的运行输出。
+ * 数据来自 `lib/oplog` 的本地存储，由 `lib/oplogBackend` 在数据源层自动埋点，
+ * 因此本页没有任何「拉取」动作 —— 刷新按钮在这里没有意义，已移除。
+ *
+ * 保留的交互（沿用 v2.2 已验证的日志查看器体验）：
+ *   * 自动滚动 + 智能暂停（上滑即停，浮出「回到最新」）
+ *   * Ctrl/Cmd+F 行内搜索、Esc 关闭
+ *   * 文本区 select-text（全局 user-select: none 的唯一例外）
+ */
 export function LogsPage() {
   const { toast } = useToast()
 
@@ -139,11 +142,8 @@ export function LogsPage() {
   /** 因用户上滑而暂停过自动滚动 —— 决定是否显示「回到最新」浮标 */
   const [pausedByUser, setPausedByUser] = useState(false)
 
-  const { data: logs, loading, reload, setData } = useAsync(
-    () => backend.listLogs(),
-    [],
-    [] as LogLine[]
-  )
+  /** 订阅操作日志存储（外部状态，用 useSyncExternalStore 而非 useState 快照） */
+  const logs = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
@@ -161,7 +161,7 @@ export function LogsPage() {
   }, [logs, level, query])
 
   const hasQuery = query.trim().length > 0
-  /** 当前视图是否被筛选/搜索/清空收窄（决定空态文案） */
+  /** 当前视图是否被筛选/搜索收窄（决定空态文案） */
   const narrowed = hasQuery || level !== 'all'
 
   /* ── 滚动控制 ── */
@@ -247,52 +247,35 @@ export function LogsPage() {
     [closeSearch]
   )
 
-  /* ── 清空：仅清本地显示，不动后端 ── */
+  /** 清空：连持久化一起清（否则刷新页面又回来了） */
   const onClear = useCallback(() => {
-    setData([])
+    clear()
     setPausedByUser(false)
     setAutoScroll(true)
-    toast('已清空当前日志显示（后端日志未受影响）', 'info')
-  }, [setData, toast])
+    toast('操作日志已清空', 'info')
+  }, [toast])
 
-  /* ── 刷新：重新拉取 ── */
-  const onReload = useCallback(async () => {
-    await reload()
-    setAutoScroll(true)
-    setPausedByUser(false)
-  }, [reload])
-
-  /** 追加按钮的修饰键语义：普通点击用「信息」级 */
-  const onAppendWith = useCallback(
-    (lvl: LogLevel) => {
-      const label: Record<LogLevel, string> = {
-        info: '信息',
-        success: '成功',
-        warn: '警告',
-        error: '错误',
-      }
-      const line = backend.appendLog(
-        lvl,
-        `[Demo] 模拟${label[lvl]}日志 · 自动滚动验证`
-      )
-      setData((prev) => [...prev, line])
-      setAutoScroll(true)
-      setPausedByUser(false)
-    },
-    [setData]
-  )
+  /** 打开网关日志目录：操作日志之外，排障仍需看网关自身的输出 */
+  const onOpenLogsDir = useCallback(() => {
+    void invoke('open_logs_dir').catch((e) =>
+      toast(`打开日志目录失败：${e instanceof Error ? e.message : String(e)}`, 'error')
+    )
+  }, [toast])
 
   /** 是否显示「回到最新」浮标：因用户上滑而暂停时 */
   const showJumpButton = pausedByUser && !autoScroll && filtered.length > 0
 
   return (
     <PageShell>
-      <PageHeader title="系统日志" description="网关与守护进程运行时输出" />
+      <PageHeader
+        title="操作日志"
+        description="账号 / 密钥 / 模型等操作的执行记录（本地保存，重启后仍在）"
+      />
 
-      {/* 工具栏：级别筛选 · 搜索 · 自动滚动 / 清空 / 刷新 */}
+      {/* 工具栏：级别筛选 · 搜索 · 自动滚动 / 清空 / 日志目录 */}
       <PageToolbar className="mb-3">
         <Select value={level} onValueChange={(v) => setLevel(v as LevelFilter)}>
-          <SelectTrigger className="w-[110px]" aria-label="按日志级别筛选">
+          <SelectTrigger className="w-[110px]" aria-label="按记录级别筛选">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -312,13 +295,13 @@ export function LogsPage() {
               variant={searchOpen ? 'secondary' : 'outline'}
               size="icon"
               onClick={() => (searchOpen ? closeSearch() : openSearch())}
-              aria-label="搜索日志"
+              aria-label="搜索操作日志"
               aria-pressed={searchOpen}
             >
               <Search />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>搜索日志内容 (Ctrl+F)</TooltipContent>
+          <TooltipContent>搜索操作日志内容 (Ctrl+F)</TooltipContent>
         </Tooltip>
 
         {searchOpen && (
@@ -328,9 +311,9 @@ export function LogsPage() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={onSearchKeyDown}
-              placeholder="搜索日志内容..."
+              placeholder="搜索操作日志..."
               className="w-56 pr-8 font-mono text-sm"
-              aria-label="搜索日志内容"
+              aria-label="搜索操作日志内容"
             />
             {hasQuery && (
               <button
@@ -360,11 +343,6 @@ export function LogsPage() {
         )}
 
         <div className="ml-auto flex items-center gap-2">
-          <Button variant="outline" onClick={() => onAppendWith('info')} title="追加一条演示日志">
-            <ScrollText />
-            追加演示日志
-          </Button>
-
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -379,19 +357,25 @@ export function LogsPage() {
             </TooltipTrigger>
             <TooltipContent>
               {autoScroll
-                ? '自动滚动已开启：新日志会跟随到底部'
-                : '自动滚动已关闭：点击恢复跟随最新日志'}
+                ? '自动滚动已开启：新记录会跟随到底部'
+                : '自动滚动已关闭：点击恢复跟随最新记录'}
             </TooltipContent>
           </Tooltip>
+
+          {inTauri && (
+            <Button
+              variant="outline"
+              onClick={onOpenLogsDir}
+              title="操作日志之外，网关自身的运行输出仍在 logs/ 目录"
+            >
+              <FolderOpen />
+              日志目录
+            </Button>
+          )}
 
           <Button variant="outline" onClick={onClear} disabled={logs.length === 0}>
             <Eraser />
             清空
-          </Button>
-
-          <Button variant="outline" onClick={() => void onReload()} loading={loading}>
-            <RefreshCw />
-            刷新
           </Button>
         </div>
       </PageToolbar>
@@ -404,22 +388,20 @@ export function LogsPage() {
           className="h-full overflow-y-auto bg-bg-log px-3 py-2 select-text"
           role="log"
           aria-live="polite"
-          aria-label="系统日志输出"
+          aria-label="操作日志输出"
         >
-          {loading ? (
-            <LogSkeleton />
-          ) : filtered.length === 0 ? (
+          {filtered.length === 0 ? (
             narrowed ? (
               <LogEmpty
                 icon={Search}
-                title="没有匹配的日志"
+                title="没有匹配的记录"
                 description="试试其他关键词或切换级别筛选"
               />
             ) : (
               <LogEmpty
                 icon={ScrollText}
-                title="暂无日志"
-                description="网关尚未输出内容，可点击「刷新」重新拉取，或追加一条演示日志"
+                title="暂无操作记录"
+                description="在账号管理 / API 管理 / 模型列表里做操作（添加账号、刷新积分、改密钥等），这里会按时间记录每一次操作及其结果"
               />
             )
           ) : (
@@ -449,7 +431,7 @@ export function LogsPage() {
               'shadow-popup transition-colors duration-fast animate-fade-in',
               'hover:bg-bg-card-hover hover:text-fg active:bg-bg-card'
             )}
-            aria-label="回到最新日志并恢复自动滚动"
+            aria-label="回到最新记录并恢复自动滚动"
           >
             <ArrowDown className="size-3.5" />
             回到最新

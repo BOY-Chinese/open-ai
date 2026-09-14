@@ -101,3 +101,12 @@ cd tools/node_modules_tools && npm install
 - **页面没变**：布局层（`AppLayout` 等）改动后 Vite HMR 在 `/mnt/d` 挂载盘上不可靠，
   请重启 dev server（`npx vite --force`）。
 - **截图各页相同**：说明页面未真正切换，通常是上一条原因导致浏览器跑着旧模块。
+- **改完 `.ps1` 一律跑一次 `check-ps1.ps1`**。PS 5.1 会按 ANSI(GBK) 解码无 BOM 的 UTF-8
+  脚本，中文注释的末字节可能与紧随的换行配成双字节字符，从而**静默吞掉下一行代码**。
+  本项目已因此中招三次：`build-tauri-release.ps1` 丢了 `$env:TAURI_ENV_DEBUG`（打过 dev
+  地址的包）、`start_hidden.ps1` 2 处硬解析错误（开机自启失效）、
+  `install-local-shortcut.ps1` 被编辑工具保存后丢了 BOM。
+  ⚠️ **有些编辑工具保存时会顺手去掉 BOM** —— 改完必须复核，不能只看「文件内容对不对」。
+- **截图被裁掉一部分**：`shot-window.ps1` 已 `SetProcessDPIAware()`。若自行写截图脚本，
+  务必先开 DPI 感知 —— 否则 `GetWindowRect` 给逻辑像素、实际窗口是 150% 缩放，
+  截出来的图右边和下边各少约三分之一（本项目实测踩到：5 列表格只截出 2 列）。

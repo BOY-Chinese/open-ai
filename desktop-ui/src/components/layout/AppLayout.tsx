@@ -9,6 +9,7 @@ import { AccountsPage } from '@/pages/AccountsPage'
 import { ApiPage } from '@/pages/ApiPage'
 import { ModelsPage } from '@/pages/ModelsPage'
 import { CreditsPage } from '@/pages/CreditsPage'
+import { AutoRouterPage } from '@/pages/AutoRouterPage'
 import { LogsPage } from '@/pages/LogsPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 
@@ -130,6 +131,7 @@ export function AppLayout() {
             {page === 'api' && <ApiPage />}
             {page === 'models' && <ModelsPage />}
             {page === 'credits' && <CreditsPage />}
+            {page === 'auto_router' && <AutoRouterPage />}
             {page === 'logs' && <LogsPage />}
             {page === 'settings' && <SettingsPage />}
           </div>

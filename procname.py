@@ -39,15 +39,23 @@ import ctypes
 import shutil
 import subprocess
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-RUNTIME_DIR = os.path.join(BASE, 'runtime')
-SHIM_DIR = os.path.join(RUNTIME_DIR, 'Scripts')
+import app_paths
+
+BASE = app_paths.ROOT              # 安装根 (打包态 = exe 所在目录)
+RUNTIME_DIR = app_paths.RUNTIME_DIR
+# ★ 品牌 exe 的落点分两种形态, 这里是打包安装的**关键差异**:
+#     源码态  runtime\Scripts\open-ai-*.exe   —— procname 现场复制解释器 + 注入图标
+#     打包态  <安装根>\open-ai-*.exe          —— 安装器直接放好的品牌 exe,
+#             没有 runtime\ 这一层。Broker 靠这个路径拉起 gateway / trae / task,
+#             写错就是「Broker 起来了但所有子进程 spawn 失败」(实测踩过)。
+SHIM_DIR = app_paths.EXE_DIR
 DLLS_DIR = os.path.join(RUNTIME_DIR, 'DLLs')
 LIB_DIR = os.path.join(RUNTIME_DIR, 'Lib')
 ICON_PATH = os.path.join(BASE, 'pic', 'open-ai.ico')
-VENV_SITE = os.path.join(BASE, '.venv', 'Lib', 'site-packages')
+VENV_SITE = os.path.join(app_paths.VENV_DIR, 'Lib', 'site-packages')
 PTH_FILE = os.path.join(VENV_SITE, 'openai_runtime.pth')
 STAMP_FILE = os.path.join(RUNTIME_DIR, '.build-stamp')
+FROZEN = app_paths.FROZEN
 
 # 版本号单源: 取自根目录 version.py 的 APP_VERSION (如 'v3.0-dev'), 提取纯数字段
 # (3.0.0) 作为 Windows 版本资源 FileVersion/ProductVersion, 与 GUI 显示一致。
@@ -428,9 +436,23 @@ def _core_ready():
 def ensure_runtime(verbose=False):
     """构建/更新 runtime (幂等, 增量): 只重建缺失或变更的 shim,
     运行中被占用的文件跳过 (打印提示), 不影响其他角色。
-    Store / org 版双兼容: DLLs 复制与 .pth 仅 Store 需要。"""
+    Store / org 版双兼容: DLLs 复制与 .pth 仅 Store 需要。
+
+    ★ 打包态 (exe 安装) 直接返回安装根里已有的品牌 exe:
+      那条"复制解释器 + 注入图标"的链路需要一台装了 Python 的机器, 而 exe
+      方案的前提恰恰是**用户机器不需要 Python**。品牌 exe 由安装器放好,
+      这里只做存在性汇报, 不做任何构建。
+    """
     if os.name != 'nt':
         return {}
+    if FROZEN:
+        out = {}
+        for role, spec in SPECS.items():
+            if os.path.exists(spec.shim_path):
+                out[role] = spec.shim_path
+            elif verbose:
+                print('[runtime] 打包态缺少 %s (对应通道不可用)' % spec.exe_name)
+        return out
     os.makedirs(SHIM_DIR, exist_ok=True)
     pkg_dir = None
     # ---- runtime 核心 (junction/pyvenv/pth/DLLs) 只在缺失时构建 ----

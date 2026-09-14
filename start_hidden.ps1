@@ -1,4 +1,4 @@
-# open-ai - hidden startup (v3.0)
+﻿# open-ai - hidden startup (v3.0)
 #
 # 职责：开机/登录时静默拉起「后端进程树 + 托盘界面」。
 #

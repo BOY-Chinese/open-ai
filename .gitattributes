@@ -1,20 +1,36 @@
-# 统一换行符策略, 防止 Windows 脚本被 git 规范化成 LF 导致 cmd/PowerShell 解析错乱
-# (LF 的 GBK 批处理在 chcp 切换代码页后, cmd 文件定位错乱, 会把中文字节劈开当命令执行)
+# 统一换行符与编码策略, 防止 Windows 脚本被 git 规范化后解析错乱。
+#
+# 背景 (本项目实测踩过): 带中文注释的 .bat 若存成 UTF-8 + LF, cmd 在
+# `chcp 936` 切换代码页后按**字节**定位, 会从半个汉字中间切开, 把残缺字节
+# 当成命令名执行 —— 现象是满屏「'xxx' 不是内部或外部命令」, 而文件在编辑器里
+# 完全正常。PowerShell 5.1 更狠: 无 BOM 的 UTF-8 脚本会被按 ANSI(GBK) 解码,
+# 中文注释的末字节与换行配成双字节字符, **静默吞掉下一行代码**。
+#
+# 因此:
+#   .bat/.cmd  → CRLF (且人工保证 GBK 编码, git 不碰编码)
+#   .ps1       → CRLF + 必须 UTF-8 **with BOM** (人工保证, 见 check-ps1.ps1)
+#   其余源码   → LF
 * text=auto
 
-# Windows 脚本必须 CRLF
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 
-# 源码与配置用 LF
-*.py text eol=lf
-*.js text eol=lf
+*.py   text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
 *.json text eol=lf
-*.md text eol=lf
+*.md   text eol=lf
 
-# 二进制不走任何转换
-*.exe binary
-*.ico binary
-*.png binary
-*.zip binary
+# 二进制不做任何转换
+*.exe   binary
+*.dll   binary
+*.ico   binary
+*.png   binary
+*.node  binary
+*.zip   binary
+*.db    binary

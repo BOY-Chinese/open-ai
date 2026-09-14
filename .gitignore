@@ -2,6 +2,32 @@
 __pycache__/
 *.pyc
 .venv/
+venv/
+
+# ===== 运行日志 (含 token / 请求详情, 一律不入库) =====
+logs/
+*.log
+
+# ===== 运行状态与本地数据 (进程 / 签到状态 / 流水库) =====
+data/
+.daemon.pid
+.daemon_last_signin
+.daemon_last_trae_retry
+.trae_signin_state
+.collector_last_run
+.gui_exit_suppress
+runtime_state.json
+
+# ===== ★ 真实配置 (含 accessToken / api_key / device_id / cookie) =====
+# 全仓库最敏感的文件: 一旦入库等于把全部账号凭据公开。
+# 仓库只保留 installer/config.shell.json 这份**空壳** (全占位符)。
+config.json
+config.json.bak*
+config.json.polluted*
+config.*.json
+# ↑ 该通配会误伤 installer/config.shell.json —— 它是全占位符空壳, 构建必需
+#   (--add-data config.shell.json;.), 按上面的设计意图必须入库, 反白名单放行。
+!installer/config.shell.json
 
 # ===== v2.4 进程管理运行时 (procname.py 自动构建, 不入库) =====
 runtime/
@@ -9,32 +35,48 @@ runtime/
 # ===== v2.4 构建时生成的 site-packages 钩子 =====
 .venv/Lib/site-packages/openai_runtime.pth
 
-# ===== 运行日志 (含 token/请求细节, 不入库) =====
-logs/
-*.log
-
-# ===== 运行状态标记 (进程 / 签到状态, 不入库) =====
-data/
-.daemon.pid
-.daemon_last_signin
-.daemon_last_trae_retry
-.trae_signin_state
-
 # ===== 临时 / 事故备份 =====
 *.bak*
-config.json.polluted*
 
-# ===== 系统 =====
-Thumbs.db
-.DS_Store
-# ===== 安装器构建产物 =====
+# ===== 安装器构建产物 (可再生, 由 build_exe.bat 生成) =====
+# 注意: *.spec 是**要入库的**源码 (安装器打包定义), 不能排除。
 installer/resources.zip
 installer/build/
 installer/dist/
-installer/*.spec
+installer/exes/
+installer/uninstall.exe
+installer/open-ai-*.exe
+# 控制 CLI 的产物名就叫 open-ai.exe (没有中间的 -), 上面的通配匹配不到它
+installer/open-ai.exe
+# build_exe.bat 用 `--name X script.py` 直接构建时, PyInstaller 会在 installer/
+# 下自动生成 X.spec —— 那是构建副产物, 手写 spec 才入库。
+installer/open-ai-installer-*.spec
+installer/ver_*.py
 
 # ===== v3.0 桌面端本机构建产物 (由 build-tauri-release.ps1 同步) =====
 desktop/
 
-# ===== 桌面端前端构建产物 (npm run build 生成, 不入库) =====
+# ===== 前端 =====
+node_modules/
 desktop-ui/dist/
+desktop-ui/node_modules_store/
+desktop-ui/tools/node_modules_tools/
+desktop-ui/src-tauri/target/
+desktop-ui/docs/screenshots/
+package-lock.json
+
+# ===== 随源码分发的第三方运行时 (体积大 / 有版权, 从官方渠道获取) =====
+# trae/lib 是 Trae 客户端的网络栈 (sscronet.dll + @aha-kit/net)。
+# 缺失时 Trae 通道自动禁用, WorkBuddy 通道不受影响 (见 trae/server.js 的 hasSelfLib)。
+toolchain/
+trae/lib/
+
+# ===== 系统 =====
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ===== ★ 本机「已知真实值」清单 (真实凭据片段/身份标识, 绝不入库) =====
+#   sanitize_check.py 与 installer/check_desktop_bundle.py 拿它当查缉样本;
+#   没有它, 两个检查器仍会跑通用形态 (JWT / sk- / 48 位 hex)。
+sanitize_known_values.txt

@@ -1,38 +1,48 @@
 @echo off
-rem open-ai autostart (v3.0): æ‹‰èµ·åŽç«¯è¿›ç¨‹æ ‘ + æ¡Œé¢ç«¯(é©»ç•™æ‰˜ç›˜)
+rem open-ai ¿ª»ú×ÔÆôÈë¿Ú (Ë«ÐÎÌ¬×ÔÊÊÓ¦)
 rem
-rem v3.0 å˜æ›´:
-rem   1) ä»¥è„šæœ¬è‡ªèº«ç›®å½•ä¸ºæ ¹, ä¸å†ç¡¬ç¼–ç  D:\app\dsh_plugin\open-ai â€”â€” å®‰è£…åˆ°
-rem      ä»»æ„è·¯å¾„éƒ½èƒ½å·¥ä½œï¼ˆæ—§ç‰ˆç¡¬ç¼–ç è·¯å¾„åœ¨éžå¼€å‘æœºä¸Šç›´æŽ¥å¤±æ•ˆï¼‰ã€‚
-rem   2) æ”¹ä¸ºè°ƒç”¨ start_hidden.ps1 æ‹‰èµ·ã€ŒBroker + æ¡Œé¢ç«¯ --minimizedã€ï¼šæ‰˜ç›˜å›¾æ ‡
-rem      ç”±æ¡Œé¢ç«¯åˆ›å»º, æ—§ç‰ˆåªæ‹‰ Broker ä¼šå¯¼è‡´ã€ŒåŽç«¯åœ¨è·‘ä½†æ‰˜ç›˜æ— å›¾æ ‡ã€ã€‚
-rem   3) æ—§çš„ Python tkinter GUI å·²æ•´æ¡åˆ é™¤, è¿™é‡Œä¸å†æœ‰ Python ç•Œé¢åˆ†æ”¯ã€‚
+rem Éè¼Æ: ×ÔÆô±ØÐë**ÏÈ°Ñºó¶ËÀ­ÆðÀ´**, ½çÃæÖ»×÷ÎªµÚ¶þ²½¡£
+rem   ÒÔÇ°´ò°ü°²×°ÀïÕâÌõÁ´Â·Ö» start ÁË×ÀÃæ¶Ë exe, ¶ø×ÀÃæ¶ËÔÚ´ò°ü°²×°Àï
+rem   Ò»¶ÈÕÒ²»µ½°²×°¸ù (is_root ÅÐ¾ÝÖ»ÈÏ .py Ô´Âë) ¡ª¡ª ½á¹û¿ª»úºóÖ»ÓÐ½çÃæ¿Ç
+rem   ÔÚÅÜ, 8000 ¶Ë¿ÚÓÀÔ¶²»¼àÌý, ±íÏÖÎª¡¸ÎÞ·¨Á¬½ÓÍø¹Ø¡¹¡£Á½²½·Ö¿ª¾Í²»ÒÀÀµ
+rem   ½çÃæÄÜ·ñ³É¹¦´úÀÍ¡£
+rem
+rem ±¾½Å±¾ÒÔ×ÔÉíËùÔÚÄ¿Â¼Îª¸ù, ²»Ð´ËÀÈÎºÎÅÌ·ûÂ·¾¶ (¾É°æÓ²±àÂëÔÚ·Ç¿ª·¢»úÖ±½ÓÊ§Ð§)¡£
 setlocal
 set "ROOT=%~dp0"
-rem åŽ»æŽ‰ç»“å°¾åæ–œæ , é¿å…æ‹¼æŽ¥å‡ºåŒæ–œæ 
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-rem å·²å¸¦ hidden å‚æ•°åˆ™ä¸é‡å¤å¼€æŽ§åˆ¶å°çª—å£ï¼ˆå…¼å®¹æ—§è°ƒç”¨çº¦å®šï¼‰
+rem ÒÑ´ø hidden ²ÎÊýÔò²»ÖØ¸´¿ª¿ØÖÆÌ¨´°¿Ú£¨¼æÈÝ¾Éµ÷ÓÃÔ¼¶¨£©
 if not "%1"=="hidden" (
     start "" /min cmd /c ""%~f0" hidden"
     exit /b 0
 )
 
 cd /d "%ROOT%"
-if not exist "runtime\Scripts\open-ai-daemon.exe" (
-    rem runtime shim æœªç”Ÿæˆï¼šå…ˆæž„å»ºï¼ˆå¹‚ç­‰ï¼‰ï¼Œå¤±è´¥ä¹Ÿæ— å¦¨ï¼ˆps1 æœ‰ pythonw å…œåº•ï¼‰
-    if exist ".venv\Scripts\python.exe" (
-        ".venv\Scripts\python.exe" procname.py >nul 2>nul
+
+rem ---- ´ò°ü°²×°ÐÎÌ¬: ¿ØÖÆ CLI À­ºó¶Ë + ×ÀÃæ¶Ë×îÐ¡»¯×¤ÁôÍÐÅÌ ----
+if exist "open-ai.exe" (
+    start "" /b ".\open-ai.exe" start
+    if exist "desktop\open-ai-desktop.exe" (
+        start "" ".\desktop\open-ai-desktop.exe" --minimized
     )
+    exit /b 0
+)
+if exist "open-ai-daemon.exe" (
+    start "" /b ".\open-ai-daemon.exe"
+    if exist "desktop\open-ai-desktop.exe" (
+        start "" ".\desktop\open-ai-desktop.exe" --minimized
+    )
+    exit /b 0
 )
 
-if exist "%ROOT%\start_hidden.ps1" (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden ^
-        -File "%ROOT%\start_hidden.ps1"
-) else (
-    rem æžç«¯å…œåº•ï¼šç›´æŽ¥æ‹‰ broker
-    if exist "%ROOT%\runtime\Scripts\open-ai-daemon.exe" (
-        start "" /b "%ROOT%\runtime\Scripts\open-ai-daemon.exe" "%ROOT%\bootstrap.py" start
-    )
+rem ---- Ô´ÂëÐÎÌ¬: Òþ²Ø PowerShell Òýµ¼ (ÄÚ²¿»á½¨ shim ²¢µ÷ bootstrap) ----
+if not exist "runtime\Scripts\open-ai-daemon.exe" (
+    if exist ".venv\Scripts\python.exe" ".venv\Scripts\python.exe" procname.py >nul 2>nul
 )
-exit /b 0
+if exist "%ROOT%\start_hidden.ps1" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%ROOT%\start_hidden.ps1"
+    exit /b 0
+)
+echo [ERROR] neither packaged exe nor start_hidden.ps1 found in "%ROOT%"
+exit /b 1

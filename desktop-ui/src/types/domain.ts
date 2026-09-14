@@ -5,13 +5,13 @@
 
 /* ═══════════ 通道 ═══════════ */
 
-/** 三通道：Trae / WorkBuddy / WorkBuddy 国际版 */
-export type Channel = 'Trae' | 'WorkBuddy' | 'WorkBuddy_IE'
+/** 四通道：Trae / WorkBuddy / WorkBuddy 国际版 / Loomy（讯飞） */
+export type Channel = 'Trae' | 'WorkBuddy' | 'WorkBuddy_IE' | 'Loomy'
 
 /** 筛选用值（含"全部"） */
 export type ChannelFilter = Channel | 'all'
 
-export const CHANNELS: Channel[] = ['Trae', 'WorkBuddy', 'WorkBuddy_IE']
+export const CHANNELS: Channel[] = ['Trae', 'WorkBuddy', 'WorkBuddy_IE', 'Loomy']
 
 /** 通道展示配置：色值走 CSS 变量，此处只做语义映射 */
 export const CHANNEL_META: Record<
@@ -25,6 +25,7 @@ export const CHANNEL_META: Record<
     token: 'bg-channel-wbie',
     dot: 'bg-warning',
   },
+  Loomy: { label: 'Loomy', token: 'bg-channel-loomy', dot: 'bg-channel-loomy' },
 }
 
 /**
@@ -52,7 +53,7 @@ export type AccountStatus = 'enabled' | 'disabled' | 'disconnected'
 export interface Account {
   id: string
   channel: Channel
-  /** 展示名，如「网页登录账号(3190130595077593)」「国际版账号(boy-chinese)」 */
+  /** 展示名，如「网页登录账号(<uid>)」「国际版账号(<用户名>)」 */
   name: string
   /** 是否已勾选启用 */
   enabled: boolean
@@ -125,6 +126,22 @@ export interface ModelEntry {
   pinned: boolean
 }
 
+/* ═══════════ Auto 路由连 ═══════════ */
+
+/**
+ * Auto 路由连（虚拟模型）配置 — 对应 config.json 的 auto_chain 段
+ *
+ * 请求 model="Auto路由连" 时按 models 顺序故障转移：
+ * 第一个成功产出内容的模型胜出，全部失败返回 502。
+ */
+export interface AutoChain {
+  enabled: boolean
+  /** 每个模型的最大等待秒数（0 = 用 provider 默认） */
+  timeout: number
+  /** 尝试顺序即数组顺序；元素为对外调用名（带 tr- / wb- / wbie- / lm- 前缀） */
+  models: string[]
+}
+
 /* ═══════════ 积分 / 用量 ═══════════ */
 
 export interface UsageRow {
@@ -144,12 +161,13 @@ export interface CreditStats {
   used: number
 }
 
-/** 图表用：单日三通道堆叠数据 */
+/** 图表用：单日四通道堆叠数据 */
 export interface DailyUsage {
   day: string
   Trae: number
   WorkBuddy: number
   WorkBuddy_IE: number
+  Loomy: number
 }
 
 export interface WeekBundle {
@@ -170,14 +188,61 @@ export interface TodayBundle {
 
 /* ═══════════ 日志 ═══════════ */
 
+/**
+ * 记录级别。
+ *
+ * v3.0 起前端不再展示网关运行日志（那一页已改回 v2.3 的「操作日志」，
+ * 记录的是用户在界面上的操作，见 `lib/oplog.ts`），故此类型只描述级别本身；
+ * 网关日志行（`LogLine`）已随 /v1/admin/logs 的前端调用一并移除。
+ * 网关自身的输出仍可通过「操作日志」页的「日志目录」按钮或托盘菜单查看。
+ */
 export type LogLevel = 'info' | 'success' | 'warn' | 'error'
 
-export interface LogLine {
-  id: number
-  level: LogLevel
-  text: string
+/* ═══════════ 每日签到 ═══════════ */
+
+/**
+ * 单个账号今日的签到结果。
+ *
+ * 语义边界（重要）：这是**今日签到是否成功**的客观凭证，不是「是否要签到」的开关。
+ * 证据来自本地流水库 gain 表 —— 有当日入账记录才算成功
+ * （TRAE 记 `checkin`，WorkBuddy 系记当日入账的资源包）。
+ * 因此该字段**只读**，前端不得提供勾选框让用户改它。
+ */
+export interface SigninStatus {
+  /** 今日已签到成功 */
+  checkedIn: boolean
+  /** 今日签到入账积分 */
+  amount: number
+  /** 入账类型：TRAE 为 'checkin'，WB 系为资源包名 */
+  kinds: string[]
+  /** 入账时间（epoch 秒） */
   ts: number
 }
+
+/** 签到状态查询结果：未出现在 signin 里的账号即「今日未签到」 */
+export interface SigninBundle {
+  /** 统计日（YYYY-MM-DD，本地时区） */
+  day: string
+  /** accountId → 签到结果 */
+  signin: Record<string, SigninStatus>
+}
+
+/** 空签到表（初值 / 接口不可用时使用） */
+export const EMPTY_SIGNIN: SigninBundle = { day: '', signin: {} }
+
+/* ═══════════ 外观 / 主题 ═══════════ */
+
+/**
+ * 外观模式（系统设置 → 启动设置 → 外观设置）
+ *
+ *   light  —— 白天：始终浅色
+ *   dark   —— 夜间：始终深色
+ *   system —— 跟随系统：按 `prefers-color-scheme` 实时切换
+ *
+ * 默认 `light`（白天）。定义放这里而不是 `lib/theme.ts`，
+ * 是为了让组件只 import 类型，不牵出 localStorage 等副作用代码。
+ */
+export type ThemeMode = 'light' | 'dark' | 'system'
 
 /* ═══════════ 通用异步状态 ═══════════ */
 

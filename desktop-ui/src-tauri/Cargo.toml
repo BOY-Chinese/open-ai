@@ -2,7 +2,9 @@
 name = "open-ai-desktop"
 version = "3.0.0"
 description = "open-ai 账号管理桌面端"
-authors = ["BOY-Chinese"]
+# ★ authors 会被写进 PE 的 CompanyName 字段 —— 最终用户右键「属性」就能看到。
+#   写个人 GitHub 账号等于把发布者身份随安装包公开, 故用项目名。
+authors = ["open-ai project"]
 edition = "2021"
 rust-version = "1.77"
 

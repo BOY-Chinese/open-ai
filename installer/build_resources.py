@@ -16,8 +16,9 @@ import zipfile
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_ZIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources.zip')
 
-# 需要打包的顶层文件/目录 (v3.0: 后端源码 + 桌面端; 开源版**装的是源码**,
-# 用户装完可直接查看/修改 .py —— 与 portable 用户版的冻结 exe 方案相反)
+# 需要打包的顶层文件/目录 (v3.0: 后端源码 + 前端源码 + 桌面端; 开源版**装的是
+# 源码**, 用户装完可直接查看/修改 .py 与前端 —— 与 portable 用户版的冻结 exe
+# 方案相反)
 INCLUDE = [
     'main.py', 'daemon.py', 'app_runtime.py', 'ipc.py', 'jobmgmt.py',
     'procname.py', 'bootstrap.py', 'watchdog_boot.py',
@@ -25,7 +26,11 @@ INCLUDE = [
     'version.py',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',
-    'providers', 'scripts', 'trae', 'tests', 'pic',
+    'providers', 'scripts', 'trae', 'pic',
+    'desktop-ui',  # ★ 前端源码整包: 没有它用户改不了界面 (改完用包内
+                   #   tools/build-tauri-release.ps1 重编桌面端)。
+                   #   tests 不随安装包分发 —— 那是开发机跑 pytest 的本机
+                   #   测试, 只留在 git 仓库, 装出来的应用运行时不碰它。
 ]
 # v2.4 → v3.0 变化: launcher_main.py / launcher_version.txt (v2.4 启动器体系)
 # 已被桌面端整体替代, 不再分发; app_paths.py / auto_router.py 为 v3.0 新增后端模块。
@@ -64,6 +69,21 @@ EXCLUDE_DIRS = {'__pycache__', '.venv', 'runtime', 'logs', 'data', '.git', 'inst
 EXCLUDE_EXTS = {'.pyc', '.log'}
 EXCLUDE_FILES = {'config.json'}  # 安装器会生成空壳 config, 不打真实配置
 
+# ★ 精确路径排除 (前缀匹配, 只砍前端构建产物, 不伤及无辜):
+# 不能把 'node_modules' / 'dist' / 'target' 直接丢进 EXCLUDE_DIRS —— 那是**目录名**
+# 全局匹配, 会把 trae/lib/node_modules (Trae 通道运行时必需的 @aha-kit 原生
+# 依赖) 一起砍掉, 装出来 server.js 报「未找到网络栈依赖」。本项目已踩过一次。
+EXCLUDE_DIR_PATHS = {
+    'desktop-ui/node_modules',
+    'desktop-ui/node_modules_store',
+    'desktop-ui/node_modules_tools',
+    'desktop-ui/dist',
+    'desktop-ui/src-tauri/target',
+}
+EXCLUDE_FILE_PATHS = {
+    'desktop-ui/package-lock.json',  # npm 产物, 用户 npm install 自生成
+}
+
 # ── 防空壳包: 资源包里必须存在的关键条目 (build() 末尾强制校验) ──
 # 体积闸门只能看总量, 看不出「该装的没装进去」。源码版安装包的灵魂是
 # 「装完就是可读可改的源码」—— 后端入口、v3.0 新模块、loomy 注册、任务脚本、
@@ -76,14 +96,28 @@ REQUIRED_ENTRIES = [
     'trae/server.js', 'trae/lib/sscronet.dll',
     'desktop/open-ai-desktop.exe',
     'uninstall.exe',
+    # 前端源码 (用户改界面的本钱): 包管理定义 / Tauri 配置 / 相对路径
+    # cargo 配置 / 重编脚本 / 前端入口, 缺一个前端就重建不起来
+    'desktop-ui/package.json',
+    'desktop-ui/src/main.tsx',
+    'desktop-ui/src-tauri/tauri.conf.json',
+    'desktop-ui/src-tauri/.cargo/config.toml',
+    'desktop-ui/tools/build-tauri-release.ps1',
 ]
 
 
 def should_include(relpath: str) -> bool:
-    parts = relpath.replace('\\', '/').split('/')
+    rel = relpath.replace('\\', '/')
+    parts = rel.split('/')
     for p in parts[:-1]:
         if p in EXCLUDE_DIRS:
             return False
+    # ★ 精确路径排除 (前缀匹配): 只砍前端构建产物, 不伤 trae/lib/node_modules
+    for d in EXCLUDE_DIR_PATHS:
+        if rel == d or rel.startswith(d + '/'):
+            return False
+    if rel in EXCLUDE_FILE_PATHS:
+        return False
     basename = parts[-1]
     if basename in EXCLUDE_FILES:
         return False

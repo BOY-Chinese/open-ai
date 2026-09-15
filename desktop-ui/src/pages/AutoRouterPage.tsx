@@ -16,7 +16,7 @@ import { useToast } from '@/components/feedback/Toast'
 import { useAsync } from '@/hooks/useAsync'
 import { backend } from '@/lib/dataSource'
 import { cn } from '@/lib/utils'
-import { channelMeta } from '@/types/domain'
+import { channelMeta, type Channel } from '@/types/domain'
 
 /**
  * Auto路由连 配置页
@@ -31,16 +31,31 @@ import { channelMeta } from '@/types/domain'
  * 保存后立即生效，无需重启网关（每次请求都会重读配置）。
  */
 
-/** 从对外模型名推断所属通道（与后端 route_provider 的前缀规则一致） */
-function channelOfRouteModel(routeModelId: string): string {
+/** 通道 → 圆点颜色（CSS 变量，深浅主题各自的值定义在 globals.css） */
+const CHANNEL_DOT_COLOR: Partial<Record<Channel, string>> = {
+  Loomy: 'hsl(var(--channel-loomy))',
+  WorkBuddy_IE: 'hsl(var(--channel-wbie))',
+  WorkBuddy: 'hsl(var(--channel-wb))',
+  Trae: 'hsl(var(--channel-trae))',
+}
+
+/**
+ * 从对外模型名推断所属通道（与后端 route_provider 的前缀规则一致）。
+ *
+ * ⚠ Loomy 判定必须放在其它前缀之前：v3.1 起对外前缀是 `lm-`
+ * （历史前缀 `loomy-` 仍兼容请求），后端规则为
+ * `m.startswith("lm-") or "loomy" in m`（providers/__init__.py）。
+ * 此前端只认 `loomy` 开头，链上 `lm-*` 模型全部显示「未知通道」（2026-09-15 修复）。
+ * 未识别（无前缀裸名等）返回 undefined，由调用方兜底。
+ */
+function channelOfRouteModel(routeModelId: string): Channel | undefined {
   const low = routeModelId.toLowerCase()
-  if (low.startsWith('loomy')) return channelMeta('Loomy').label
+  if (low.startsWith('lm-') || low.includes('loomy')) return 'Loomy'
   if (low.startsWith('wbie') || low.startsWith('wbai') || low.includes('intl'))
-    return channelMeta('WorkBuddy_IE').label
-  if (low.startsWith('tr-') || low.includes('trae')) return channelMeta('Trae').label
-  if (low.startsWith('wb-') || low.includes('workbuddy'))
-    return channelMeta('WorkBuddy').label
-  return '未知通道'
+    return 'WorkBuddy_IE'
+  if (low.startsWith('tr-') || low.includes('trae')) return 'Trae'
+  if (low.startsWith('wb-') || low.includes('workbuddy')) return 'WorkBuddy'
+  return undefined
 }
 
 export function AutoRouterPage() {
@@ -220,7 +235,9 @@ export function AutoRouterPage() {
               </tr>
             </thead>
             <tbody>
-              {models.map((m, i) => (
+              {models.map((m, i) => {
+                const ch = channelOfRouteModel(m)
+                return (
                 <tr key={`${m}-${i}`} className="border-b border-border-subtle last:border-0">
                   <td className="px-4 py-2.5">
                     <span className="flex size-6 items-center justify-center rounded-md bg-primary/12 font-mono text-sm font-medium text-primary">
@@ -237,19 +254,9 @@ export function AutoRouterPage() {
                       <span
                         aria-hidden
                         className="size-1.5 shrink-0 rounded-full bg-fg-subtle"
-                        style={{
-                          background: m.toLowerCase().startsWith('loomy')
-                            ? 'hsl(var(--channel-loomy))'
-                            : m.toLowerCase().startsWith('wbie')
-                              ? 'hsl(var(--channel-wbie))'
-                              : m.toLowerCase().startsWith('wb-')
-                                ? 'hsl(var(--channel-wb))'
-                                : m.toLowerCase().startsWith('tr-')
-                                  ? 'hsl(var(--channel-trae))'
-                                  : undefined,
-                        }}
+                        style={{ background: ch ? CHANNEL_DOT_COLOR[ch] : undefined }}
                       />
-                      {channelOfRouteModel(m)}
+                      {channelMeta(ch).label}
                     </span>
                   </td>
                   <td className="px-4 py-2.5">
@@ -292,7 +299,8 @@ export function AutoRouterPage() {
                     </span>
                   </td>
                 </tr>
-              ))}
+                )
+                })}
             </tbody>
           </table>
         )}
@@ -312,7 +320,9 @@ export function AutoRouterPage() {
                   remaining.map((m) => (
                     <SelectItem key={m} value={m}>
                       <span className="font-mono">{m}</span>
-                      <span className={cn('ml-2 text-xs text-fg-faint')}>{channelOfRouteModel(m)}</span>
+                      <span className={cn('ml-2 text-xs text-fg-faint')}>
+                        {channelMeta(channelOfRouteModel(m)).label}
+                      </span>
                     </SelectItem>
                   ))
                 )}

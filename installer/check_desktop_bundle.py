@@ -38,8 +38,11 @@ DIRTY_BUNDLES = ['index-DFsuRhLZ.js']
 # BRHJC03a: v3.0-portable Loomy 桌面通道登录版前端 (sendLoomyDesktopCode /
 #   loomyDesktopLogin 接入; mock 账号仍为「示例账号(…)/随机数」命名,
 #   sk- 仅为 DEMO-KEY-NOT-REAL 占位, 已过真值/形态扫描 —— 2026-09-14)。
+# udsI5bB_: Auto路由连 Loomy 前缀显示修复版前端 (channelOfRouteModel 对齐
+#   后端 route_provider 的 lm- 前缀判定; 仅改通道显示逻辑, mock/演示数据
+#   与 BRHJC03a 完全一致, 无新增数据 —— 2026-09-15)。
 CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
-                 'index-DH4ONbl3.js', 'index-BRHJC03a.js']
+                 'index-DH4ONbl3.js', 'index-BRHJC03a.js', 'index-udsI5bB_.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

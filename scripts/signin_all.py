@@ -508,6 +508,21 @@ def main():
             log('WB国际签到', f'--wb-only 补签检查 ({len(wbai_accs)} 个账号)')
             for acc in wbai_accs:
                 wb_intl_checkin_one(acc, i_domain, i_product)
+        # Loomy 白天补签 (2026-09-15): 新登录/当天漏签的账号 30 分钟一轮补上。
+        # 只有「当天还没领到」的账号才进入补领 (claimed=True 的跳过) ——
+        # 领取接口幂等 (已领过返回 alreadyProcessed=True), 重复调用无副作用;
+        # 失败 (claimed=False/缺席) 的下一轮自动重试。修复: 此前 Loomy 只在
+        # 00:00 全量签到里跑, 白天新添加的账号要干等到次日零点 (实测 09-15,
+        # master 中午登录的新账号当天领不到)。
+        import loomy_client as lc
+        loomy_state = lc.load_daily_state() or {}
+        pending = [a for a in lc.load_accounts()
+                   if a.get('enabled', True) and not (loom_state.get(
+                       str(a.get('userid') or '')) or {}).get('claimed')]
+        if pending:
+            log('Loomy补签', f'补领检查 ({len(pending)} 个未领账号)')
+            for acc in pending:
+                loomy_daily_one(acc)
         log('WB补签', '本轮补签检查完成')
         sys.exit(0)
 

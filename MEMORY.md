@@ -317,6 +317,10 @@ POST https://www.workbuddy.ai/billing/meter/get-user-request-usage
      （Web 账号 = web_me 会话校验 + points-summary，桌面账号 = first-login；
      Web 端**没有**显式领取端点，积分随当日登录由服务端自动发放）。
      `GET /accounts/signin` 读缓存，账号页「每日签到」列正常渲染。
+**白天补签（2026-09-15 补）**：Loomy 原本只在 00:00 全量签到里跑，
+     当天新登录的账号要干等到次日零点（实测 master 中午添加的新账号当天
+     领不到）—— 已挂进 daemon 的 `--wb-only` 30 分钟补签循环：
+     只补 `claimed != True` 的账号，领取幂等（已领过返回 alreadyProcessed）。
 4. **Loomy 登录 = 手机号短信验证码**（HMAC-SHA1 ak/sk 签名，逆向自 Loomy 桌面端），
    **不是浏览器交互**：桌面端「添加 Loomy 账号」弹 `LoomyLoginDialog`
    图形化向导（默认走**桌面通道** `desktop-send-code`/`desktop-login`，

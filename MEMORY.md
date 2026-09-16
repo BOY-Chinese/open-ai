@@ -674,3 +674,53 @@ PowerShell `-File` 对中文路径的拒绝），谁也没想到它漏了检查�
   只挂一条 = 另一条渠道裸奔。本项目已有两个渠道，将来加渠道同理。
 - 「本地测试全绿」永远不能替代构建门禁：本文件记录的三次事故
   （`__file__` 家族、拼错变量名、打包态脚本拉起）全部满足「本地全绿、装机才炸」。
+
+## portable 版登录助手仍拉系统 Edge：打包侧改了、脚本侧没同步（2026-09-16 虚拟机事故）
+
+**现象**：master 在虚拟机装 portable 版，「添加账号」拉起的还是 Edge；
+本机版 / dev 版拉的是 Chromium（v2.6 起就该如此）。
+
+**根因**：三仓同源，但同步只做了一半 ——
+
+| 部分 | 状态 |
+| --- | --- |
+| `installer/build_resources.py`（打包侧） | 已按 v2.6 约定，把 `ms-playwright/chromium-1234` 打进安装包（+190MB），注释里甚至写明「旧脚本会让本次修复在便携版上完全没生效，而且不报错」 |
+| `scripts/login_*.py`（脚本侧） | **仍是 v2.6 之前的写法**：`p.chromium.launch(headless=False, channel='msedge')` |
+| `app_paths.ensure_playwright_browsers_path()` | portable 已有且被调用 —— 指路了也没用，因为 `channel='msedge'` 是**强制**走系统浏览器 |
+| portable 的 `MEMORY.md` | 抄了 dev 的 v2.6 段落，读起来像已完成 |
+
+`channel='msedge'` 与「包内有没有 Chromium」无关：它直接点名系统 Edge。
+于是安装包白涨 190MB、行为照旧，且**不报错** —— 属于最难查的一类。
+
+**为什么 grep 查不出来**：三个脚本的文档头都写着
+「旧版直接 `p.chromium.launch(channel='msedge')` 拉起系统 Edge —— …」，
+那是在解释历史。文本检索必然命中，无法区分「注释里的旧代码」与「真的还在这么调」。
+故门禁一律用 **AST 判代码**。
+
+**修复**：portable 的三个 `login_*.py` 整份同步 dev 仓版本（改后 md5 三仓一致），获得
+v2.6 的全部行为：`BROWSER_FALLBACK = chromium → chrome → msedge → firefox`
+（自带优先）、`launch_persistent_context` + 每次全新 profile
+（`data/pw_profiles/<通道>/run-<时间戳>`，多账号不互相顶号）、
+反自动化检测（去 `--enable-automation`、隐藏 `navigator.webdriver`）、
+原生 UA（不再伪造 `Edg/143`）、`--browser` / `--reuse-profile` 开关。
+
+**防复发（本次同时落地）**：
+- 新增构建门禁 `installer/check_login_browser.py`，挂进 `build_exe.bat` 的
+  **[0f/7]** 步与 `build_all.py` 的 **[0f/5]** 步（两条出包链都挂，见上一节教训）；
+- 新增 `tests/test_login_browser.py`（同规则的单元测试）：
+  - R1 每个 `login_*.py` 必须有模块级 `BROWSER_FALLBACK` 且首元素是 `chromium`；
+  - R2 `p.chromium.launch*` 的 `channel` 不许是字面量（必须由降级链决定，
+    chromium 档传 `None` = 用包内自带的那个）；
+  - R3 必须调 `ensure_playwright_browsers_path()`，否则打包态认不出
+    `<root>\ms-playwright`，判定「浏览器未安装」→ 悄悄降级回系统 Edge。
+- 有效性已实测：把门禁/测试指向修复前的脚本，会精确报出
+  `login_trae.py:113`、`login_workbuddy.py:92`、`login_workbuddy_intl.py:468`
+  三处写死的 `channel='msedge'`；对修复后的脚本全绿。
+
+**规则重申**：
+- 「包装备好了」不等于「代码用上了」：凡是「安装包内嵌了某资源」的改动，
+  必须同时验证**代码真的按预期路径去用它**（本次体积涨了 190MB 却毫无效果）。
+- 同源仓库的同步要**成对检查**：改了 A 侧（打包/安装器）就必须确认 B 侧
+  （运行时脚本）也到位；只有单侧更新的提交，等于埋一个静默失效。
+- 判断「代码里还在不在用旧写法」用 AST，不要用 grep —— 文档头里的历史说明
+  会稳定误命中（本项目已因此差点漏判）。

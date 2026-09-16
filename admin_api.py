@@ -967,22 +967,30 @@ async def refresh_accounts(payload: dict = Body(default={})):
 
 @router.post("/accounts/reconnect")
 async def reconnect_accounts(payload: dict = Body(default={})):
-    """重新连接账号：拉起既有重连脚本（异步、不等待）。"""
+    """重新连接账号：拉起重连脚本 signin_all.py（异步、不等待）。
+
+    ★ 命令行走 {@link _signin_argv} —— **这一条曾经漏改，用户机上表现为
+      「重新连接账号」秒失败：`ApiError: signin_all.py 不存在`（耗时 41ms）**。
+
+      打包态（安装包）里没有 scripts 目录下的 .py 源码，也没有独立解释器，所以：
+        · 拿 `os.path.exists(scripts/signin_all.py)` 当门槛 → 装机后必 501；
+        · 拿 .venv/Scripts/python.exe 当解释器 → 那个目录在装机后也不存在。
+      正确做法与签到/采集/登录脚本完全一致：把脚本路径当**路由标记**交给
+      task shim（`open-ai-task.exe`），由 `task_main._route` 按文件名路由到
+      内置模块；路径参数本身不要求存在。
+
+      源码态仍用项目自带 `.venv`，缺失时回落当前解释器 —— 两种形态同一套
+      行为，且不再有「只有装机后才炸」的分支（见 tests/test_frozen_script_launch.py）。
+    """
     def _work() -> dict:
         import subprocess
-        import sys
-        script = os.path.join(BASE, "scripts", "signin_all.py")
-        if not os.path.exists(script):
-            raise HTTPException(status_code=501, detail="signin_all.py 不存在")
-        exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
-        if not os.path.exists(exe):
-            exe = sys.executable
-        flags = 0
-        if os.name == "nt":
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen([exe, script], cwd=BASE,
-                         creationflags=flags)  # noqa: S603
-        return {"ok": True, "started": True}
+        argv = _signin_argv("signin_all.py", [])
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        # 输出无需重定向：signin_all 自己就往 logs/signin.log 追加（见其 LOG()），
+        # 这里只要把它拉起来即可（异步、不等待）。
+        proc = subprocess.Popen(argv, cwd=BASE, creationflags=flags,  # noqa: S603
+                                stdin=subprocess.DEVNULL)
+        return {"ok": True, "started": True, "pid": proc.pid}
 
     return await _in_thread(_work)
 

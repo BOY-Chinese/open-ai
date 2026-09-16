@@ -73,6 +73,22 @@ if errorlevel 1 (
 )
 echo   [OK] no undefined name
 
+rem ---- 0e. script-launch gate: 打包态拉起内置脚本必须走 task shim ----
+rem 2026-09-16 用户机事故: POST /accounts/reconnect 用源码态写法 spawn
+rem .venv\Scripts\python.exe 并检查 scripts\signin_all.py 是否存在 ->
+rem 装机后 (安装包不含 .py 源码与 .venv) 必 501「signin_all.py 不存在」。
+rem 这类错本地全绿、只有装机才炸, 故在构建前扫一遍。
+echo [0e] script-launch gate (frozen spawn scan)...
+pushd ..
+%PY% -m unittest tests.test_frozen_script_launch >> "%LOGFILE%" 2>&1
+if errorlevel 1 (
+    popd
+    echo [ERROR] frozen script-launch check failed - see build_installer.log
+    goto :err
+)
+popd
+echo   [OK] bundled-script launches are frozen-safe
+
 rem ---- 1. uninstall.exe (独立卸载程序, onedir) ----
 rem onedir 而非 onefile: 无 %TEMP%\_MEI 临时目录, 根治退出时
 rem "Failed to remove temporary directory" 弹窗 (VM/杀软锁文件场景), 启动也更快。

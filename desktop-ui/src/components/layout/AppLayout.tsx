@@ -99,6 +99,35 @@ export function AppLayout() {
     }
   }, [phase])
 
+  /**
+   * 离线自愈探测（20 秒一次，**只探活、不拉起后端**）。
+   *
+   * 为什么需要：启动门把页面挡在后面，一旦判成 offline，用户不点「重试连接」
+   * 界面就永远停在那儿 —— 而这一档最常见的成因其实是**会自己变好的**：
+   * 网关重启后 `api_store.ensure_api_keys()` 补了一条新密钥（旧进程缓存的旧密钥
+   * 一度失配，见 `lib/gateway.ts` 的 2026-09-16 说明），重探一次就能连上。
+   * 实测那次用户等了十分钟，界面上写的是「已请求启动后端，但 45 秒内网关仍未就绪」。
+   *
+   * 与 ensureGateway 的区别（这条边界不能破）：
+   *   - 这里只 `probeGateway()`，**绝不**调 start_backend —— 用户若是主动停的服务，
+   *     界面不该偷偷给他拉起来（与上面 45 秒存活探测同一取舍）；
+   *   - 恢复后清掉 reason，让内容区直接挂载页面，不需要用户再点一次。
+   */
+  useEffect(() => {
+    if (isMockMode || phase !== 'offline') return
+    let alive = true
+    const timer = window.setInterval(async () => {
+      const probe = await probeGateway(2500)
+      if (!alive || !probe.online) return
+      setReason(undefined)
+      setPhase('online')
+    }, 20000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [phase])
+
   const openLogs = useCallback(() => {
     void invoke('open_logs_dir').catch((e) => console.warn('[open-ai] 打开日志目录失败', e))
   }, [])

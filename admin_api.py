@@ -1696,13 +1696,34 @@ async def rename_api_key(payload: dict = Body(...)):
 
 @router.post("/api-keys/delete")
 async def delete_api_key(payload: dict = Body(...)):
-    """body: {key}。v3.0 起所有密钥一视同仁，均可删除。"""
+    """body: {key}。v3.0 起所有密钥一视同仁，均可删除 —— **但最后一条不许删**。
+
+    ★ 为什么必须拦（2026-09-16 实测事故，用户报「拿不到后端数据」）：
+      密钥是管理面**唯一**的凭据。用户在本页面把密钥依次删完的那一刻，
+      正在发请求的客户端（桌面端自己！）当场全部 401 且**无法自救** ——
+      「创建密钥」本身也要鉴权，界面从此只能显示「无法连接后端网关 /
+      界面已就绪，但拿不到后端数据」。
+      更麻烦的是恢复路径：网关仅在**下次重启**时才由
+      `api_store.ensure_api_keys()` 补一条新密钥，而那条新密钥对「还开着」的
+      客户端又是一把没见过的钥匙（旧进程缓存的是已删密钥）→ 继续 401。
+      用户唯一的出路是重启桌面端，而他看到的提示是「后端 45 秒内仍未就绪」，
+      与真实原因（密钥被自己删空了）完全对不上。
+      拦住这一步，整条链就不会发生。
+    """
     def _work() -> dict:
         store = _api_store()
         cfg = store.load_config()
         key = str(payload.get("key") or "")
         if not key:
             raise HTTPException(status_code=400, detail="key 必填")
+
+        rows = cfg.get("api_keys") or []
+        if key in [a.get("key") for a in rows] and len(rows) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="至少需要保留一条 API 密钥：删掉最后一条会让所有客户端"
+                       "（包括本界面）立即失去访问权限，只能改 config.json 或重启网关才能恢复",
+            )
         if not store.delete_api(cfg, key):
             raise HTTPException(status_code=404, detail="密钥不存在")
         return {"ok": True}

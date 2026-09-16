@@ -27,10 +27,23 @@ config.json 中的 api_keys 结构:
        「不可删除」，用户无法清理。
   `migrate_legacy_api_key()` 负责一次性迁移：把顶层密钥搬进 api_keys，
   占位符（没填过的空壳）直接换成新生成的强密钥，然后删掉两个顶层字段。
+
+★ 2026-09-16 加固（config.json 被一次静默覆盖抹掉全部账号之后补的）：
+
+  1. `load_config()` 在**文件存在但读不懂**时抛异常，不再静默返回 {}。
+     返回 {} 的下一步就是「补一条密钥 → 整体覆盖写回」，配置里的账号/token
+     就是这么没的 —— 静默的「空配置」比一次报错危险得多。
+  2. `save_config()` 三道防线：防缩水守卫（原配置有 providers、新配置没有 →
+     拒绝写入）、写入前滚动备份 `config.json.bak-auto`、临时文件 + os.replace
+     原子替换（不再有半截 JSON）。
+  3. 写盘失败一律**显式**（`_save_or_raise`）：调用方不能一边改着内存、
+     一边把没落盘的密钥报成「创建成功」。
 """
 import json
+import logging
 import os
 import secrets
+import shutil
 import time
 
 # ★ 打包态 __file__ 指向 _MEI 临时目录, config 必须钉死安装根 (见 app_paths.py)
@@ -41,6 +54,10 @@ except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
     BASE = os.path.dirname(os.path.abspath(__file__))
     OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
 
+# 日志走标准 logging: 打包态（task/网关）里 print 会进黑洞, 而「拒绝覆盖配置」
+# 这种事必须留下痕迹, 否则就成了又一次静默事故。
+_log = logging.getLogger("openapi.api_store")
+
 # 安装包空壳配置里的占位符：它从来不是真密钥，不该被当成密钥保留
 LEGACY_PLACEHOLDER = 'YOUR_API_KEY_HERE'
 
@@ -49,16 +66,75 @@ DEFAULT_NAME = '默认密钥'
 
 
 def load_config():
-    try:
-        with open(OPENAI_CFG, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
+    """读取 config.json。
+
+    ★ 文件存在但读不懂时**抛异常**，绝不静默返回 {}（2026-09-16 事故的一环）：
+      调用方拿到 {} 只会以为「这是个空配置」，接着走「补一条密钥」的正常路径，
+      顺手把整个配置覆盖成 {"api_keys": [...]} 的空壳 —— 4 个通道的账号、
+      token、device_id 就是这么永久丢掉的（当时既无 git 也无归档可退）。
+      读不懂就报错，让上层提示用户去修配置；静默的「空配置」比一次报错危险得多。
+      文件**不存在**仍返回 {}：那是全新安装的合法状态。
+    """
+    if not os.path.exists(OPENAI_CFG):
         return {}
+    with open(OPENAI_CFG, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError('config.json 顶层不是 JSON 对象，拒绝当作空配置处理')
+    return data
 
 
 def save_config(cfg):
-    with open(OPENAI_CFG, 'w', encoding='utf-8') as f:
+    """把配置写回 config.json（原子替换 + 防缩水守卫 + 滚动备份）。
+
+    三道防线，全部针对 2026-09-16「config.json 被覆灭」那次事故：
+      1) **防缩水守卫**：磁盘上原配置有 providers（账号都在里面），而本次要写的
+         配置没有 → 拒绝写入并返回 False。宁可少写一次密钥，也不接受
+         「一次静默覆盖抹掉全部账号」——那次事故就是这么发生的，且无从追溯。
+      2) **滚动备份**：写入前把上一版复制成 config.json.bak-auto，
+         保证任何时候都能退回上一版（该文件已由 .gitignore 排除）。
+      3) **原子替换**：先写同目录临时文件再 os.replace。中途崩溃/断电不会留下
+         半截 JSON —— 半截 JSON 会让网关启动直接失败，比写失败更难查。
+
+    返回 True 表示已落盘；False 表示被守卫拦下（原因写进日志）。
+    """
+    previous = None
+    if os.path.exists(OPENAI_CFG):
+        try:
+            previous = load_config()
+        except Exception as e:  # noqa: BLE001
+            _log.error("config.json 无法解析，为避免覆盖掉可手工抢救的内容，"
+                       "本次写入已拒绝: %s", e)
+            return False
+
+    if (previous or {}).get('providers') and not (cfg.get('providers') or {}):
+        _log.error("拒绝写入 config.json：新配置不含 providers，"
+                   "会把 %d 个通道的账号一起抹掉（如需清空请手工编辑文件）",
+                   len(previous.get('providers') or {}))
+        return False
+
+    tmp = OPENAI_CFG + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+
+    if previous is not None:
+        try:
+            shutil.copyfile(OPENAI_CFG, OPENAI_CFG + '.bak-auto')
+        except Exception as e:  # noqa: BLE001
+            _log.warning("滚动备份 config.json 失败（不影响本次写入）: %s", e)
+
+    os.replace(tmp, OPENAI_CFG)
+    return True
+
+
+def _save_or_raise(cfg):
+    """写入失败即抛错：静默失败会让界面显示一条**根本不存在**的密钥。"""
+    if not save_config(cfg):
+        raise RuntimeError(
+            '写入 config.json 被拒绝：本次改动会覆盖掉现有通道配置，'
+            '请检查 config.json 是否损坏（网关日志 openapi.api_store 有详情）')
 
 
 def generate_key():
@@ -89,7 +165,10 @@ def ensure_api_keys(cfg=None):
 
     返回值: True 表示配置被改写并已落盘。
     """
-    cfg = cfg if cfg is not None else load_config()
+    # ★ 在**副本**上改，落盘成功才算数：否则写入被守卫拦下时，
+    #   调用方手里那份 cfg 会多出一条「只存在于内存里的密钥」，
+    #   API 管理页会把它列出来，用户复制去做请求却 401 —— 又一种「看着正常」的假象。
+    cfg = json.loads(json.dumps(cfg)) if cfg is not None else load_config()
     changed = False
 
     # ── 1) 旧版顶层 api_key / api_key_name → api_keys ──
@@ -122,7 +201,9 @@ def ensure_api_keys(cfg=None):
         changed = True
 
     if changed:
-        save_config(cfg)
+        # 写不进去就不算「已统一」：返回 False 让调用方（main 的启动日志 /
+        # admin_api 的重读分支）知道配置还是旧样子，别报一条假成功。
+        _save_or_raise(cfg)
     return changed
 
 
@@ -151,7 +232,7 @@ def create_api(cfg=None, name=''):
     created = int(time.time())
     cfg.setdefault('api_keys', []).append(
         {'name': name, 'key': key, 'createdAt': created})
-    save_config(cfg)
+    _save_or_raise(cfg)
     return name, key, created
 
 
@@ -161,7 +242,7 @@ def rename_api(cfg, old_key, new_name):
     for a in cfg.get('api_keys') or []:
         if a.get('key') == old_key:
             a['name'] = new_name
-            save_config(cfg)
+            _save_or_raise(cfg)
             return True
     return False
 
@@ -172,7 +253,7 @@ def delete_api(cfg, key):
     for i, a in enumerate(apis):
         if a.get('key') == key:
             del apis[i]
-            save_config(cfg)
+            _save_or_raise(cfg)
             return True
     return False
 
@@ -185,7 +266,7 @@ def normalize_names(cfg):
             a['name'] = '无名' + str(_next_unnamed_index(cfg))
             changed = True
     if changed:
-        save_config(cfg)
+        _save_or_raise(cfg)
     return cfg
 
 

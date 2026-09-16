@@ -650,3 +650,27 @@ NameError: name 'loom_state' is not defined. Did you mean: 'loomy_state'?
 - 这类「静态可查却没人查」的错已出现三次（`_ = rid` 的 UnboundLocalError、
   `__file__` 家族 #4/#5、本次 typo）。新增门禁挂在**构建脚本**上，
   而不是只写单测 —— 单测可以被跳过，构建门禁不行。
+
+## 门禁只挂在一个渠道的构建脚本上 = 等于没有门禁（2026-09-16 补挂）
+
+**发现经过**：修完「重新连接账号」装机必失败之后核对出包流程，发现两个渠道
+用的**不是同一个构建脚本**：
+
+| 渠道 | 出包脚本 | 静态门禁 |
+| --- | --- | --- |
+| portable（用户版，冻结 exe） | `installer/build_exe.bat` | [0c] frozen-path、[0d] undefined-name、[0e] script-launch |
+| dev（开源版，源码分装） | `installer/build_all.py` | **一道都没有** |
+
+两个渠道装的是**同一份运行时代码**（dev 把 `scripts/`、`providers/` 源码整包
+装过去，portable 装冻结 exe）。门禁只挂在 portable 那条链上，dev 渠道就能带着
+同一批 bug 出包 —— 而 `build_all.py` 是 Python 驱动的（自带说明：规避
+PowerShell `-File` 对中文路径的拒绝），谁也没想到它漏了检查。
+
+**修复**：`build_all.py` 补挂 [0c]/[0d]/[0e] 三步，与 `build_exe.bat` 对齐；
+`run()` 增加 `cwd` 参数（门禁脚本在 `installer/` 下，而 `unittest` 必须从仓库根跑）。
+
+**规则重申**：
+- 新增门禁时，**必须把两条出包链都过一遍**（`grep -rn "check_" installer/`），
+  只挂一条 = 另一条渠道裸奔。本项目已有两个渠道，将来加渠道同理。
+- 「本地测试全绿」永远不能替代构建门禁：本文件记录的三次事故
+  （`__file__` 家族、拼错变量名、打包态脚本拉起）全部满足「本地全绿、装机才炸」。

@@ -31,11 +31,15 @@ def log(msg):
         pass
 
 
-def run(args, step):
-    """运行并同时写日志；返回是否成功。"""
+def run(args, step, cwd=None):
+    """运行并同时写日志；返回是否成功。
+
+    cwd 默认是本目录（installer/，各门禁脚本与 .spec 都在这里）；
+    tests/ 相关的步骤要显式传仓库根，否则 unittest 找不到模块。
+    """
     log(f"--- [{step}] {' '.join(args)}")
     with open(LOG, "a", encoding="utf-8", errors="replace") as lf:
-        p = subprocess.run(args, cwd=HERE, stdout=lf,
+        p = subprocess.run(args, cwd=cwd or HERE, stdout=lf,
                            stderr=subprocess.STDOUT, text=True)
     return p.returncode == 0
 
@@ -63,6 +67,31 @@ def main():
                 os.path.join(HERE, "..", "desktop", "open-ai-desktop.exe")],
                "1/5 fingerprint"):
         log("[ERROR] 桌面端内嵌的前端不是已清洗版本, 拒绝打包")
+        return 1
+
+    # ── 静态门禁（打包前必过; 这三类错本地全绿、只有装机后才炸）──
+    #   [0c] frozen-path : 运行时模块裸 __file__ → 装机后指向 _MEI 临时目录
+    #   [0d] 未定义名    : 拼错的变量名, 只在执行到那一行时才 NameError
+    #   [0e] 脚本拉起    : spawn scripts/*.py 却不区分安装形态 → 装机后必
+    #                     501 / 静默失效（2026-09-16 「重新连接账号」事故:
+    #                     POST /accounts/reconnect 直接 spawn .venv python）
+    # ★ 2026-09-16 补挂: 本脚本此前**一道静态门禁都没有**, 而 dev 渠道与
+    #   portable 跑的是同一份运行时代码 —— 门禁只挂在 build_exe.bat 上,
+    #   等于给 dev 渠道留了后门。门禁必须挂在「真正出包的那条脚本」上。
+    log("[0c/5] frozen-path gate (bare __file__ scan)")
+    if not run([sys.executable, "check_frozen_paths.py"], "0c frozen-path"):
+        log("[ERROR] 运行时模块存在裸 __file__ 路径 —— 装机后必读错 config/data/logs")
+        return 1
+
+    log("[0d/5] undefined-name gate (static scan)")
+    if not run([sys.executable, "check_undefined_names.py"], "0d undefined-name"):
+        log("[ERROR] 运行时模块存在未定义名 —— 执行到该行即 NameError")
+        return 1
+
+    log("[0e/5] script-launch gate (frozen spawn scan)")
+    if not run([sys.executable, "-m", "unittest", "tests.test_frozen_script_launch"],
+               "0e script-launch", cwd=os.path.dirname(HERE)):
+        log("[ERROR] 存在未区分打包态的脚本拉起点（应改走 _signin_argv / task shim）")
         return 1
 
     steps = [

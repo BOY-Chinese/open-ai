@@ -94,6 +94,11 @@ def main():
         log("[ERROR] 存在未区分打包态的脚本拉起点（应改走 _signin_argv / task shim）")
         return 1
 
+    log("[0f/5] login-browser gate (bundled chromium scan)")
+    if not run([sys.executable, "check_login_browser.py"], "0f login-browser"):
+        log("[ERROR] 登录助手必须优先用包内自带 Chromium（否则装机后悄悄拉系统 Edge）")
+        return 1
+
     steps = [
         ("2/5 uninstall.exe (onedir)",
          [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--noupx",

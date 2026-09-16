@@ -864,7 +864,8 @@ async def launch_login(payload: dict = Body(default={})):
             # ★ 打包态: 安装包不含 scripts\*.py, 也没有独立 python —— 与
             #   signin/usage 同机制, 把脚本路径当「路由标记」传给 task exe,
             #   由 task_main 按文件名路由到内置 login_* 模块 (playwright 驱动
-            #   已随包, 浏览器走系统 msedge, 用户机无需另装)。路径参数本身
+            #   已随包; 浏览器用包内自带的 Chromium (v2.6 起, 见 login_*
+            #   文档头 —— 不再拉系统 Edge), 用户机无需另装)。路径参数本身
             #   不要求存在, 不可用 os.path.exists 拦截 (app_paths 的老警告)。
             exe = os.path.join(BASE, "open-ai-task.exe")
             cmd = [exe, script]

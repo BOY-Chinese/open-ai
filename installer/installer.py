@@ -639,7 +639,11 @@ class InstallerApp:
             if host:
                 env['PLAYWRIGHT_DOWNLOAD_HOST'] = host
                 self._log(f'  下载镜像 ({i + 1}/{len(PLAYWRIGHT_DOWNLOAD_HOSTS)}): {host}')
-            rc, out = self._run_cmd_env(prefix + ['-m', 'playwright', 'install'],
+            # ★ 只装 chromium: 登录助手与 Trae 后端都只用它 (见 login_*.py 的
+            #   浏览器说明)。旧版跑无参 `playwright install` 会把 firefox /
+            #   webkit / ffmpeg 全部拉下来 —— 多下 ~500MB, 用户白等十几分钟,
+            #   而且我们根本不启动那些浏览器。
+            rc, out = self._run_cmd_env(prefix + ['-m', 'playwright', 'install', 'chromium'],
                                         env, timeout=1800)
             if rc == 0:
                 installed = True

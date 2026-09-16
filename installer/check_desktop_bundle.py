@@ -47,7 +47,13 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                  #   (账号页刷新补签 / 积分看板刷新拉新流水 / 版本号显示 dev-v3.1)。
                  #   新增 POST /accounts/signin/refresh 与 /credits/refresh 两个端点调用;
                  #   mock 演示数据仍为占位值, 已过真值扫描 (13 项真实凭据 0 泄漏)。
-                 'index-3fBWhgE_.js']
+                 'index-3fBWhgE_.js',
+                 # DU-XzvPp: 2026-09-16 修复「密钥轮换后界面卡在启动门 / 拿不到
+                 #   后端数据」后的前端 —— lib/gateway.ts 探活遇 401 重读 config.json
+                 #   再试、AppLayout 离线每 20 秒自愈。仅改这两处逻辑, mock / 演示
+                 #   数据一字未动; 已按本仓 sanitize_known_values.txt (18 条真值)
+                 #   扫描产物: 0 命中 (唯一 sk- 命中是既有的 DEMO-KEY-NOT-REAL 占位)。
+                 'index-DU-XzvPp.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

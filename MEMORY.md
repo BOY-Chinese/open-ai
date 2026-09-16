@@ -724,3 +724,38 @@ v2.6 的全部行为：`BROWSER_FALLBACK = chromium → chrome → msedge → fi
   （运行时脚本）也到位；只有单侧更新的提交，等于埋一个静默失效。
 - 判断「代码里还在不在用旧写法」用 AST，不要用 grep —— 文档头里的历史说明
   会稳定误命中（本项目已因此差点漏判）。
+
+## v3.1 Release 资产已被覆盖（2026-09-16 晚，master 指示）
+
+**背景**：v3.1 的 release 标题写着「Chromium 登录」，但其中 **portable 资产**
+（`open-ai-installer-portable.exe`，407,056,104 字节）实际是登录助手仍拉系统
+Edge 的那版 —— 标题为真、产物为假（原因见上一节：打包侧改了、脚本侧没同步）。
+
+**操作**：用本机重出的两个包原地覆盖 v3.1 的两个 asset（**未新建 tag / 未改
+release 元数据**，只有二进制换了）：
+
+| 资产 | 覆盖前 | 覆盖后 |
+| --- | --- | --- |
+| `open-ai-installer-portable.exe` | 407,056,104 字节（asset id 567763550） | **419,092,059** 字节（asset id 568268612）<br>sha256 `1418dd28…9333c` |
+| `open-ai-installer-dev.exe` | 34,606,607 字节（asset id 567762807） | **34,612,819** 字节（asset id 568275512）<br>sha256 `6deeb204…fa30f` |
+
+- 覆盖**前**的两个旧 asset 已整份留档到
+  `/mnt/d/dsh_归档区/20260916-233000-github-v3.1-assets-before-overwrite/`
+  （含 `归档记录.tsv`），可随时回退。
+- 上传后**回读校验**：GitHub 返回的 sha256 与本机文件逐字节一致；
+  公开下载 URL（`https://github.com/BOY-Chinese/open-ai/releases/download/v3.1/…`）
+  均 HTTP 200 且字节数正确。
+
+**⚠️ 覆盖已知副作用（下次发版务必记住）**：
+`admin_api.check_update` 是拿 release 的 **tag** 与 `version.APP_VERSION`
+（`portable-v3.1`）**比相等**来判断「有没有更新」。资产原地覆盖、tag 不变，
+所以**任何已装 v3.1 的机器都会显示「已是最新」**，不会自动拉到修复版，
+必须重新下载安装包。下次同类修复建议**新打 tag**（如 `v3.1.1`）并同步改
+`version.py` 的 `APP_VERSION`，而不是原地覆盖资产。
+
+**上传踩坑**：本机（WSL + Watt 加速）到 `uploads.github.com` 约 **1.9 MB/s**，
+419MB 资产需 ~3.5 分钟。用 Python `urllib` 上传会撞上默认 180s 的 socket 写超时
+（`TimeoutError: The write operation timed out`），**且此时旧 asset 已被删掉、
+新 asset 没传上去 —— 中间态等于把资产弄丢**。正确姿势：`curl --retry 3
+--retry-all-errors --connect-timeout 30 --speed-time 120 --speed-limit 10240
+--data-binary @file`（无总时限，只在链路真的停住时才放弃），先删后传要经得起重试。

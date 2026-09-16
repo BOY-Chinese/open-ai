@@ -24,7 +24,11 @@ def _root():
     """安装根目录 (日志/GUI 面板都在这里)。frozen: exe 在安装根; 脚本态: 上两级。"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import app_paths as _ap
+        return _ap.ROOT
+    except Exception:  # 源码态兜底: task_main.py 在 scripts/ 下, 根是上两级
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _route(script, rest):

@@ -31,10 +31,19 @@ try:
 except Exception:
     pass
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
-LOGS_DIR = os.path.join(HERE, '..', 'logs')
-DATA_DIR = os.path.join(HERE, '..', 'data')
+# ★ 打包态 (PyInstaller onefile) __file__ 指向 %TEMP%\_MEIxxxx 解包临时目录,
+#   在这里拼 config/logs/data 会导致装机后签到必炸 (2026-09-15 用户机
+#   FileNotFoundError 弹窗事故)。一律钉死安装根 (app_paths)。
+try:
+    import app_paths as _ap
+    OPENAI_CFG = _ap.CONFIG_PATH
+    LOGS_DIR = _ap.LOGS_DIR
+    DATA_DIR = _ap.DATA_DIR
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
+    LOGS_DIR = os.path.join(HERE, '..', 'logs')
+    DATA_DIR = os.path.join(HERE, '..', 'data')
 SIGNIN_LOG = os.path.join(LOGS_DIR, 'signin.log')
 # TRAE 签到状态: done=今日已签上 / pending=今日仍未签上(9074 繁忙), 供 daemon 补试
 TRAE_SIGNIN_STATE = os.path.join(DATA_DIR, '.trae_signin_state')

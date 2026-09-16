@@ -32,6 +32,26 @@ export function maskKey(key: string): string {
   return `${key.slice(0, 6)}${'•'.repeat(16)}${key.slice(-4)}`
 }
 
+/**
+ * 版本号统一展示格式 —— 唯一的版本号格式化入口。
+ *
+ * 后端 `version.py` 的 APP_VERSION 形如 `dev-v3.1`（通道前缀 + 版本），
+ * 历史上还有 `3.1.0` / `v3.1` 两种写法。规则：
+ *   - 空值 → 空串（由调用方决定显示「未知」还是骨架屏）
+ *   - 已带 `v`，或形如 `<通道>-v<数字>`（dev-v3.1 / portable-v3.0）→ 原样
+ *   - 其余（'3.1.0'）→ 补上 `v` 前缀
+ *
+ * ★ 不能简单地 `'v' + raw`：那会把 `dev-v3.1` 显示成 `vdev-v3.1`。
+ *   版本号显示错误正是从这种「无脑补前缀」来的。
+ */
+export function formatVersion(raw: string): string {
+  const s = raw.trim()
+  if (!s) return ''
+  if (/^v\d/i.test(s)) return s
+  if (/^[a-z][a-z0-9]*[-_]v?\d/i.test(s)) return s
+  return `v${s}`
+}
+
 /** 时间戳(秒) → '2026/09/12 00:56'
  *
  * 秒级时间戳为 0 或非法时返回「—」：表示**未知**，而不是伪造一个时间。

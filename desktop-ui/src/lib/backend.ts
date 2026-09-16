@@ -225,6 +225,54 @@ let MODELS: ModelEntry[] = [
 
 let USAGE: UsageRow[] = seedUsage()
 
+/**
+ * 演示用「今日签到结果」——可变状态。
+ *
+ * 刻意让两种状态都出现（国际版账号今日未签到），否则「每日签到」这一列在演示
+ * 模式下永远是同一个样子，等于没验证过；而可变是因为「刷新账号」会补签
+ * （见 refreshSignin），补完再看这一列必须真的变了。
+ */
+const DEMO_SIGNIN: Record<string, SigninStatus> = (() => {
+  const midnight = new Date()
+  midnight.setHours(0, 5, 0, 0)
+  const ts = Math.floor(midnight.getTime() / 1000)
+  return {
+    'acc-trae-1': { checkedIn: true, amount: 200, kinds: ['checkin'], ts },
+    'acc-trae-2': { checkedIn: true, amount: 200, kinds: ['checkin'], ts },
+    'acc-wb-1': {
+      checkedIn: true,
+      amount: 100,
+      kinds: ['pack:CodeBuddy个人版国内运营裂变包'],
+      ts,
+    },
+    'acc-wb-2': {
+      checkedIn: true,
+      amount: 100,
+      kinds: ['pack:CodeBuddy个人版国内运营裂变包'],
+      ts,
+    },
+    // acc-wbie-1（国际版）今日未签到：用于验证未签到态与提示文案
+  }
+})()
+
+/**
+ * 演示签到凭证对应的统计日。
+ *
+ * 跨零点后 `DEMO_SIGNIN` 里的凭证就过期了（真实后端同样按当天流水判定），
+ * 故读取与补签时都过一遍 {@link syncDemoSigninDay}：日期一变即清空重来，
+ * 否则界面会一直显示「昨天已签到」。
+ */
+let DEMO_SIGNIN_DAY = toDayKey(new Date())
+
+function syncDemoSigninDay(): string {
+  const today = toDayKey(new Date())
+  if (DEMO_SIGNIN_DAY !== today) {
+    for (const id of Object.keys(DEMO_SIGNIN)) delete DEMO_SIGNIN[id]
+    DEMO_SIGNIN_DAY = today
+  }
+  return today
+}
+
 let gateway: GatewayInfo = {
   openaiBase: 'http://127.0.0.1:8000/v1',
   chatEndpoint: 'http://127.0.0.1:8000/v1/chat/completions',
@@ -369,31 +417,13 @@ export const mockBackend = {
    */
   async listSignin(filter: ChannelFilter = 'all'): Promise<SigninBundle> {
     await sleep(LATENCY / 2)
-    const day = toDayKey(new Date())
-    const midnight = new Date()
-    midnight.setHours(0, 5, 0, 0)
-    const ts = Math.floor(midnight.getTime() / 1000)
-    const seed: Record<string, SigninStatus> = {
-      'acc-trae-1': { checkedIn: true, amount: 200, kinds: ['checkin'], ts },
-      'acc-trae-2': { checkedIn: true, amount: 200, kinds: ['checkin'], ts },
-      'acc-wb-1': {
-        checkedIn: true,
-        amount: 100,
-        kinds: ['pack:CodeBuddy个人版国内运营裂变包'],
-        ts,
-      },
-      'acc-wb-2': {
-        checkedIn: true,
-        amount: 100,
-        kinds: ['pack:CodeBuddy个人版国内运营裂变包'],
-        ts,
-      },
-      // acc-wbie-1（国际版）今日未签到：用于验证未签到态与提示文案
-    }
+    const day = syncDemoSigninDay()
+    // 演示签到结果：`DEMO_SIGNIN` 是可变状态，刷新账号时的「补签」会真的改它
+    // （见 refreshSignin），否则「点刷新 → 未签到变已签到」这条路径无法演示。
     const signin: Record<string, SigninStatus> = {}
     for (const a of ACCOUNTS) {
       if (filter !== 'all' && a.channel !== filter) continue
-      if (seed[a.id]) signin[a.id] = { ...seed[a.id] }
+      if (DEMO_SIGNIN[a.id]) signin[a.id] = { ...DEMO_SIGNIN[a.id] }
     }
     return { day, signin }
   },
@@ -415,9 +445,46 @@ export const mockBackend = {
     return mockBackend.listAccounts(filter)
   },
 
+  /**
+   * 补一次签到（演示）。
+   *
+   * 与真实后端同契约：把当前筛选范围内「今日未签到」的账号补成已签到，
+   * 并回读签到表。演示模式下这一步会真的改变 `DEMO_SIGNIN`，
+   * 于是「点刷新 → 未签到变已签到」这条路径在前端也验证得到。
+   */
+  async refreshSignin(
+    filter: ChannelFilter = 'all',
+    force = false
+  ): Promise<{ signin: SigninBundle; pending: string[]; ran: string[]; day: string }> {
+    await sleep(LATENCY * 2)
+    const day = syncDemoSigninDay()
+    const midnight = new Date()
+    midnight.setHours(0, 5, 0, 0)
+    const ts = Math.floor(midnight.getTime() / 1000)
+    const scoped = ACCOUNTS.filter((a) => filter === 'all' || a.channel === filter)
+    // 国际版无签到渠道：既不算 pending，也不会被补成已签到
+    const pending = scoped.filter(
+      (a) => a.channel !== 'WorkBuddy_IE' && (!DEMO_SIGNIN[a.id] || force)
+    )
+    for (const a of pending) {
+      DEMO_SIGNIN[a.id] = {
+        checkedIn: true,
+        amount: a.channel === 'Trae' ? 200 : 100,
+        kinds: [a.channel === 'Trae' ? 'checkin' : 'pack:演示资源包'],
+        ts,
+      }
+    }
+    DEMO_SIGNIN_DAY = day
+    return {
+      signin: await mockBackend.listSignin(filter),
+      pending: pending.map((a) => a.id),
+      ran: pending.length > 0 ? ['--wb-only'] : [],
+      day,
+    }
+  },
+
   /** 重连指定通道账号 */
-  async reconnectAccounts(filter: ChannelFilter = 'all'): Promise<Account[]> {
-    await sleep(LATENCY * 3)
+  async reconnectAccounts(filter: ChannelFilter = 'all'): Promise<Account[]> {    await sleep(LATENCY * 3)
     ACCOUNTS = ACCOUNTS.map((a) => {
       const inScope = filter === 'all' || a.channel === filter
       if (!inScope) return a
@@ -602,6 +669,30 @@ export const mockBackend = {
     return buildWeek(offset, channel)
   },
 
+  /**
+   * 催一次流水采集（演示）。
+   *
+   * 真实后端在这里拉起 usage_collector 把新流水采进本地库；演示数据源没有库，
+   * 但**必须保留这个方法**：否则界面在演示模式下的刷新路径与真实路径不同，
+   * 「刷新没反应」这类 bug 就演示不出来（契约见 dataSource.ts）。
+   */
+  async refreshCredits(): Promise<void> {
+    await sleep(LATENCY * 2)
+    // 演示：让今日多出一笔流水，便于肉眼确认「刷新后数字确实变了」
+    const now = Date.now() / 1000
+    USAGE = [
+      {
+        id: uid('u'),
+        channel: 'Trae',
+        account: '示例账号(Trae-1)',
+        model: 'deepseek-v4-flash-official',
+        ts: Math.floor(now),
+        amount: Number((Math.random() * 3 + 0.1).toFixed(2)),
+      },
+      ...USAGE,
+    ]
+  },
+
   /* ── Auto 路由连（演示） ── */
   async getAutoChain(): Promise<{ chain: AutoChain; availableModels: string[] }> {
     await sleep(LATENCY)
@@ -714,12 +805,14 @@ export const mockBackend = {
 
   async getVersion(): Promise<{ current: string; latest?: string }> {
     await sleep(LATENCY / 2)
-    return { current: 'v3.0-dev' }
+    // 与 version.py 的 APP_VERSION 保持一致的形状（真实版 dev-v3.1）：
+    // 演示模式若落后一个版本，视觉回归就会把「版本号显示错」当成正常。
+    return { current: 'dev-v3.1' }
   },
 
   async checkUpdate(): Promise<{ hasUpdate: boolean; latest: string }> {
     await sleep(LATENCY * 3)
-    return { hasUpdate: false, latest: 'v3.0-dev' }
+    return { hasUpdate: false, latest: 'dev-v3.1' }
   },
 }
 

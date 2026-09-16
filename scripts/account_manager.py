@@ -32,13 +32,21 @@ try:
 except Exception:
     pass
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# ★ 打包态 (PyInstaller onefile) __file__ 指向 %TEMP%\_MEIxxxx 解包临时目录,
+#   用它拼 config/脚本路径会读错位置 (bug 家族 #4/#5, 见 MEMORY.md)。
+#   一律钉死安装根 (app_paths) 再派生; 源码态走 except 兜底, 行为不变。
+try:
+    import app_paths as _ap
+    OPENAI_ROOT = _ap.ROOT
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    OPENAI_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE = os.path.join(OPENAI_ROOT, 'scripts')  # = 本文件所在 scripts/ 目录 (打包态不漂移)
 # open-ai 自包含: 所有配置统一在 open-ai/config.json
-OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
-OPENAI_VENV_PY = os.path.join(BASE, '..', '.venv', 'Scripts', 'python.exe')
+OPENAI_CFG = os.path.join(OPENAI_ROOT, 'config.json')
+OPENAI_VENV_PY = os.path.join(OPENAI_ROOT, '.venv', 'Scripts', 'python.exe')
 
 # ---- v2.4 进程品牌化: 短命脚本用 task shim (任务管理器显示 open-ai 品牌) ----
-OPENAI_TASK_SHIM = os.path.join(BASE, '..', 'runtime', 'Scripts',
+OPENAI_TASK_SHIM = os.path.join(OPENAI_ROOT, 'runtime', 'Scripts',
                                 'open-ai-task.exe')
 
 

@@ -3,7 +3,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { GatewayGate } from '@/components/feedback/GatewayGate'
 import { DEFAULT_PAGE, getNavItem, NAV_ALL, type PageKey } from '@/config/navigation'
-import { isMockMode } from '@/lib/dataSource'
+import { backend, isMockMode } from '@/lib/dataSource'
+import { formatVersion } from '@/lib/utils'
 import { ensureGateway, gatewayRuntime, inTauri, probeGateway, type GatewayPhase } from '@/lib/gateway'
 import { AccountsPage } from '@/pages/AccountsPage'
 import { ApiPage } from '@/pages/ApiPage'
@@ -104,6 +105,32 @@ export function AppLayout() {
 
   const online = phase === 'online'
 
+  /**
+   * 版本号 —— 界面上显示的那个必须来自后端 `version.py`（APP_VERSION，
+   * 经 GET /v1/admin/version 返回，如 `dev-v3.1`）。
+   *
+   * 为什么放在布局层而不是各页面自己拉：侧边栏与「系统设置」页显示的是
+   * 同一个版本号，两处各拉一次迟早会出现「一处更新了、另一处还是旧的」。
+   * 这里拉一次、格式化一次，页面只消费结果。
+   *
+   * 网关未就绪（打包态启动中）时拿不到版本，此时**留空而不是猜一个值** ——
+   * 显示一个硬编码的旧版本号，正是这条 bug 的成因。
+   */
+  const [version, setVersion] = useState('')
+  useEffect(() => {
+    if (!online) return
+    let alive = true
+    void backend
+      .getVersion()
+      .then((v) => {
+        if (alive) setVersion(formatVersion(v.current))
+      })
+      .catch((e) => console.warn('[open-ai] 读取版本号失败', e))
+    return () => {
+      alive = false
+    }
+  }, [online])
+
   /** 页面与 URL hash 双向同步：刷新/深链保持当前页，也便于自动化工具直达 */
   useEffect(() => {
     const next = `#/${page}`
@@ -121,7 +148,7 @@ export function AppLayout() {
 
   return (
     <div className="flex h-full w-full overflow-hidden bg-bg-app">
-      <Sidebar current={page} onSelect={setPage} gatewayOnline={online} />
+      <Sidebar current={page} onSelect={setPage} gatewayOnline={online} version={version} />
 
       <main className="flex min-w-0 flex-1 flex-col bg-bg-content">
         {online ? (

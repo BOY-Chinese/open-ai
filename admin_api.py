@@ -328,6 +328,122 @@ def _loomy_group_credits(lc, g: dict) -> tuple[float | None, str]:
     return None, last_web_err
 
 
+def _run_blocking(coro):
+    """在线程里安全地执行一个协程（线程池线程内没有事件循环）。
+
+    用途：`_in_thread` 的 worker 里复用另一个 async 端点 —— 直接 await 不行
+    （worker 是同步函数），`asyncio.run` 在已有 loop 的线程里会报错，
+    线程池线程恰好没有 loop，用 asyncio.run 最干净。
+    """
+    return asyncio.run(coro)
+
+
+# ─────────────────── 签到补签（供 POST /accounts/signin/refresh 使用） ───────
+
+def _signin_argv(script_name: str, extra: list[str]) -> list[str]:
+    """拼出「跑一个内置脚本」的完整命令行 —— **必须按安装形态分叉**。
+
+    打包态（PyInstaller）里安装包**不含 `scripts\\*.py` 源码**，也没有独立
+    解释器，故不能拿 `os.path.exists(脚本)` 当门槛（现存实现踩过这个坑：
+    安装后签到/重连静默失效）。正确做法与 `launch_login` / Broker 定时任务
+    一致：把脚本路径当「路由标记」传给 task shim，由 `task_main` 按文件名
+    路由到内置模块。路径参数本身不要求存在。
+
+    源码态则用项目自带 `.venv`，缺失时回落到当前解释器。
+    """
+    import sys as _sys
+    script = os.path.join(BASE, "scripts", script_name)
+    if bool(getattr(_sys, "frozen", False)):
+        return [os.path.join(BASE, "open-ai-task.exe"), script] + list(extra)
+    if not os.path.exists(script):
+        raise HTTPException(status_code=501, detail=f"{script_name} 不存在")
+    exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
+    return [exe if os.path.exists(exe) else _sys.executable, script] + list(extra)
+
+
+def _run_signin_script(extra: list[str], timeout: int = 180) -> tuple[int, str]:
+    """同步跑一次 signin_all.py（幂等脚本），返回 (退出码, 尾部输出)。
+
+    退出码语义（见 signin_all.main）：0 = TRAE 已签上/今日已签；1 = TRAE 仍
+    繁忙 —— **不是错误**，只是本轮没抢到，故调用方只把它记进 errors 供展示，
+    不抛异常。超时按失败处理（脚本内部最坏会等 2 次 9074 重试）。
+    """
+    import subprocess
+    argv = _signin_argv("signin_all.py", extra)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        p = subprocess.run(  # noqa: S603
+            argv, cwd=BASE, capture_output=True, text=True, timeout=timeout,
+            creationflags=flags, encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return -1, f"超时（>{timeout}s）"
+    except Exception as e:  # noqa: BLE001
+        return -1, repr(e)[:200]
+    tail = (p.stdout or "").strip().splitlines()[-3:]
+    return p.returncode, " / ".join(tail)[:300]
+
+
+def _signin_targets(channel: str | None, signin: dict) -> dict:
+    """当前配置里「今日还没签到」的账号 → 决定补签要跑哪些脚本。
+
+    返回 {wb, trae, pending}：wb/trae 是「该通道存在未签账号」的布尔量
+    （决定要不要拉起 `--wb-only` / `--trae-only`），pending 是这些账号的
+    **id 列表**（与 GET /accounts/signin 的 key 同构，供前端复核补签结果）。
+
+    WorkBuddy 国际版恒不计入 —— 官方无签到渠道（2026-09-13 确认），
+    补签只会白打一次状态探测。
+
+    判定依据是**本地凭证的缺席**（GET /accounts/signin 的语义），因此
+    脚本本身仍需自行判定「已签/未参与」，重复调用无副作用。
+    """
+    cfg = _read_config()
+    prov = cfg.get("providers") or {}
+    out = {"wb": False, "trae": False, "pending": []}
+    for ch, pkey in CHANNEL_TO_PROVIDER.items():
+        if channel and ch != channel:
+            continue
+        if ch == "WorkBuddy_IE":
+            continue  # 无签到渠道
+        seg = prov.get(pkey) or {}
+        accounts = seg.get("accounts") or []
+        if ch == "Loomy":
+            # Loomy 的补领挂在 --wb-only 里（见 signin_all.main 的 Loomy 补签段），
+            # 按手机号合并行判定，与界面行 id 对齐。
+            # ⚠ _loomy_groups 的 value 是 (序号, 账号 dict) 元组，不是裸 dict ——
+            #   解包取 [1] 才拿得到账号（同 accounts_signin / refresh_account_credits）。
+            for phone, g in _loomy_groups(accounts).items():
+                d, w = g.get("desktop"), g.get("web")
+                half = d or w
+                if not half:
+                    continue
+                acc = half[1]
+                rid = _account_id(ch, acc, half[0])
+                # ★ 必须用 `in` 判存在，不能用 `.get(rid)` 判真假 —— 签到表的
+                #   value 在调用方裁剪后可能是 `{}`（空 dict 是假值），用真假判定
+                #   会把「已签到」误判成「未签到」，于是每次刷新都白跑一遍补签。
+                if rid in signin:
+                    continue
+                out["wb"] = True
+                # pending 里放**账号 id**（不是手机号/展示名）：前端拿它去签到表
+                # 里复核「补签后是否签上了」，必须与 GET /accounts/signin 的
+                # key 同构才能对得上表。
+                out["pending"].append(rid)
+            continue
+        for i, acc in enumerate(accounts):
+            if acc.get("enabled", True) is False:
+                continue
+            rid = _account_id(ch, acc, i)
+            if rid in signin:  # 同上：签到表 value 可能是 {}，不能按真假判
+                continue
+            if ch == "Trae":
+                out["trae"] = True
+            else:
+                out["wb"] = True
+            out["pending"].append(rid)
+    return out
+
+
 def _history_accounts():
     """取本地流水库里的账号（uid → 显示名）与最近积分快照。"""
     try:
@@ -474,6 +590,77 @@ async def accounts_signin(channel: str | None = None):
                 logger.warning("loomy 签到状态缓存读取失败: %s", e)
 
         return {"signin": out, "day": day, "updatedAt": _now()}
+
+    return await _in_thread(_work)
+
+
+@router.post("/accounts/signin/refresh")
+async def refresh_account_signin(payload: dict = Body(default={})):
+    """对「今日尚未签到」的账号补一次签到（联网，幂等），再回读签到表。
+
+    为什么需要这个端点
+    ------------------
+    界面上的「刷新账号」按钮原先只做两件事：拉余额（credits/refresh）+ 重读
+    签到表 —— 两件事都是**读**。于是「今天还没签到的账号」在用户点刷新后
+    依然是未签到，只能干等 Broker 每 30 分钟一轮的 `signin_all.py --wb-only`
+    补签；用户看到的却是「我刚点过刷新了，怎么还是没签到」。
+
+    实现复用既有脚本，不重复实现协议：
+      * WorkBuddy 系（含国际版）：`signin_all.py --wb-only`
+        —— 内部用官方 checkin-activity-status 判定 today_checked_in/active，
+           幂等（已签/未参与直接返回），只在 WB 通道被请求时拉起；
+      * TRAE：`signin_all.py --trae-only`
+        —— 状态查询 + claim，**不做 token 续期**（force 续期会重写
+           config.json 里的 token，正是「重新连接」按钮的职责，刷新不该顺带做）；
+      * Loomy：由 `--wb-only` 内的一段补领逻辑覆盖（只挑今日未领取的账号）。
+
+    取舍：默认**只对未签到的账号补齐**（用 GET /accounts/signin 判定），
+    force=true 时无条件全量跑一遍（供用户显式要求「重新签到」）。
+    已有今日凭证时不联网，界面点刷新不会白等一次上游往返。
+
+    返回 {ok, channel, ran: [脚本标签], pending: [...], signin, day, updatedAt}
+    —— 直接带上刷新后的签到表，调用方无需再发一次 GET。
+    """
+    channel = payload.get("channel")
+    force = bool(payload.get("force"))
+
+    if channel and channel != "all":
+        ch_norm = normalize_channel(channel)
+        if ch_norm not in CHANNEL_TO_PROVIDER:
+            raise HTTPException(status_code=400, detail=f"未知通道 {channel}")
+    else:
+        ch_norm = None
+
+    def _work() -> dict:
+        signin = (_run_blocking(accounts_signin(channel)) or {}).get("signin") or {}
+        targets = _signin_targets(ch_norm, signin)
+
+        ran: list[str] = []
+        # force：无条件重跑本通道的签到（用户显式要求），忽略 pending 判定
+        if force or targets["wb"]:
+            ran.append("--wb-only")
+        if force or targets["trae"]:
+            ran.append("--trae-only")
+
+        errors: list[str] = []
+        for flag in ran:
+            rc, err = _run_signin_script([flag])
+            if rc != 0:
+                errors.append(f"signin_all.py {flag} 退出码 {rc}{('：' + err) if err else ''}")
+
+        # 重新读一次：签到结果落在流水库 / loomy 状态缓存里，必须回读才有意义
+        after = (_run_blocking(accounts_signin(channel)) or {})
+        return {
+            "ok": True,
+            "channel": channel or "all",
+            "force": force,
+            "ran": ran,
+            "pending": targets["pending"],
+            "errors": errors[:10],
+            "signin": after.get("signin") or {},
+            "day": after.get("day") or "",
+            "updatedAt": _now(),
+        }
 
     return await _in_thread(_work)
 
@@ -1195,6 +1382,50 @@ def _platform_of(channel: str | None) -> str | None:
     if not channel or channel == "all":
         return None
     return CHANNEL_TO_PROVIDER.get(channel, channel)
+
+
+@router.post("/credits/refresh")
+async def refresh_credits(payload: dict = Body(default={})):
+    """催一次流水采集（usage_collector --collect），供积分看板的「刷新」调用。
+
+    为什么需要它
+    ------------
+    `/credits/today` 与 `/credits/week` 都是**只读本地流水库**的聚合（毫秒级），
+    而库由后台每 5 分钟采集一次。前端「刷新」若只重读这两个端点，拿到的还是
+    同一份快照 —— 用户看到的就是「点了刷新，数字一点没变」。
+
+    本端点把「采集」这一步显式暴露给前端：先采、再读，刷新才真的有新数据。
+    采集是**增量**的（usage_collector 按天/按账号续采），重复调用幂等。
+
+    实现复用 app_runtime 的定时任务脚本，不重写采集逻辑（命令行拼装见
+    {@link _signin_argv}，打包态走 task shim 按文件名路由到内置模块）。
+    采集失败不抛错：库中仍有上一次的数据，前端刷新照常进行
+    （返回 ok=false + error 供展示）。
+    """
+    def _work() -> dict:
+        import subprocess
+
+        argv = _signin_argv("usage_collector.py", ["--collect"])
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            p = subprocess.run(  # noqa: S603
+                argv, cwd=BASE, capture_output=True, text=True, timeout=180,
+                creationflags=flags, encoding="utf-8", errors="replace",
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "采集超时（>180s）", "ts": _now()}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:200], "ts": _now()}
+
+        tail = (p.stdout or "").strip().splitlines()[-3:]
+        return {
+            "ok": p.returncode == 0,
+            "exitCode": p.returncode,
+            "detail": " / ".join(tail)[:300],
+            "ts": _now(),
+        }
+
+    return await _in_thread(_work)
 
 
 @router.get("/credits/week")

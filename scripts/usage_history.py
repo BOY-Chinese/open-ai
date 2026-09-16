@@ -43,8 +43,13 @@ try:
 except Exception:
     pass
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
+# ★ 打包态 __file__ 指向 _MEI 临时目录, config 必须钉死安装根 (见 app_paths.py)
+try:
+    import app_paths as _ap
+    OPENAI_CFG = _ap.CONFIG_PATH
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    BASE = os.path.dirname(os.path.abspath(__file__))
+    OPENAI_CFG = os.path.join(BASE, '..', 'config.json')
 
 USAGE_URL = 'https://api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session'
 USAGE_TYPE_CREDITS = [7]

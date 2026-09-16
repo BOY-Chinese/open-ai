@@ -5,7 +5,7 @@
 GUI「设置」页显示该版本号, 「一键更新」据此与 GitHub 最新 release 比较决定是否更新。
 """
 
-APP_VERSION = 'v3.0-dev'
+APP_VERSION = 'dev-v3.1'
 
 # 更新通道标识 (UPDATE_CHANNEL): 当前构建版本的更新通道, 决定「一键更新」在
 # GitHub Release Assets 中精确匹配文件名含该关键词的安装包。dev 通道匹配

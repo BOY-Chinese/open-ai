@@ -1,7 +1,7 @@
 {
   "name": "open-ai-desktop",
   "private": true,
-  "version": "3.0.0",
+  "version": "3.1.0",
   "type": "module",
   "description": "open-ai 账号管理桌面端 — Tauri 2 + React 18 + Tailwind",
   "scripts": {

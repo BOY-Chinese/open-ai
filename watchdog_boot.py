@@ -14,7 +14,12 @@ import sys
 import subprocess
 from datetime import datetime
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# ★ 打包态 __file__ 指向 _MEI 临时目录, 根必须钉死 (见 app_paths.py)
+try:
+    import app_paths as _ap
+    BASE = _ap.ROOT
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    BASE = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE, 'logs')
 LOG = os.path.join(LOGS_DIR, 'daemon_boot.log')
 PYW = os.path.join(BASE, '.venv', 'Scripts', 'pythonw.exe')

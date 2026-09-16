@@ -51,6 +51,15 @@ if errorlevel 1 (
 )
 echo   [OK] desktop\open-ai-desktop.exe 就位 (前端指纹校验通过)
 
+rem ---- 0c. frozen-path gate: bare __file__ in runtime modules = broken install ----
+echo [0c] frozen-path gate (bare __file__ scan)...
+%PY% check_frozen_paths.py >> "%LOGFILE%" 2>&1
+if errorlevel 1 (
+    echo [ERROR] bare __file__ path in runtime modules - see build_installer.log
+    goto :err
+)
+echo   [OK] no bare __file__ path
+
 rem ---- 1. uninstall.exe (独立卸载程序, onedir) ----
 rem onedir 而非 onefile: 无 %TEMP%\_MEI 临时目录, 根治退出时
 rem "Failed to remove temporary directory" 弹窗 (VM/杀软锁文件场景), 启动也更快。

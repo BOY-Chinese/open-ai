@@ -332,7 +332,6 @@ def collect_gains(conn, cfg):
                 if amount > 0 and not _is_registration_pack(pkg):
                     rows.append((plat, str(acc.get('userId', '')), day, amount,
                                  f'pack:{pkg}'[:40], now_ts()))
-            _ = rid  # rid 已并入 rows
     if rows:
         conn.executemany('''INSERT INTO gain (platform, uid, day, amount, kind, updated_at)
             VALUES (?,?,?,?,?,?)

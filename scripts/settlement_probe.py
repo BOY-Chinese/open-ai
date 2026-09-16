@@ -17,7 +17,12 @@ import sys
 import time
 import urllib.request
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ★ 打包态 __file__ 指向 _MEI 临时目录, 根必须钉死 (见 app_paths.py)
+try:
+    import app_paths as _ap
+    BASE = _ap.ROOT
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFG = os.path.join(BASE, 'config.json')
 API = 'https://www.workbuddy.ai'
 

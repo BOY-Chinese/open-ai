@@ -27,7 +27,12 @@ import httpx
 from providers.base import Provider, make_chunk_id
 
 # 每次 _pick_account 都从 config.json 实时读取启用状态
-_WB_CONFIG_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'config.json'))
+# ★ 打包态 __file__ 指向解包临时目录, 相对路径会读错 config —— 钉死安装根。
+try:
+    import app_paths as _ap
+    _WB_CONFIG_PATH = _ap.CONFIG_PATH
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    _WB_CONFIG_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'config.json'))
 
 logger = logging.getLogger("openapi.workbuddy")
 

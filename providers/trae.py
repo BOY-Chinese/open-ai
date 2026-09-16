@@ -7,10 +7,12 @@ open-ai/trae/server.js (Node) 复用 TRAE 内置 aha 网络栈(sscronet.dll)完�
 Node 后端与 Python 网关同属 open-ai 独立项目, 由 start.bat 统一拉起。
 
 模型命名 (对外统一 tr- 前缀, 标识 Trae 通道):
-  tr-DeepSeek-V4-Flash-Official  → 上游动态模型 (每日自动同步, 50 个)
-  tr-glm-5.3 / tr-kimi-k3 / ...  → 上游动态模型
-  tr-flash-official 等短别名     → config.json providers.trae.models 配置层映射
-请求归一化: 剥 tr- / trae- / custom-local: 前缀 → 配置别名 → 动态上游名(大小写不敏感)。
+  tr-glm-5.3-flash / tr-kimi-k3 / ... → 上游动态模型 (每日自动同步)
+  tr-DeepSeek-V4-Flash-Official__dev  → 上游变体 (__dev=开发模式, __max=最大模式)
+  tr-flash-official 等短别名          → config.json providers.trae.models 配置层映射
+请求归一化: custom-local:/tr-/trae- 前缀剥离 → 配置别名(整名优先) → 动态上游名(大小写不敏感)。
+上游 v3 协议: 带 __dev/__max 后缀的变体名由 server.js 拆成 config_name+model_name 分开传,
+整串塞 config_name 会被上游拒绝 (the param is invalid)。
 """
 import asyncio
 import json
@@ -30,9 +32,9 @@ class TraeProvider(Provider):
         self.base_url = (cfg.get("base_url") or "http://127.0.0.1:18787/v1").rstrip("/")
         self.timeout = float(cfg.get("timeout", 300.0))
         # 别名仅来自 config.json providers.trae.models (配置层, 代码不再写死)
-        # 例: {"deepseek-v4-flash": "DeepSeek-V4-Flash", "trae-flash-official": "DeepSeek-V4-Flash-Official"}
+        # 例: {"deepseek-v4-flash": "DeepSeek-V4-Flash__dev", ...}  ← 值可为 __dev/__max 变体名
         self.aliases = {k: v for k, v in (cfg.get("models") or {}).items()}
-        self._default = (cfg.get("default_model") or "DeepSeek-V4-Flash-Official").strip()
+        self._default = (cfg.get("default_model") or "DeepSeek-V4-Flash-Official__dev").strip()
         # 账号池: 与 trae/server.js 读的是同一份 config.json providers.trae.accounts。
         # 仅用于「有没有可用账号」的判定 —— 见 list_models()。
         self.accounts = cfg.get("accounts") or []
@@ -118,18 +120,18 @@ class TraeProvider(Provider):
             name = name[len("custom-local:"):]
         if not name:
             return self._default
-        # 1) 原始名直接查配置别名 (兼容 "trae-flash-official" 这类自带前缀的 key)
+        # 1) 完整名先查配置别名 —— 必须在拆 "__dev/__max" 后缀**之前**,
+        #    否则 "trae-v4-max" 会被先剥 trae- 再截成 "v4__max" 这种垃圾名。
         if name in self.aliases:
             return self.aliases[name]
-        # 2) 剥通道前缀: tr- 为规范前缀, trae- 兼容旧客户端
+        # 2) 剥通道前缀: tr- 为规范前缀, trae- 兼容旧客户端 (循环剥, 兼容 trae-trae-x)
         low = name.lower()
-        if low.startswith("tr-"):
-            name = name[3:]
-        elif low.startswith("trae-"):
-            name = name[5:]
-        if name in self.aliases:
-            return self.aliases[name]
-        # 3) 动态上游名大小写不敏感匹配 (tr-DeepSeek-V4-Flash-Official → 原名)
+        while low.startswith("tr-") or low.startswith("trae-"):
+            name = name[5:] if low.startswith("trae-") else name[3:]
+            low = name.lower()
+            if name in self.aliases:      # 剥完前缀可能命中别名表
+                return self.aliases[name]
+        # 3) 动态上游名大小写不敏感匹配 (tr-glm-5.3-flash → glm-5.3-flash)
         for m in self._node_models:
             if m.lower() == name.lower():
                 return m

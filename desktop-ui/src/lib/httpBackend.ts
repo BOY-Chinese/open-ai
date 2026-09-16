@@ -179,6 +179,38 @@ export const httpBackend = {
     return this.listAccounts(filter)
   },
 
+  /**
+   * 给「今日尚未签到」的账号补一次签到。返回**刷新后的签到表**。
+   *
+   * 为什么由后端做判定：签到凭证在本地流水库 / Loomy 状态缓存里
+   * （见 GET /accounts/signin 的说明），前端拿不到「谁还没签」的全貌；
+   * 网关侧一次调用即可完成「判定 → 补签 → 回读」，且补签脚本幂等
+   * （已签/活动未参与均为终态，重复跑无副作用）。
+   *
+   * 耗时：有未签账号时要联网（逐账号请求上游），故给到 180s；
+   * 全部已签时后端不拉起脚本，毫秒级返回。
+   */
+  async refreshSignin(
+    filter: ChannelFilter = 'all',
+    force = false
+  ): Promise<{ signin: SigninBundle; pending: string[]; ran: string[] }> {
+    const r = await req<{
+      signin?: Record<string, SigninStatus>
+      day?: string
+      pending?: string[]
+      ran?: string[]
+    }>('/v1/admin/accounts/signin/refresh', {
+      method: 'POST',
+      body: { channel: filter, force },
+      timeoutMs: 180000,
+    })
+    return {
+      signin: { day: r.day ?? '', signin: r.signin ?? {} },
+      pending: r.pending ?? [],
+      ran: r.ran ?? [],
+    }
+  },
+
   async reconnectAccounts(filter: ChannelFilter = 'all'): Promise<Account[]> {
     await req('/v1/admin/accounts/reconnect', {
       method: 'POST',
@@ -368,6 +400,19 @@ export const httpBackend = {
       updatedAt: number
     }>(`/v1/admin/credits/week${q({ offset, channel })}`)
     return r
+  },
+
+  /**
+   * 催一次流水采集（usage_collector --collect，增量、幂等，联网但很快）。
+   *
+   * 为什么「刷新积分」必须先做这一步：看板的今日/本周数字**全部来自本地
+   * 流水库**，而库是后台每 5 分钟采一次的快照。用户点刷新时若只重读接口，
+   * 读到的还是同一份旧数据 —— 界面上就是「刷新了但数字没变」。
+   *
+   * 失败不致命：库中仍有上一次采集的数据，调用方据此继续刷新即可。
+   */
+  async refreshCredits(): Promise<void> {
+    await req('/v1/admin/credits/refresh', { method: 'POST', body: {}, timeoutMs: 120000 })
   },
 
   /* ═══════════════ Auto 路由连 ═══════════════ */

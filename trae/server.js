@@ -251,7 +251,12 @@ async function fetchUpstreamModels() {
     method: 'POST',
     headers: {
       ...BASE_HDRS,
+      // 与 llm_utils_chat 同口径: 三头同 token + X-Uid (缺 X-Uid 时部分账号拿不到全量模型)
+      'authorization': `Cloud-IDE-JWT ${acc.token}`,
+      'x-cloudide-token': acc.token,
       'x-ide-token': acc.token,
+      'x-uid': acc.uid || '',
+      'accept': 'application/json',
       'content-type': 'application/json',
       'referer': 'https://trae-api-cn.mchost.guru/',
     },
@@ -292,14 +297,34 @@ async function refreshModels(force) {
 }
 
 // ======================= 模型映射 =======================
-function resolveModel(model) {
-  if (!model) return CFG.default_model;
+// 上游 v3 协议 (2026-09 实测): 模型名带模式后缀 "__dev"/"__max" 时, 必须拆开传:
+//   config_name = 基础配置名 (如 glm-5.3-flash)          ← get_detail_param 返回的名字
+//   model_name  = 完整变体名 (如 glm-5.3-flash__dev)
+// 整串塞进 config_name 会被上游拒之门外: "the param is invalid"。
+// (J/K 双向实测: model_name=__max 可用; 整串 config_name=__max/__dev 一律 4001)
+function resolveModelNames(model) {
+  if (!model) model = CFG.default_model || '';
+  // 剥通道前缀: 网关(normalize_model)通常已剥, 这里兜底处理直连 18787 的调用
+  // (custom-local: 旧客户端格式 / tr- 规范前缀 / trae- 旧前缀, 循环剥)
+  let low = String(model).toLowerCase();
+  while (low.startsWith('custom-local:') || low.startsWith('tr-') || low.startsWith('trae-')) {
+    model = model.slice(low.startsWith('custom-local:') ? 13 : (low.startsWith('trae-') ? 5 : 3));
+    low = String(model).toLowerCase();
+  }
+  if (!model) model = CFG.default_model || '';
   // 动态模型表优先(上游 config_name)
-  if (DYNAMIC_MODELS.includes(model)) return model;
-  // config.json 显式别名
-  if (CFG.models && CFG.models[model]) return CFG.models[model];
-  // 兜底: 原样透传 (动态表里的模型名直接可用)
-  return model;
+  if (DYNAMIC_MODELS.includes(model)) return { configName: model, modelName: model };
+  // config.json 显式别名 (值可以是基础名或 __dev/__max 变体名)
+  if (CFG.models && CFG.models[model]) model = CFG.models[model];
+  // 拆模式后缀: "__dev" / "__max" → config_name + model_name
+  const m = model.match(/^(.+)__(dev|max)$/);
+  if (m) return { configName: m[1], modelName: model };
+  return { configName: model, modelName: model };
+}
+
+// 兼容旧调用点: 只取完整模型名 (变体名)
+function resolveModel(model) {
+  return resolveModelNames(model).modelName;
 }
 
 // ======================= 消息转换 (OpenAI -> Trae) =======================
@@ -374,14 +399,72 @@ function extractUserInput(messages) {
 }
 
 // ======================= Trae 聊天调用 =======================
-async function traeChat(body, { onOutput, onUsage, onDone, onError, signal }) {
-  const configName = resolveModel(body.model);
+// 上游 (2026-09) 起「不带模式变体的基础名」一律拒绝:
+//   config_name=glm-5.3-flash 直呼 → event:error "the model is unknown"
+//   必须显式给 model_name=<config>__dev (或 __max), 缺变体即失败。
+// 因此: 用户没指定变体时补默认 __dev; 万一该配置没有 dev 变体, 首字节前自动
+// 回退成「不传 model_name」再试一次 (老协议形态), 保证两种情况都能出字。
+const DEFAULT_VARIANT = '__dev';
+const RETRYABLE_MODEL_ERR = /model is unknown|param is invalid/i;
+
+function hasModelVariant(name) {
+  return /__(dev|max)$/i.test(String(name || ''));
+}
+
+// traeChat: 变体兜底 + 一次性回退
+async function traeChat(body, handlers) {
+  const { configName, modelName } = resolveModelNames(body.model);
+  const userGaveVariant = hasModelVariant(modelName);
+  const firstModelName = userGaveVariant ? modelName : `${modelName}${DEFAULT_VARIANT}`;
+
+  // 首字节前先不把 error/done 透给调用方 (可能是可回退的模型名错误)
+  let emitted = false;
+  let deferredErr = null;
+  let deferredDone = null;
+  // 排队状态: 记录是否排过队 + 最后一次位次 (供流结束时的 queue_timeout 判定)
+  let queueSeen = false;
+  let lastPosition = null;
+  const buffered = {
+    onOutput: (o) => { emitted = true; handlers.onOutput(o); },
+    onUsage: (u) => handlers.onUsage && handlers.onUsage(u),
+    onDone: (fr) => { deferredDone = fr; },
+    onError: (msg) => { deferredErr = msg; },
+    // 排队事件只透传「位次」, 不传 queue_id 等内部标识; 由 HTTP 层决定是否提示
+    onQueue: (q) => {
+      queueSeen = true;
+      if (q && q.phase === 'wait' && Number.isFinite(q.position)) lastPosition = q.position;
+      if (handlers.onQueue) handlers.onQueue(q);
+    },
+    signal: handlers.signal,
+  };
+
+  const r1 = await traeChatOnce(body, configName, firstModelName, buffered);
+  const errText = String(r1.error || deferredErr || '');
+  if (!emitted && !userGaveVariant && RETRYABLE_MODEL_ERR.test(errText)) {
+    console.warn(`[trae-warn] ${configName}${DEFAULT_VARIANT} 被上游拒绝(${errText.slice(0, 60)}), 回退为不带 model_name 重试`);
+    return await traeChatOnce(body, configName, null, handlers);
+  }
+  // 排队空转: 全程只排队、一个 token 都没出 → 明确标 queue_timeout, 不留「无信息空回复」
+  if (queueSeen && !emitted && !deferredErr) {
+    console.warn(`[trae-warn] ${configName} 排队期结束但无输出 (最后位次=${lastPosition}), 标记 queue_timeout`);
+    if (handlers.onDone) handlers.onDone('queue_timeout');
+    return { error: null, queueTimeout: true, lastPosition };
+  }
+  // 无回退: 把缓冲的 error/done 按原语义补报给调用方
+  if (deferredErr) handlers.onError && handlers.onError(deferredErr);
+  if (deferredDone) handlers.onDone && handlers.onDone(deferredDone);
+  return r1;
+}
+
+async function traeChatOnce(body, configName, modelName, { onOutput, onUsage, onDone, onError, onQueue, signal }) {
   const chatFunction = CFG.function || 'chat_v3';
   const reqBody = {
     function: chatFunction,
     config_name: configName,
     messages: convertMessages(body.messages),
   };
+  // 变体名必须独立成字段; 基础名直传 config_name 会被上游判为 unknown model
+  if (modelName) reqBody.model_name = modelName;
   if (CFG.use_work_credits !== false) {
     reqBody.session_id = '6a' + hex(21);
     reqBody.conversation_id = '6a' + hex(21);
@@ -395,25 +478,63 @@ async function traeChat(body, { onOutput, onUsage, onDone, onError, signal }) {
   const toolChoice = convertToolChoice(body.tool_choice, !!tools);
   if (toolChoice) reqBody.tool_choice = toolChoice;
 
-  const { idx: accIdx, acc } = pickAccount();
-
-  if (process.env.TRAE_PROXY_DEBUG) {
-    console.log(`[req] account[${accIdx}]=${acc.name} model=${configName} messages=${body.messages?.length} tools=${tools?.length ?? 0} tool_choice=${toolChoice || body.tool_choice || 'auto'}`);
+  // 上游偶发 TTNet/Cronet 网络错误 (code=3/-21 网络切换, code=8/-101 连接重置)
+  // 与 429/5xx 都是瞬时的: 重试并轮换账号, 避免把抖动当成「模型不可用」抛给客户端。
+  // 只在首字节之前重试 (fetch 阶段), 不会重复已产生的输出。
+  // 每次尝试都挂到合并信号上: 内部 ac (看门狗) + 调用方 signal (客户端断开),
+  // 任一触发都中止上游 —— AbortSignal.any 需要 Node 20+, 本项目 runtime 满足。
+  const ac = new AbortController();
+  const upstreamSignal = signal ? AbortSignal.any([signal, ac.signal]) : ac.signal;
+  const MAX_ATTEMPTS = 3;
+  let resp = null;
+  let lastFetchErr = null;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const acc = pickAccount().acc;
+    try {
+      resp = await ahaNet.fetch('https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat', {
+        method: 'POST',
+        headers: {
+          ...BASE_HDRS,
+          // 上游 v3 要求三头同 token (Cloud-IDE-JWT / X-Cloudide-Token / X-Ide-Token)
+          // 以及账号 uid (X-Uid); 缺失时部分模型会报 param invalid / 鉴权失败
+          'authorization': `Cloud-IDE-JWT ${acc.token}`,
+          'x-cloudide-token': acc.token,
+          'x-ide-token': acc.token,
+          'x-uid': acc.uid || '',
+          'content-type': 'application/json',
+          'x-request-id': 'req_' + randomUUID(),
+          'x-trae-request-id': randomUUID(),
+          'referer': 'https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat',
+        },
+        body: JSON.stringify(reqBody),
+        signal: upstreamSignal,
+      });
+    } catch (e) {
+      lastFetchErr = e;
+      resp = null;
+      // 看门狗已触发: 不再重试, 直接把失败抛给上层
+      if (watchdogTripped) break;
+      if (process.env.TRAE_PROXY_DEBUG) {
+        console.warn(`[trae-warn] 第 ${attempt + 1}/${MAX_ATTEMPTS} 次请求网络异常: ${e && e.message}`);
+      }
+    }
+    if (resp && (resp.status === 429 || resp.status >= 500)) {
+      lastFetchErr = new Error(`HTTP ${resp.status}`);
+      resp = null;
+    }
+    if (resp) break;
+    if (attempt < MAX_ATTEMPTS - 1) {
+      await new Promise(r => setTimeout(r, 600 * (attempt + 1)));   // 退避后再试(换账号)
+    }
   }
-
-  const resp = await ahaNet.fetch('https://api5-normal.mchost.guru/api/agent/v3/llm_utils_chat', {
-    method: 'POST',
-    headers: {
-      ...BASE_HDRS,
-      'x-ide-token': acc.token,
-      'content-type': 'application/json',
-      'x-request-id': 'req_' + randomUUID(),
-      'x-trae-request-id': randomUUID(),
-      'referer': 'https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat',
-    },
-    body: JSON.stringify(reqBody),
-    signal,
-  });
+  if (!resp) {
+    if (watchdogTripped) {
+      throw new Error(`Trae 上游${watchdogTripped} (连接已中止)`);
+    }
+    const msg = (lastFetchErr && lastFetchErr.message) || '上游不可达';
+    console.error(`[trae-err] 重试 ${MAX_ATTEMPTS} 次仍失败: ${msg}`);
+    throw new Error(`Trae API 请求失败: ${msg}`);
+  }
 
   if (resp.status !== 200) {
     const errText = await resp.text();
@@ -427,10 +548,33 @@ async function traeChat(body, { onOutput, onUsage, onDone, onError, signal }) {
   let currentEvent = null;
   let lastError = null;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  // 无数据看门狗: 防上游/TTNet 挂死导致的「无限等待」。
+  // 注意与心跳的区别 —— 心跳是发给客户端的保活(会重置网关的读超时),
+  // 看门狗只看「上游是否给过字节」: 建连后 60s 内零字节, 或读流中途 120s
+  // 无新字节, 就 abort 上游连接并抛错, 让网关/客户端立刻收到失败,
+  // 而不是被自己的心跳喂成无限等待。(排队场景不受影响: 上游每 ~1.16s
+  // 就有 request_wait_in_queue 事件, 计时器不断被喂, 不会误杀)
+  let watchdogTripped = null;
+  const armWatchdog = (ms, label) => {
+    return setTimeout(() => {
+      if (watchdogTripped) return;
+      watchdogTripped = `${label} ${Math.round(ms / 1000)}s 无上游数据`;
+      console.error(`[trae-err] 看门狗触发: ${watchdogTripped} → abort 上游连接`);
+      try { ac.abort(); } catch { /* ignore */ }
+    }, ms);
+  };
+  let wd = armWatchdog(60000, '首字节');
+  const FEED = () => {
+    clearTimeout(wd);
+    wd = armWatchdog(120000, '读流中断');
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      FEED();
+      buffer += decoder.decode(value, { stream: true });
 
     let nlIdx;
     while ((nlIdx = buffer.indexOf('\n')) !== -1) {
@@ -467,10 +611,47 @@ async function traeChat(body, { onOutput, onUsage, onDone, onError, signal }) {
             console.error('[trae-err] event:error:', lastError.slice(0, 300));
             onError(lastError);
           } catch { /* ignore */ }
+        } else if (currentEvent === 'queue_begin') {
+          // 排队开始: 此时只有 queue_id, 还拿不到位次 → 不对外发提示
+          try {
+            const q = JSON.parse(data);
+            if (onQueue) onQueue({ phase: 'begin', queueId: q.queue_id || '', requestUuid: q.request_uuid || '' });
+          } catch { /* ignore */ }
+        } else if (currentEvent === 'request_wait_in_queue') {
+          // 排队等待: 带实时位次 position (实测上游每 ~1.16s 推一条, 位次递但不匀速)
+          try {
+            const q = JSON.parse(data);
+            // 注意 Number(null) === 0 且 isFinite 为真, 必须排除 null/空串
+            const raw = q.position;
+            const pos = (raw === null || raw === undefined || raw === '') ? NaN : Number(raw);
+            if (onQueue && Number.isFinite(pos) && pos > 0) {
+              onQueue({
+                phase: 'wait',
+                position: pos,
+                message: q.message || '',
+                queueId: q.queue_id || '',
+                requestUuid: q.request_uuid || '',
+              });
+            }
+          } catch { /* ignore */ }
+        } else if (currentEvent === 'progress_notice') {
+          // 保活事件 ("Processing_<ts>" / ";Processing"): 仅用于心跳, 不产生内容
         }
         currentEvent = null;
       }
     }
+  }
+  } catch (e) {
+    // 看门狗 abort / 上游读流异常: 明确抛错, 让客户端立刻失败而非无限等待
+    if (watchdogTripped) {
+      lastError = `Trae 上游${watchdogTripped} (连接已中止)`;
+    } else if (e && e.name === 'AbortError') {
+      lastError = 'Trae 上游连接被中止 (AbortError)';
+    } else {
+      throw e;
+    }
+  } finally {
+    clearTimeout(wd);
   }
   return { error: lastError };
 }
@@ -579,6 +760,8 @@ const server = http.createServer(async (req, res) => {
       const id = 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 24);
       const created = Math.floor(Date.now() / 1000);
       const send = (chunk) => res.write('data: ' + chunk + '\n\n');
+      // 客户端断开信号: 传给 traeChat → 与看门狗合并中止上游 (下面 res.on('close') 触发)
+      const clientAbort = new AbortController();
 
       if (stream) {
         res.writeHead(200, {
@@ -600,9 +783,45 @@ const server = http.createServer(async (req, res) => {
           res.end();
         };
 
+        // 排队提示: 只报位次, 禁止百分比/ETA —— 实测位次推进不匀速
+        // (112→105 用了 85s, 之后卡住 115s 没动), 算 ETA 会骗人, 不如只报第 N 位。
+        // 位次**每次变化**都更新 (首条之后仍在 token 之前): 数字在变小 = 链路活着,
+        // 只是上游人多 —— 这正是提示层的初衷: 用户能看出「不是网关挂了」。
+        // 这些 content 块同时喂饱网关 httpx 与 DSH idleWatchdog 的空闲超时,
+        // 排队十几分钟也不会被任何一层判死。
+        let lastQueuePos = null;
+        let sawContent = false;
+        const onQueueHint = ({ phase, position }) => {
+          if (sawContent || phase !== 'wait') return;
+          if (position === lastQueuePos) return;      // 位次没变就不刷屏
+          lastQueuePos = position;
+          send(openaiChunk(model, id, created,
+               { content: `⌛ 排队中，当前第 ${position} 位…\n` }, null));
+        };
+
+        // 防御性保活: 每 15s 一条 SSE 注释行 (以 ':' 开头, OpenAI 客户端会忽略)。
+        // 不是为了修现有静默 (Trae 排队期本就每 ~1.16s 有事件), 而是覆盖
+        // 「非排队类的首 token 前长静默」, 防上游改推流节奏后静默超时被掐断。
+        const hb = setInterval(() => {
+          if (finished) return;
+          try { res.write(': keep-alive\n\n'); } catch { /* ignore */ }
+        }, 15000);
+
+        // 用户断开即中止上游: 客户端等不及关掉后, 不让上游队列里还挂着一个
+        // 空占位次的请求 (既浪费我们的额度, 又推高后面所有人的位次)。
+        // 通过 clientAbort 信号传给 traeChatOnce, 与看门狗合并监听。
+        res.on('close', () => {
+          if (!finished) {
+            console.log(`[trae] 客户端已断开, 中止上游请求 (排队位次=${lastQueuePos ?? '无'})`);
+            try { clientAbort.abort(); } catch { /* ignore */ }
+          }
+        });
+
         try {
           await traeChat(body, {
             onOutput: ({ response, reasoning_content, tool_calls }) => {
+              if (response || reasoning_content ||
+                  (tool_calls && tool_calls.length > 0)) sawContent = true;
               if (tool_calls && tool_calls.length > 0) {
                 const deltas = merger.feed(tool_calls);
                 for (const d of deltas) {
@@ -613,13 +832,17 @@ const server = http.createServer(async (req, res) => {
               if (reasoning_content) send(openaiChunk(model, id, created, { reasoning_content }, null));
             },
             onUsage: () => {},
+            onQueue: onQueueHint,
             onDone: (fr) => endStream(fr),
             onError: () => endStream('stop'),
+            signal: clientAbort.signal,
           });
           if (merger.calls.size > 0) endStream('tool_calls');
           else endStream('stop');
         } catch (e) {
           endStream('stop');
+        } finally {
+          clearInterval(hb);
         }
       } else {
         let full = '';
@@ -627,7 +850,14 @@ const server = http.createServer(async (req, res) => {
         let usage = null;
         let finishReason = 'stop';
         let traeError = null;
+        let lastQueuePos = null;
         const merger = new ToolCallStreamMerger();
+
+        // 非流式同样: 客户端断开就中止上游, 不空占队列位次
+        res.on('close', () => {
+          console.log(`[trae] 客户端已断开(非流式), 中止上游请求 (排队位次=${lastQueuePos ?? '无'})`);
+          try { clientAbort.abort(); } catch { /* ignore */ }
+        });
 
         try {
           await traeChat(body, {
@@ -637,8 +867,14 @@ const server = http.createServer(async (req, res) => {
               if (tool_calls && tool_calls.length > 0) merger.feed(tool_calls);
             },
             onUsage: (u) => { usage = { prompt_tokens: u.prompt_tokens, completion_tokens: u.completion_tokens, total_tokens: u.total_tokens }; },
+            onQueue: ({ phase, position }) => {
+              if (phase === 'wait' && Number.isFinite(position) && position > 0) {
+                lastQueuePos = position;
+              }
+            },
             onDone: (fr) => { finishReason = fr || 'stop'; },
             onError: (msg) => { traeError = msg; },
+            signal: clientAbort.signal,
           });
         } catch (e) {
           traeError = String(e.message || e);
@@ -650,6 +886,12 @@ const server = http.createServer(async (req, res) => {
           message.tool_calls = toolCalls;
           if (!full) message.content = null;
           finishReason = 'tool_calls';
+        }
+        // 排队空转: 非流式也能看出「排过队且一个字没出」, 给出可读说明而不只是空回复
+        if (!traeError && !full && !reasoning && toolCalls.length === 0 &&
+            lastQueuePos !== null) {
+          message.content = `⌛ 排队中，当前第 ${lastQueuePos} 位…（本次未等到模型返回，请稍后重试）`;
+          finishReason = 'queue_timeout';
         }
         const payload = {
           id, object: 'chat.completion', created, model,

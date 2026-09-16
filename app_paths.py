@@ -39,6 +39,29 @@ RUNTIME_DIR = os.path.join(ROOT, 'runtime')
 SHIM_DIR = os.path.join(ROOT, 'runtime', 'Scripts')
 VENV_DIR = os.path.join(ROOT, '.venv')
 
+# Playwright 浏览器缓存的**本地**落点 (安装包把该目录整份解到 <root>\ms-playwright)。
+#
+# 为什么要显式指路: 打包态既没有 pip 也不会跑 `playwright install`, 浏览器二进制
+# 由安装包随 resources.zip 带下来。Playwright 默认只认 `%LOCALAPPDATA%\ms-playwright`
+# 或环境变量 PLAYWRIGHT_BROWSERS_PATH —— 不设的话它会认为"浏览器未安装",
+# 登录助手启动失败后**静默降级到系统 Edge** (国际版 X/OAuth 在那里会卡死, 且不报错)。
+PLAYWRIGHT_BROWSERS_DIR = os.path.join(ROOT, 'ms-playwright')
+
+
+def ensure_playwright_browsers_path():
+    """把内嵌的浏览器目录暴露给 Playwright (幂等, 可重复调用)。
+
+    仅当目录**确实存在**时才设置: 源码态开发者机器上通常没有 <root>\\ms-playwright,
+    此时保持不设, 让 Playwright 走自己的默认缓存 (开发者自行
+    `python -m playwright install chromium`)。
+
+    返回最终生效的路径 (未设置时为 '')。
+    """
+    if not os.path.isdir(PLAYWRIGHT_BROWSERS_DIR):
+        return ''
+    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = PLAYWRIGHT_BROWSERS_DIR
+    return PLAYWRIGHT_BROWSERS_DIR
+
 # 品牌化 exe 的落点:
 #   源码态 —— procname.py 在 runtime\Scripts\ 下生成 shim (复制解释器 + 注入图标)
 #   打包态 —— 品牌 exe 直接躺在安装根, 没有 runtime\Scripts\ 这一层

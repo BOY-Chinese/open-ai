@@ -30,10 +30,28 @@ WorkBuddy 国际版 (www.workbuddy.ai) 网页登录 → 应用 token 脚本
   python login_workbuddy_intl.py --debug           # 打印全部网络响应 (排障用)
   python login_workbuddy_intl.py --keep-open       # 失败时保留浏览器窗口供人工检查
   python login_workbuddy_intl.py --url <登录页URL>  # 覆盖登录页 URL (链路变更时用)
+  python login_workbuddy_intl.py --browser chromium # 指定浏览器 (chromium/chrome/msedge/firefox)
+  python login_workbuddy_intl.py --reuse-profile    # 复用上次登录会话 (接着没走完的登录)
+
+★ 浏览器方案 (v2.6 起更换, 更稳定):
+  旧版直接 p.chromium.launch(channel='msedge') 拉起系统 Edge —— 实测
+  (logs/login_WorkBuddy_IE.log 2026 多次) 走 X(Twitter) OAuth 登录时被 X 的
+  反机器人挑战 (onboarding/web#/s/knowledge_check) 卡成死循环, 根因是
+  Playwright 浏览器带自动化特征 (navigator.webdriver=true 等)。本版三管齐下:
+    1. 默认用 **Playwright 自带 Chromium** (版本与 playwright 包锁死,
+       不受系统 Edge/Chrome 自动更新影响, 最稳);
+    2. 反自动化检测: 去 --enable-automation 开关 +
+       --disable-blink-features=AutomationControlled + 隐藏 navigator.webdriver;
+    3. **每次登录用全新独立 profile** (data/pw_profiles/wbie/run-<时间戳>/):
+       干净会话 —— 同一通道可连续添加多个账号, 不会被上一次的登录态自动
+       顶号 (固定 profile 的教训: SSO cookie 常驻会让登录页"自动登录",
+       没法加第二个账号); 上次没走完的登录用 --reuse-profile 复用最近会话。
+  启动失败 (如自带浏览器缺失) 自动按 chromium → chrome → msedge → firefox 降级。
 """
 import base64
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.parse
@@ -53,11 +71,24 @@ except Exception:
 try:
     import app_paths as _ap
     OPENAI_CFG = _ap.CONFIG_PATH
+    # ★ 便携版把 Playwright 浏览器内嵌在 <root>\ms-playwright, 必须指路 ——
+    #   否则 Playwright 认为「浏览器未安装」, 启动失败后静默降级到系统 Edge,
+    #   而 Edge 恰是本次换 Chromium 要绕开的那个不稳定路径 (见文件头说明)。
+    _ap.ensure_playwright_browsers_path()
     LOG_PATH = os.path.join(_ap.LOGS_DIR, 'login_workbuddy_intl.log')
+    # 浏览器 profile 根目录 (data/ 下, 用户数据)。每次登录在其中开一个全新的
+    # run-<时间戳> 子目录 —— 干净会话才能在同一通道添加多个账号 (见
+    # _pick_profile_dir); 也不污染真实浏览器配置。
+    PROFILE_ROOT = os.path.join(_ap.DATA_DIR, 'pw_profiles', 'wbie')
+    # v2.6 早期用过的固定 profile (SSO 登录态常驻会自动顶号, 无法加多账号),
+    # 已废弃, 启动时顺手清掉。
+    _LEGACY_PROFILE_DIR = os.path.join(_ap.DATA_DIR, 'pw_profile_wbie')
 except Exception:  # 源码态单独运行的兜底
     HERE = os.path.dirname(os.path.abspath(__file__))
     OPENAI_CFG = os.path.join(HERE, '..', 'config.json')
     LOG_PATH = os.path.join(HERE, '..', 'logs', 'login_workbuddy_intl.log')
+    PROFILE_ROOT = os.path.join(HERE, '..', 'data', 'pw_profiles', 'wbie')
+    _LEGACY_PROFILE_DIR = os.path.join(HERE, '..', 'data', 'pw_profile_wbie')
 
 INTL_HOST = 'www.workbuddy.ai'
 INTL_DOMAIN = 'www.workbuddy.ai'
@@ -65,8 +96,17 @@ INTL_PRODUCT = 'workbuddy-ai'
 
 LOGIN_URL_TMPL = ('https://www.workbuddy.ai/login/?platform=workbuddy'
                   '&state={state}&version=5.3.12&loginSessionId={lsid}')
-UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0')
+# 启动优先级: 自带 Chromium (版本与 playwright 包锁死, 不受系统浏览器自动更新
+# 影响, 最稳) → 系统 Chrome → 系统 Edge (旧版默认) → Firefox。
+# 任一档启动失败 (未安装/版本不匹配/profile 被占用) 自动降级到下一档。
+BROWSER_FALLBACK = ('chromium', 'chrome', 'msedge', 'firefox')
+
+# 反自动化检测注入: 只隐藏 navigator.webdriver 这一条硬特征。
+# ★ 浏览器一律用**原生 UA** (不传 user_agent 覆盖) —— 伪造 Edg/Chrome 身份会
+#   与 client-hints 品牌头自相矛盾, 风控正抓这种不一致; 原生长相最可信。
+STEALTH_JS = (
+    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+)
 
 # 会返回 token 的端点: 命中这些路径的响应里带的 token 优先采用 (已实测确认)。
 #   /console/login/enterprise      —— 真正的换 token 接口 (POST → accessToken/refreshToken)
@@ -379,7 +419,8 @@ def write_account(access_token, refresh_token, user_id, name):
 # ==================== 主流程 ====================
 
 def parse_args(argv):
-    opts = {'timeout': 300, 'debug': False, 'keep_open': False, 'url': ''}
+    opts = {'timeout': 300, 'debug': False, 'keep_open': False, 'url': '',
+            'browser': '', 'reuse_profile': False}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -391,13 +432,91 @@ def parse_args(argv):
             opts['keep_open'] = True; i += 1; continue
         if a == '--url' and i + 1 < len(argv):
             opts['url'] = argv[i + 1]; i += 2; continue
+        if a == '--browser' and i + 1 < len(argv):
+            opts['browser'] = argv[i + 1].strip().lower(); i += 2; continue
+        if a in ('--reuse-profile', '--reuse'):
+            opts['reuse_profile'] = True; i += 1; continue
         i += 1
     return opts
+
+
+def _pick_profile_dir(reuse=False, firefox=False):
+    """挑选本次登录的浏览器 profile 目录 (默认每次**全新**)。
+
+    ★ 为什么不再用固定 profile: 固定 profile 里上一次的登录态 (SSO cookie)
+    会让登录页自动顶上一次的账号 —— 同一通道就没法添加第二个账号了。
+    现改为每次登录一个全新 run-<时间戳> 目录, 添加任意多个账号互不干扰;
+    上次没走完的登录可用 --reuse-profile 复用最近一次会话接着来。
+
+    除「本次 + 最近一次」外的旧会话目录自动清理 (被占用的删不掉则忽略)。
+    """
+    root = os.path.join(PROFILE_ROOT, 'firefox') if firefox else PROFILE_ROOT
+    os.makedirs(root, exist_ok=True)
+    runs = sorted(d for d in os.listdir(root)
+                  if d.startswith('run-') and os.path.isdir(os.path.join(root, d)))
+    if reuse and runs:
+        udd = os.path.join(root, runs[-1])
+        log(f'[浏览器] 复用上次登录会话: {udd}')
+    else:
+        udd = os.path.join(root, 'run-' + time.strftime('%Y%m%d-%H%M%S'))
+        try:
+            os.makedirs(udd)                  # 先占住目录, 并发重跑才不会撞车
+        except Exception:                     # 已存在 (同一秒重跑/并发) → 加随机后缀
+            udd += '-' + str(uuid.uuid4())[:8]
+            os.makedirs(udd, exist_ok=True)
+        log(f'[浏览器] 全新登录会话 (干净状态, 便于添加不同账号): {udd}')
+    for d in runs[:-1]:                       # 只留最近一次旧会话供 --reuse-profile
+        shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+    return udd
+
+
+def launch_browser(p, choice='', reuse_profile=False):
+    """启动浏览器 (全新会话 + 反自动化检测), 返回 (context, 实际浏览器名)。
+
+    choice 为空按 BROWSER_FALLBACK 顺序自动尝试; 指定则先试 choice 再降级其余。
+    ★ 过 OAuth 人机挑战的关键是反自动化检测 (隐藏 webdriver 等);
+      launch_persistent_context 只是承载 profile 目录的方式 —— 目录由
+      _pick_profile_dir 决定 (默认全新, --reuse-profile 复用上次)。
+    """
+    order = ([choice] if choice else []) + \
+            [b for b in BROWSER_FALLBACK if b != choice]
+    errs = []
+    for name in order:
+        # Chromium 系与 Firefox 的 profile 格式互不兼容, 分开根目录。
+        udd = _pick_profile_dir(reuse_profile, firefox=(name == 'firefox'))
+        try:
+            if name == 'firefox':
+                ctx = p.firefox.launch_persistent_context(
+                    udd, headless=False, locale='zh-CN')
+            else:
+                ctx = p.chromium.launch_persistent_context(
+                    udd,
+                    headless=False,
+                    channel=None if name == 'chromium' else name,
+                    locale='zh-CN',
+                    no_viewport=True,      # 视口跟随窗口, 不留 1280x720 自动化痕迹
+                    args=['--disable-blink-features=AutomationControlled',
+                          '--no-first-run', '--no-default-browser-check'],
+                    ignore_default_args=['--enable-automation'],
+                )
+            ctx.add_init_script(STEALTH_JS)
+            log(f'[浏览器] 已启动 {name} (profile: {udd})')
+            return ctx, name
+        except Exception as e:
+            errs.append(f'{name} → {type(e).__name__}: {e}')
+            log(f'[降级] {name} 启动失败, 尝试下一候选 ...')
+    raise RuntimeError(
+        '所有候选浏览器都无法启动:\n  ' + '\n  '.join(errs)
+        + '\n  提示: 若报 profile 被占用, 先关掉上一次登录残留的浏览器窗口')
 
 
 def main():
     opts = parse_args(sys.argv[1:])
     timeout = opts['timeout']
+
+    # 清理 v2.6 早期的固定 profile (SSO 登录态常驻会自动顶号, 无法加多账号)
+    if os.path.isdir(_LEGACY_PROFILE_DIR):
+        shutil.rmtree(_LEGACY_PROFILE_DIR, ignore_errors=True)
 
     from playwright.sync_api import sync_playwright
 
@@ -455,23 +574,26 @@ def main():
         if bag.access and bag.access != before:
             log(f'  [网络捕获] accessToken 来自 {src}')
 
-    browser = None
     ctx = None
     page = None
     closed_by_user = False
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, channel='msedge')
-        ctx = browser.new_context(user_agent=UA)
+        ctx, browser_name = launch_browser(p, opts['browser'],
+                                           opts['reuse_profile'])
         # A. context 级监听 —— 覆盖 iframe / 弹窗, 不只主页面
         ctx.on('response', on_response)
+        # 诊断: 记录加载失败的请求 (风控/验证码端点被拒时日志里有据可查)
+        ctx.on('requestfailed',
+               lambda r: log_diag(f'FAIL {r.url[:150]} → {r.failure}'))
 
         def on_page(newp):
             log(f'  [新窗口] {newp.url[:100]}')
             newp.on('response', on_response)
         ctx.on('page', on_page)
 
-        page = ctx.new_page()
+        # 持久化 context 自带一个空白初始页: 直接复用, 免得多一个 about:blank 标签
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         # 网络不稳时 (实测见过 TCP 连接就耗 19s) goto 很容易超时, 故重试 3 次。
         goto_ok = False
         for attempt in range(1, 4):
@@ -490,7 +612,7 @@ def main():
             log('             2) 系统代理/加速器是否异常')
             log('             3) 浏览器能否手工打开 https://www.workbuddy.ai/login/')
             try:
-                browser.close()
+                ctx.close()
             except Exception:
                 pass
             return 1
@@ -560,7 +682,7 @@ def main():
                 except Exception:
                     pass
             try:
-                browser.close()
+                ctx.close()
             except Exception:
                 pass
             return 1
@@ -593,7 +715,7 @@ def main():
                 except Exception:
                     pass
             try:
-                browser.close()
+                ctx.close()
             except Exception:
                 pass
             return 1
@@ -601,11 +723,11 @@ def main():
         write_account(access, refresh, uid, name)
 
         try:
-            browser.close()
+            ctx.close()
         except Exception:
             pass
 
-    log('登录完成, 浏览器已自动关闭')
+    log(f'登录完成, 浏览器({browser_name})已自动关闭')
     log('   提示: 重启 open-ai 网关 (或点 GUI「⑤ 重新连接」) 后新账号即可参与轮询')
     return 0
 

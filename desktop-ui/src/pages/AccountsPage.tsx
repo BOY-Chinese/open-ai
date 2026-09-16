@@ -90,6 +90,8 @@ export function AccountsPage() {
     loading: signinLoading,
     error: signinError,
     reload: reloadSignin,
+    // 补签接口直接回读签到表（省一次 GET），用它就地替换
+    setData: setSignin,
   } = useAsync(() => backend.listSignin(filter), [filter], EMPTY_SIGNIN)
 
   /* 从全量数据推导筛选下拉的计数，让"全部"也能显示总数 */
@@ -107,14 +109,50 @@ export function AccountsPage() {
     return map
   }, [accounts])
 
-  /** 刷新当前筛选通道的账号状态（余额走联网，签到表顺带刷新一次） */
+  /**
+   * 刷新当前筛选通道：拉余额 + **给未签到账号补一次签到** + 重读签到表。
+   *
+   * ★ 补签（refreshSignin）是这里的关键一步，此前缺失 —— 原实现只有两个
+   *   「读」动作：credits/refresh 拉余额、listSignin 重读签到表。于是
+   *   「今天还没签到的账号」在用户点刷新后依然是未签到，只能干等后台
+   *   每 30 分钟一轮的补签；用户看到的却是「我刚点过刷新了，怎么还没签到」。
+   *   现在由后端判定「谁还没签」并立即补（脚本幂等，已签/活动未参与为终态）。
+   *
+   * 顺序固定为「先补签、后拉余额」：签到会真实入账，先补签拿到的余额才是
+   * 入账后的值，否则余额里会缺掉刚签的那一笔。
+   *
+   * 失败处理刻意**不对称**：
+   *   - 补签失败 → 只在文案里说明，列表与余额照常刷新（签到是尽力而为，
+   *     上游繁忙 9074 是常态，不该让整个刷新报错、更不该回滚已刷新的余额）；
+   *   - 拉余额失败 → 抛出，由外层 toast 出来（它才是这次点击的主目标）。
+   */
   const onRefresh = useCallback(async () => {
     setBusy('refresh')
+    let signinNote = ''
     try {
+      try {
+        const r = await backend.refreshSignin(filter)
+        setSignin(r.signin)
+        if (r.pending.length > 0) {
+          // 补签后仍未出现在签到表里的账号 —— 上游没签上（繁忙/活动未参与）。
+          // ★ 用 `in` 判存在而不是判真假：签到项的 value 可能是空对象（假值），
+          //   用 `!obj[id]` 会把「已签到」误报成「未签上」，提示文案就说谎了。
+          const stillPending = r.pending.filter(
+            (id) => !(id in r.signin.signin)
+          )
+          signinNote =
+            stillPending.length > 0
+              ? `；${stillPending.length} 个账号本次未签上，稍后自动补试`
+              : `；已补签 ${r.pending.length} 个账号`
+        }
+      } catch (e) {
+        signinNote = `；签到未能执行（${e instanceof Error ? e.message : String(e)}）`
+        console.warn('[accounts] 补签失败：', e)
+      }
       const next = await backend.refreshAccounts(filter)
       setData(next)
       await reloadSignin()
-      toast(`已刷新 ${FILTER_LABEL[filter]} 账号积分`, 'success')
+      toast(`已刷新 ${FILTER_LABEL[filter]} 账号积分${signinNote}`, 'success', 5000)
     } catch (e) {
       toast(e instanceof Error ? e.message : '刷新失败', 'error')
     } finally {

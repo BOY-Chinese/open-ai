@@ -2,6 +2,54 @@
 
 > 本文件随代码打包一并保留。涉及设备标识、签到机制等关键约束。
 
+## Trae 上游 llm_utils_chat 协议变更：模型名必须拆 config_name + model_name（2026-09-15）
+
+**结论**：上游 `llm_utils_chat` 已改协议，模型名分两段传，且**必须带模式变体后缀**，否则一律失败。
+本文结论全部由 curl 直连 `https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat` 逐条实测得到。
+
+| 请求形态 | 实测结果 |
+|---|---|
+| `config_name="glm-5.3-flash"` + `model_name="glm-5.3-flash__dev"` | ✅ 正常出字 |
+| `config_name="glm-5.3-flash"`（不给 model_name） | ⚠️ curl 能通；Node 侧实测 **"the model is unknown"** |
+| `config_name="glm-5.3-flash__dev"`（整串塞 config_name） | ❌ `code=4001 the param is invalid` |
+| `model_name="xxx__max"` | ✅ 仍可用（`__max` 没死，别信"上游只剩 __dev"） |
+
+**关键规则**
+1. `config_name` = 基础配置名（`get_detail_param` 返回的 `config_name`，**不带任何后缀**）。
+2. `model_name` = 完整变体名（`<config_name>__dev` / `__max`）；**基础名直呼已不被接受**。
+   变体语义来自 `get_detail_param` 每项的 `context_window_tokens: {dev, max}`。
+3. `messages[].content` 必须是**内容对象数组**（`[{"type":"text","text":"..."}]`）；传字符串报
+   `cannot unmarshal string into Go struct field LLMRawMessage.messages.content`。
+4. 请求头需三头同 token：`Authorization: Cloud-IDE-JWT <jwt>` + `X-Cloudide-Token` + `X-Ide-Token`，
+   外加 `X-Uid`；UA 用 `Trae/<ide_version>`。**纯 HTTP 即可，不再需要 TTNet/Cronet 签名**
+   （ahaNet 仍可用，只是非必需）。
+5. 无变体名一律自动补 `__dev`；对「该配置没有 dev 变体」的情况保留一次「不带 model_name」的
+   回退重试（首字节前），两种情况都能出字。
+
+**代码修复点**
+- `trae/server.js`
+  - `resolveModelNames()`：剥 `custom-local:`/`tr-`/`trae-` 前缀（循环）→ 动态表精确匹配 →
+    配置别名 → 按 `__dev`/`__max` 拆成 `{configName, modelName}`。**查完整别名必须在拆后缀之前**，
+    否则 `trae-v4-max` 会被截成 `-v4-max` 这类垃圾名。
+  - `traeChat()` / `traeChatOnce()`：拆两层 —— 外层「无变体补 `__dev`」+ 首字节前一次性回退重试；
+    内层真正发请求。
+  - 三头 + `X-Uid` 补齐；`get_detail_param` 同口径；上游模型列表仍取 `config_name`（基础名）。
+  - 上游偶发 Cronet 抖动（`code=3/-21` 网络切换、`code=8/-101` 连接重置）与 429/5xx →
+    重试 3 次并轮换账号（仅首字节前，不会重复输出）。
+- `providers/trae.py`
+  - `normalize_model()`：**先查完整别名表（含带变体名的 key），再剥前缀**；
+    `trae-` 前缀是 5 个字符（写成 4 会把 `trae-v4-max` 截成 `-v4-max`）。
+  - 别名值可直接写变体名（如 `"deepseek-v4-flash": "DeepSeek-V4-Flash__dev"`）。
+- `config.json`（`providers.trae`）
+  - `default_model` → `DeepSeek-V4-Flash-Official__dev`；`models` 别名值统一指向 `__dev` 变体。
+  - 新增 `deepseek-v4.1-flash` 映射；`function` 保持 `"chat_v3"`
+    （实测 `solo_work_lite` 对多数 config 报 param invalid）。
+
+**排查提示**
+- `the param is invalid` → 模型名形态不对（多半是整串变体塞进了 config_name）。
+- `the model is unknown` → 基础名没带 `__dev`/`__max` 变体。
+- `Cronet Error: code=N` → 网络抖动/风控，**不是**模型名问题，等几秒重试即可。
+
 ## device_id 由 Trae 客户端生成（核心约束）
 
 **结论**：open-ai 网关对接 Trae 所需的 `device_id`（HTTP 头 `x-device-id`）**必须由 Trae 桌面客户端生成**，网关自身不会、也不能生成合法值。
@@ -76,6 +124,32 @@
   master 醒来读该日志即知结论。
 - 判定时刻 ~03:12（批量结算），若今日新 code_007 包出现 → 心跳即活跃成立，
   无客户端方案可行；否则按 MEMORY 下文三情形（设备注册/websocket/真实使用）继续排查。
+- **✗ 判决（09-15 03:07/03:30 双探）**：纯 HTTP 轮询心跳（msg 30s + buddy 60s，共 11+ 小时，
+  daemon 全程零错误、buddy 恒 null）不足以被判活跃，03:12 无新 code_007 包、无到站消息。
+  结论：HTTP 轮询 ≠ 活跃。剩余假设按优先级：① 真实使用行为（客户端 agent 会话，与
+  09-13 晚用客户端→09-14 03:12 +30 的时间线吻合，最可能）；② 边缘 websocket 在线
+  （channel-sdk 握手 + device-id）；③ buddy 的生成本身就需要使用行为触发。
+  下一步方向：要么接受"客户端每日开一次"，要么逆向 websocket 在线协议再试。
+
+### 深挖二期（2026-09-15）：信号定位 → 遥测复刻实验
+
+- **消耗流水真相**：get-user-request-usage 必须 `X-Enterprise-Id=userId`（个人账号也要）；
+  按天视图只汇总 credit>0。翻页后共 852 条流水（09-11:12 / 09-12:343 / 09-13:197 / 09-14:242），
+  **网关每天几百次成功调用都有记录** —— "网关流量不算活跃"的旧结论成立且更扎实。
+- **四天对照（关键）**：09-12(343请求/无客户端)/09-14(242请求/无客户端) 都没拿到 +30；
+  唯一拿到 +30 的 09-13 是**客户端在跑**的那天。客户端 17:21-17:52 的调用同样走
+  /v2/chat/completions —— 端点无差别，差别在客户端独有的后台信号。
+- **客户端独有信号**（logs/2026-09-13 ProxyResolver 全量 URL）：`/v2/report` 113次(每~15s)、
+  get-dosage-notify 16次、/v3/config 9次、Centrifugo WS 长连接。
+- **/v2/report 格式已逆向并打通**（StandardEventService，packages/telemetry）：扁平结构
+  `[{eventCode,timestamp,reportDelay,...事件字段}]`，事件码=Events 枚举（page_load/page_show/
+  chat_message_send/user_auth_action...），Bearer token 鉴权，实测 HTTP 200 code=0。
+  ⚠ 嵌套 {commonFields,payload} 会 400。
+- **实验三**：`scripts/wb_report_heartbeat.py`（09-15 10:45 常驻）复刻客户端后台信号组合：
+  每20s /v2/report page_show 轮换 + 120s get-dosage-notify + 60s buddy/msg 轮询 + 10min
+  资源包监视 + 09:05 幂等 claim。判决：**09-16 03:12** 是否出现新 code_007 +30 包。
+- 若成立 → 网关侧加遥测心跳即可无客户端领每日 30 分；若不成立 → 下一嫌疑是
+  Centrifugo WS 长连接（cf-connect/websocket，centrifuge-js 协议，asar 内有 CentrifugoClient）。
 
 ### 国际版协议差异（旧表，仍适用）
 
@@ -107,6 +181,44 @@
 
 **结论：国际版换 token 就是 `POST /console/login/enterprise` →
 返回 `{accessToken, refreshToken}`，与国内版脚本写法一致。**
+
+**浏览器方案 v2.6 更换（登录失败根治）**：旧版 `p.chromium.launch(channel='msedge')`
+拉起的系统 Edge 带自动化特征，走 X(Twitter) OAuth 登录时被 X 的反机器人挑战
+（`onboarding/web#/s/knowledge_check`）卡成死循环，始终回不到 workbuddy.ai、
+抓不到 token（`logs/login_WorkBuddy_IE.log` 多次复现）。现改为：
+1. 默认 **Playwright 自带 Chromium**（版本与 playwright 包锁死，最稳）；
+2. 反检测：去 `--enable-automation` + `--disable-blink-features=AutomationControlled`
+   + init script 隐藏 `navigator.webdriver`（实测注入后 evaluate 返回 None）；
+3. `launch_persistent_context` + **每次登录全新 profile**
+   `data/pw_profiles/wbie/run-<时间戳>/`（Chromium 系与 Firefox profile 互不
+   兼容，后者在 `.../firefox/` 子根）。⚠️ 固定 profile 是错误设计：上一次的
+   SSO 登录态常驻会让登录页**自动顶号**，同一通道没法添加第二个账号
+   （master 实测反馈后改掉）——现在默认全新干净会话，多账号互不干扰；
+   上次没走完的登录用 `--reuse-profile` 复用最近一次；旧会话目录自动清理
+   （只留「本次 + 最近一次」，同秒并发用 uuid 后缀防撞）；旧固定 profile
+   （`data/pw_profile_*`）启动时顺手删除。
+启动失败自动降级 chromium → chrome → msedge → firefox；`--browser` 可指定。
+**v2.6 起 `login_workbuddy.py`（国内版, `data/pw_profiles/wb/`）与
+`login_trae.py`（`data/pw_profiles/trae/`）已套用同一方案**，三个登录
+脚本各自内嵌同款 `launch_browser()` + `_pick_profile_dir()`（不抽公共模块：
+打包态按文件名路由到内嵌模块，新 helper 文件不会进 exe，自包含才安全）。
+本装是**源码形态**（有 `.venv`、无 open-ai-*.exe），GUI 改源码即生效。
+
+**TRAE 登录滑块验证报「网络环境较差 [5014][502]」（v2.6.2 排查结论）**：
+不是断网——是字节风控对「设备指纹 + 出口 IP」的综合打分拒绝（滑块验证属
+字节风控，该话术是其固定文案）。排查事实：出口 IP 112.49.6.101（中国移动，
+ip-api 判定非代理非机房）干净；trae.cn 页面在 chromium/msedge 下加载均正常
+（无头对照实验）；此前固定 profile 时代 17:0x 连续 3 次自动登录（见
+login_Trae.log）抬高了该设备的风控评分。v2.6.2 对策：
+① 三个登录脚本浏览器一律**原生 UA**——旧版让自带 Chromium 伪造 `Edg/143`
+  UA，与 client-hints 品牌头（真实是 Chromium）自相矛盾，正是风控可疑点；
+② 伪装脚本最小化：只藏 `navigator.webdriver`（半吊子伪造反而制造新不一致）；
+③ 复用持久化 context 自带的空白初始页（不再多开一个 about:blank 标签）；
+④ 三个脚本都挂 `requestfailed` 记录，风控端点被拒时日志有据可查；
+⑤ trae 换 token 的 HTTP 调用改用浏览器实际 UA（与产 cookie 的会话一致）；
+⑥ wb 国内版顺带补齐 goto 三次重试 + 手动关窗优雅退出（原来直接崩堆栈）。
+仍被 [5014] 拒时：改用扫码登录绕开短信验证 / 换手机热点 / 等 30-60 分钟让
+风控降权。
 
 实测证据（`logs/login_workbuddy_intl.log`，2026-09-11 22:07:15 成功那次）：
 ```
@@ -317,7 +429,7 @@ POST https://www.workbuddy.ai/billing/meter/get-user-request-usage
      （Web 账号 = web_me 会话校验 + points-summary，桌面账号 = first-login；
      Web 端**没有**显式领取端点，积分随当日登录由服务端自动发放）。
      `GET /accounts/signin` 读缓存，账号页「每日签到」列正常渲染。
-**白天补签（2026-09-15 补）**：Loomy 原本只在 00:00 全量签到里跑，
+     **白天补签（2026-09-15 补）**：Loomy 原本只在 00:00 全量签到里跑，
      当天新登录的账号要干等到次日零点（实测 master 中午添加的新账号当天
      领不到）—— 已挂进 daemon 的 `--wb-only` 30 分钟补签循环：
      只补 `claimed != True` 的账号，领取幂等（已领过返回 alreadyProcessed）。
@@ -478,3 +590,16 @@ app_paths.py 的 docstring 早就警告过这类错误 —— scripts 是漏网�
 `open-ai-task.exe <脚本路径标记>` (路径仅作路由标记, 不做 exists 检查);
 源码态保持原样。三个 login 脚本的 OPENAI_CFG/LOG_PATH 同时钉死安装根
 (同一 CWD 依赖 bug 的最后一处)。
+
+## `__file__` 家族 #5 复发修复同步（2026-09-15，源自 portable 用户机事故）
+
+portable 版装机后签到弹 FileNotFoundError（signin_all.py:92 load_json 读到 %TEMP%\_MEI
+临时目录）。本仓库同步修复时 AST 全仓扫描发现：除 #5 的 signin_all / usage_history /
+wb_usage_history / settlement_probe / task_main / watchdog_boot 六处外，**#4 批次
+（account_manager 的 OPENAI_CFG/BASE、api_store、providers/loomy、providers/workbuddy）
+也从未回流本仓库** —— 同一家族同一规则，本次一并钉死：app_paths + except 源码态兜底；
+account_manager 保留 BASE 变量名（= OPENAI_ROOT/scripts），源码态行为比特级不变。
+
+规则重申：运行时模块**禁止**用 `__file__` 拼 config/data/logs —— 一律 `import app_paths`，
+仅 except 兜底分支可保留 `__file__`。本仓库无 installer/ 构建物料，门禁暂无挂载点；
+未来若引入打包流程，先从 portable 仓库复制 installer/check_frozen_paths.py 挂入构建脚本。

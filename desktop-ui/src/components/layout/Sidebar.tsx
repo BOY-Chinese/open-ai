@@ -57,12 +57,21 @@ export function Sidebar({
   current,
   onSelect,
   gatewayOnline = true,
-  version = 'v3.0-dev',
+  version,
 }: {
   current: PageKey
   onSelect: (key: PageKey) => void
   /** 网关在线状态（对应「重新连接」的全局指示） */
   gatewayOnline?: boolean
+  /**
+   * 版本号文案（由 AppLayout 从后端读到后传入，已格式化）。
+   *
+   * ★ 这里**不再有默认值**。原来写死 `version = 'v3.0-dev'`，而 AppLayout
+   *   调用时没传 —— 侧边栏于是永远显示这个硬编码常量：升级到 dev-v3.1 后
+   *   界面上还是 v3.0-dev，看起来就是「版本号没正确显示」。
+   *   版本号的唯一真源是后端 `version.py`（经 GET /v1/admin/version），
+   *   拿不到时留空，宁可什么都不显示也不显示一个错的。
+   */
   version?: string
 }) {
   return (

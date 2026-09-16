@@ -42,7 +42,12 @@ DIRTY_BUNDLES = ['index-DFsuRhLZ.js']
 #   后端 route_provider 的 lm- 前缀判定; 仅改通道显示逻辑, mock/演示数据
 #   与 BRHJC03a 完全一致, 无新增数据 —— 2026-09-15)。
 CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
-                 'index-DH4ONbl3.js', 'index-BRHJC03a.js', 'index-udsI5bB_.js']
+                 'index-DH4ONbl3.js', 'index-BRHJC03a.js', 'index-udsI5bB_.js',
+                 # 3fBWhgE_: dev-v3.1 / portable-v3.1 前端 —— 修复三处用户实测 bug
+                 #   (账号页刷新补签 / 积分看板刷新拉新流水 / 版本号显示 dev-v3.1)。
+                 #   新增 POST /accounts/signin/refresh 与 /credits/refresh 两个端点调用;
+                 #   mock 演示数据仍为占位值, 已过真值扫描 (13 项真实凭据 0 泄漏)。
+                 'index-3fBWhgE_.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

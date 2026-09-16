@@ -150,6 +150,8 @@ export function CreditsPage() {
   const [view, setView] = useState<ViewMode>('today')
   const [channel, setChannel] = useState<ChannelFilter>('all')
   const [weekOffset, setWeekOffset] = useState(0)
+  /** 「刷新」按钮的忙碌态（与两个 useAsync 自己的 loading 分开，见 onRefresh） */
+  const [busy, setBusy] = useState(false)
 
   /**
    * 图表配色随主题切换：亮色系列在白底上不可见、暗色系列在白底上才够亮，
@@ -175,17 +177,40 @@ export function CreditsPage() {
     })
   }, [])
 
+  /**
+   * 刷新积分看板。
+   *
+   * ★ 原实现只重读「当前视图」这一个接口，而该接口只读本地流水库 ——
+   *   库是后台每 5 分钟采一次的快照，于是无论点多少次刷新，拿到的都是同一份
+   *   旧数据，用户看到的就是「刷新没有刷新出新的积分情况」。现在补齐三步：
+   *   ① **先催一次流水采集**（usage_collector，增量、幂等）：这一步才真正
+   *      把上游最新的积分流水拉进本地库，是「刷新出新积分」的关键；
+   *   ② 刷新当前视图（今日或本周）—— 用户按下按钮时看的那个；
+   *   ③ 顺手刷新另一个视图：两个视图读同一份统计，只刷一个的话，用户切过去
+   *      看到的仍是旧数，会以为第二次刷新又没生效。
+   *
+   * 采集失败不阻断刷新：库至少还有上一次的数据可读，读到的仍比不读强。
+   */
   const onRefresh = useCallback(async () => {
-    if (view === 'today') {
-      await today.reload()
-      toast('已刷新今日积分数据', 'success')
-    } else {
-      await week.reload()
-      toast('已刷新本周积分数据', 'success')
+    setBusy(true)
+    try {
+      try {
+        await backend.refreshCredits()
+      } catch (e) {
+        console.warn('[credits] 流水采集失败，改用库中现有数据：', e)
+      }
+      // 两个视图分别重新拉取；与视图无关的采集只在上面做一次
+      await Promise.all([today.reload(), week.reload()])
+      toast('已刷新积分数据', 'success')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '刷新失败', 'error')
+    } finally {
+      setBusy(false)
     }
-  }, [view, today, week, toast])
+  }, [today, week, toast])
 
-  const refreshing = today.loading || week.loading
+  /** 按钮 loading：刷新中或当前视图首屏加载中 */
+  const refreshing = busy || today.loading || week.loading
 
   return (
     <PageShell>

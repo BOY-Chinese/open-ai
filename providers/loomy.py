@@ -35,8 +35,13 @@ UPSTREAM_BASE = "https://loomyad.xunfei.cn/api/v1"
 UPSTREAM_CHAT_PATH = "/chat/completions"
 USER_AGENT = "Loomy/1.0"
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+# ★ 打包态 __file__ 指向解包临时目录, 相对路径会读错 config —— 钉死安装根。
+try:
+    import app_paths as _ap
+    CONFIG_PATH = _ap.CONFIG_PATH
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 
 def _account_session(acc: dict) -> str:

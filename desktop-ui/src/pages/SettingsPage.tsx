@@ -18,6 +18,7 @@ import { useToast } from '@/components/feedback/Toast'
 import { useAsync } from '@/hooks/useAsync'
 import { useTheme } from '@/hooks/useTheme'
 import { backend } from '@/lib/dataSource'
+import { formatVersion } from '@/lib/utils'
 import { inTauri } from '@/lib/gateway'
 
 /**
@@ -29,11 +30,11 @@ import { inTauri } from '@/lib/gateway'
  */
 const UPDATE_REPO = 'owner/open-ai'
 
-/** 版本号统一展示格式：后端返回 "2.4.0" / "v2.4.0" 均归一为 v 前缀 */
-function formatVersion(raw: string): string {
-  const trimmed = raw.trim()
-  return trimmed.startsWith('v') ? trimmed : `v${trimmed}`
-}
+/**
+ * 版本号格式化统一在 `lib/utils.ts` 的 {@link formatVersion}（侧边栏与设置页
+ * 共用）。此处只负责「拿不到版本号时显示未知」这一层，不再自己拼前缀 ——
+ * 曾经本文件里那份私有实现会把 `dev-v3.1` 显示成 `vdev-v3.1`。
+ */
 
 /**
  * 系统设置页
@@ -88,6 +89,7 @@ export function SettingsPage() {
   const {
     data: version,
     loading: versionLoading,
+    error: versionError,
   } = useAsync<{ current: string; latest?: string }>(
     () => backend.getVersion(),
     [],
@@ -97,9 +99,17 @@ export function SettingsPage() {
   /** 检查到更新后按钮下次点击的目标版本，空串表示尚未发现新版本 */
   const [pendingVersion, setPendingVersion] = useState('')
 
+  /**
+   * 展示文案：拿到版本号就原样显示（`dev-v3.1`），拿不到就明确写「读取失败」
+   * 或留空 —— 不再回落到任何写死的常量（那正是「版本号显示不对」的来源）。
+   */
   const versionLabel = versionLoading
     ? ''
-    : formatVersion(version.current || '未知')
+    : version.current
+      ? formatVersion(version.current)
+      : versionError
+        ? '读取失败'
+        : '未知'
 
   /** 一键更新：检查 → 有更新则提示并切换按钮文案，全程不阻塞 UI */
   const handleCheckUpdate = useCallback(async () => {

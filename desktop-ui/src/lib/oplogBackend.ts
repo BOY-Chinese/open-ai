@@ -43,6 +43,11 @@ const MUTATIONS: Record<
     title: '刷新账号积分',
     detail: (a) => `通道=${(a[0] as ChannelFilter) ?? 'all'}`,
   },
+  refreshSignin: {
+    tag: '账号',
+    title: '补签未签到账号',
+    detail: (a) => `通道=${(a[0] as ChannelFilter) ?? 'all'}${a[1] ? '（强制重签）' : ''}`,
+  },
   reconnectAccounts: {
     tag: '账号',
     title: '重新连接账号',
@@ -70,6 +75,7 @@ const MUTATIONS: Record<
     detail: (a) => `密钥=${String(a[1] ?? a[0])}`,
   },
   refreshModels: { tag: '模型', title: '拉取最新模型列表及积分倍率' },
+  refreshCredits: { tag: '积分', title: '采集最新积分流水' },
   updateModels: {
     tag: '模型',
     title: '修改模型可见性 / 置顶',

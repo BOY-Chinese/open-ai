@@ -603,3 +603,50 @@ account_manager 保留 BASE 变量名（= OPENAI_ROOT/scripts），源码态行�
 规则重申：运行时模块**禁止**用 `__file__` 拼 config/data/logs —— 一律 `import app_paths`，
 仅 except 兜底分支可保留 `__file__`。本仓库无 installer/ 构建物料，门禁暂无挂载点；
 未来若引入打包流程，先从 portable 仓库复制 installer/check_frozen_paths.py 挂入构建脚本。
+
+## 未定义名（拼写错变量）只在用户机上炸（2026-09-16 portable 用户机事故）
+
+**现象**：portable 版装机后签到进程直接崩，任务日志只有一段 traceback：
+
+```
+File "task_main.py", line 92, in <module>
+File "task_main.py", line 84, in main
+File "task_main.py", line 43, in _route
+File "signin_all.py", line 529, in main
+NameError: name 'loom_state' is not defined. Did you mean: 'loomy_state'?
+```
+
+**根因**：`scripts/signin_all.py` 的 Loomy 白天补签分支里，变量定义是
+`loomy_state`，使用处却敲成了 `loom_state`（少一个 y）。这个名字**全仓从未定义**，
+执行到那一行必抛 `NameError`。
+
+**为什么本地测不出来**（这条比 bug 本身更重要）：
+1. Python 只在**真正执行到该行**时才抛 NameError，而该行被
+   `[a for a in lc.load_accounts() if ... not (loomy_state.get(...))...]`
+   这个推导式包着 —— 开发机没登录 Loomy 账号 / `load_accounts()` 返回空时，
+   推导式不进循环体，**这一行根本不执行**，全量测试照样全绿。
+2. 三仓同源（本机版 / dev / portable 是同一份代码的副本）：改一处忘回流，
+   另外两仓就带着同一个坑各自发版。本次 v3.1 的**两个安装包都已中招**
+   （dev 13:14 的 resources.zip、portable 13:0x 的品牌 exe），发布后才由
+   master 在用户机上撞到。
+
+**修复**：`signin_all.py` 改回 `loomy_state`（三仓同步，md5 一致）。
+
+**防复发（本次同时落地，别只改那一行）**：
+- 新增 `tests/test_static_names.py` —— 全仓 AST 扫描「用了但没定义」的名字。
+  判定：函数自身绑定 + 闭包外层 + 模块级定义 + 内建 + 推导式/lambda 变量，
+  剩下的 Load 名才报。**嵌套函数只产出节点本身、不展开其内部** —— 否则
+  嵌套函数的形参（`def chunk(delta, finish=None)` 的 `finish`）会被算到外层
+  头上，实测多出十几条假阳性，那种门禁上线当天就会被当噪声关掉。
+- 新增构建门禁 `installer/check_undefined_names.py`，已挂进
+  `installer/build_exe.bat` 的 [0d] 步（与 [0c] frozen-path gate 并列）：
+  未定义名 → `goto :err`，不产出安装包。两个发布仓都已挂载。
+
+**规则重申**：
+- 运行时模块改完变量名，**必须**跑一次 `check_undefined_names.py`
+  （或 `python -m unittest tests.test_static_names`）；
+  "测试全绿" 不等于 "没有未定义名" —— 条件分支里的错拼测试碰不到。
+- 同一改动三仓同步后，用 md5 核对关键文件一致，别靠记忆。
+- 这类「静态可查却没人查」的错已出现三次（`_ = rid` 的 UnboundLocalError、
+  `__file__` 家族 #4/#5、本次 typo）。新增门禁挂在**构建脚本**上，
+  而不是只写单测 —— 单测可以被跳过，构建门禁不行。

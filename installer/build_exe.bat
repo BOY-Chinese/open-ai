@@ -60,6 +60,19 @@ if errorlevel 1 (
 )
 echo   [OK] no bare __file__ path
 
+rem ---- 0d. undefined-name gate: typos that only blow up on the user machine ----
+rem 2026-09-16 portable 用户机事故: signin_all.py 把 loomy_state 写成 loom_state,
+rem 拼错的名字从未定义 -> 签到进程 NameError 直接挂掉。这类错**编译期不报**,
+rem 只在真正执行到那一行时才抛, 而该分支还被条件包着（没登录 Loomy 账号的
+rem 机器永远跑不到）—— 本地测试全绿, 装了用户机才炸。故在构建前静态扫一遍。
+echo [0d] undefined-name gate (static scan)...
+%PY% check_undefined_names.py >> "%LOGFILE%" 2>&1
+if errorlevel 1 (
+    echo [ERROR] undefined name found in runtime modules - see build_installer.log
+    goto :err
+)
+echo   [OK] no undefined name
+
 rem ---- 1. uninstall.exe (独立卸载程序, onedir) ----
 rem onedir 而非 onefile: 无 %TEMP%\_MEI 临时目录, 根治退出时
 rem "Failed to remove temporary directory" 弹窗 (VM/杀软锁文件场景), 启动也更快。

@@ -526,7 +526,7 @@ def main():
         import loomy_client as lc
         loomy_state = lc.load_daily_state() or {}
         pending = [a for a in lc.load_accounts()
-                   if a.get('enabled', True) and not (loom_state.get(
+                   if a.get('enabled', True) and not (loomy_state.get(
                        str(a.get('userid') or '')) or {}).get('claimed')]
         if pending:
             log('Loomy补签', f'补领检查 ({len(pending)} 个未领账号)')

@@ -53,7 +53,16 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                  #   再试、AppLayout 离线每 20 秒自愈。仅改这两处逻辑, mock / 演示
                  #   数据一字未动; 已按本仓 sanitize_known_values.txt (18 条真值)
                  #   扫描产物: 0 命中 (唯一 sk- 命中是既有的 DEMO-KEY-NOT-REAL 占位)。
-                 'index-DU-XzvPp.js']
+                 'index-DU-XzvPp.js',
+                 # j58bi9IW: 2026-09-18 WorkBuddy 国际版「网页端拿积分」并入后的前端
+                 #   —— 账号页国际版未拿到积分时的 tooltip 由「暂无签到渠道，无每日
+                 #   签到积分」改为「积分由后台自动入账，无法通过刷新主动获取」;
+                 #   刷新提示剔除 WorkBuddy_IE (避免延迟入账被误报成「未签上」);
+                 #   lib/backend.ts 演示态注释同步。仅改提示文案与一处过滤,
+                 #   mock / 演示数据一字未动; 已按本仓 sanitize_known_values.txt
+                 #   (14 条真值) 扫描产物: 0 命中 (唯一 sk- 命中是既有的
+                 #   DEMO-KEY-NOT-REAL 占位)。
+                 'index-j58bi9IW.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

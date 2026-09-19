@@ -112,6 +112,26 @@ export interface ModelEntry {
   name: string
   /** 积分倍率；international 通道单位为 credits，用 unit 区分 */
   ratio: number
+  /**
+   * 该倍率是否为「已知」——用来区分「真·0 倍率」与「没查到倍率」。
+   *
+   * 为什么需要（2026-09-18 master 反馈「国际版 gpt-6-astra 倍率是 0」）：
+   * 倍率有三态，压成同一个 0 会让界面撒谎：
+   *   - 已知且 >0：正常显示数字
+   *   - 已知且 =0：上游**明确**返回 x0.00（如 hy3 / hy4-preview 确实免费）→ 显示 0.00
+   *   - 未知：上游目录里没有这个模型（如 gpt-6-astra，由 KNOWN_EXTRA 补入），
+   *     倍率从未拉到 → 显示「--」，不能显示 0.00
+   *
+   * 后端用 `ratio: -1` 作哨兵（见 admin_api.RATE_UNKNOWN），本字段由前端
+   * 在合并倍率时派生（见 httpBackend.listModels），用作渲染与排序的稳定判据。
+   *
+   * 声明为可选是为了兼容两类来源，二者都不该被迫手写这个字段：
+   *   - 演示/兜底用的静态数据（lib/backend.ts 的 MODELS）
+   *   - 旧版本写入的 localStorage 缓存
+   * 读取方一律用 `ratioKnown !== false` 判定（见 lib/modelCache.ts），
+   * 缺失即按「已知」处理，保持旧数据原样显示。
+   */
+  ratioKnown?: boolean
   ratioUnit: string
   /**
    * 实际路由表模型名（客户端请求时填的 model 值）
@@ -126,20 +146,80 @@ export interface ModelEntry {
   pinned: boolean
 }
 
-/* ═══════════ Auto 路由连 ═══════════ */
+/* ═══════════ Auto 路由链 ═══════════ */
 
 /**
- * Auto 路由连（虚拟模型）配置 — 对应 config.json 的 auto_chain 段
+ * 路由链上的单个模型 — 对应 config.json auto_chain.chains[].models[]
  *
- * 请求 model="Auto路由连" 时按 models 顺序故障转移：
- * 第一个成功产出内容的模型胜出，全部失败返回 502。
+ * timeout 为该模型的独立超时秒数（0 = 用 provider 默认）。
+ */
+export interface AutoChainModel {
+  /** 对外调用名（带 tr- / wb- / wbie- / lm- 前缀） */
+  model: string
+  /** 独立超时秒数（0 = 用 provider 默认） */
+  timeout: number
+}
+
+/**
+ * 一条自定义路由链 — 对应 config.json 的 auto_chain.chains[]（v3.2 起支持多条）
+ *
+ * 请求 model="Auto路由链"（总名）时用第一条启用的链；
+ * 请求 model="<链名>" 时精确命中对应链。链内按 models 顺序故障转移。
  */
 export interface AutoChain {
+  /** 稳定 id（后端生成，毫秒时间戳） */
+  id: string
+  /** 链名（自定义；「添加新路由链」自动命名为「无名N」） */
+  name: string
+  /** 启用中的链才参与路由，并可被总名 / 链名请求命中 */
   enabled: boolean
-  /** 每个模型的最大等待秒数（0 = 用 provider 默认） */
-  timeout: number
-  /** 尝试顺序即数组顺序；元素为对外调用名（带 tr- / wb- / wbie- / lm- 前缀） */
-  models: string[]
+  /** 尝试顺序即数组顺序 */
+  models: AutoChainModel[]
+}
+
+/**
+ * 「检查」探活结果的三态（对应 auto_router.check_model 的 status）
+ *
+ *   ok   → 绿色「正常」：上游有回复
+ *   busy → 黄色「繁忙」：限流 / 上游 5xx / 超时（通道活着，暂时挤不进）
+ *   down → 红色「断连」：认证失败、连接失败等（通道当前不可用）
+ */
+export type ChainCheckStatus = 'ok' | 'busy' | 'down' | 'unknown'
+
+export const CHAIN_CHECK_META: Record<
+  ChainCheckStatus,
+  { label: string; badge: string; dot: string }
+> = {
+  ok: {
+    label: '正常',
+    badge: 'bg-success/12 text-success border-success/30',
+    dot: 'bg-success',
+  },
+  busy: {
+    label: '繁忙',
+    badge: 'bg-warning/12 text-warning border-warning/30',
+    dot: 'bg-warning',
+  },
+  down: {
+    label: '断连',
+    badge: 'bg-danger/12 text-danger border-danger/30',
+    dot: 'bg-danger',
+  },
+  unknown: {
+    label: '未检查',
+    badge: 'bg-bg-card text-fg-faint border-border',
+    dot: 'bg-fg-subtle',
+  },
+}
+
+/** 单个模型的检查结果（后端 /auto-chain/check 的 results[]） */
+export interface ChainCheckResult {
+  model: string
+  status: Exclude<ChainCheckStatus, 'unknown'>
+  /** 检查请求耗时（毫秒） */
+  latencyMs: number
+  /** 成功时为回复摘要；失败时为错误摘要 */
+  detail: string
 }
 
 /* ═══════════ 积分 / 用量 ═══════════ */
@@ -229,6 +309,28 @@ export interface SigninBundle {
 
 /** 空签到表（初值 / 接口不可用时使用） */
 export const EMPTY_SIGNIN: SigninBundle = { day: '', signin: {} }
+
+/* ═══════════ 定制：启动 dsh（仅 master 本机使用，不必同步发布版） ═══════════ */
+
+/** POST /v1/admin/dsh/launch 的返回体（后端 admin_api.dsh_launch） */
+export interface DshLaunchResult {
+  /** 命令是否成功执行（超时也算 ok：脚本已转后台启动） */
+  ok: boolean
+  /** DSH 是否本来就在运行（决定 toast 文案是「已启动」还是「已在运行」） */
+  alreadyRunning: boolean
+  /** wsl.exe 退出码（超时为 null） */
+  exitCode: number | null
+  /** ~/dsh-web.sh 的输出尾部（排障用） */
+  output: string
+  /** DSH Web GUI 地址 */
+  url: string
+  /**
+   * 已在运行时后端是否成功拉起了系统默认浏览器新开 DSH 页
+   * （定制需求：每次点击都新开一个页签，不判断浏览器里是否已有该页；
+   * 刚拉起的冷启动分支不开，避免端口未就绪时开出错误页。）
+   */
+  openedInBrowser: boolean
+}
 
 /* ═══════════ 外观 / 主题 ═══════════ */
 

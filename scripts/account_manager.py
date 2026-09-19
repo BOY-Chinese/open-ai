@@ -48,12 +48,27 @@ OPENAI_VENV_PY = os.path.join(OPENAI_ROOT, '.venv', 'Scripts', 'python.exe')
 # ---- v2.4 进程品牌化: 短命脚本用 task shim (任务管理器显示 open-ai 品牌) ----
 OPENAI_TASK_SHIM = os.path.join(OPENAI_ROOT, 'runtime', 'Scripts',
                                 'open-ai-task.exe')
+# 打包态没有 runtime\ 这一层, 品牌 exe 直接躺在安装根
+OPENAI_TASK_SHIM_ROOT = os.path.join(OPENAI_ROOT, 'open-ai-task.exe')
+
+
+def _task_shim():
+    """品牌载体路径 (源码态 runtime\\Scripts 或打包态安装根); 都没有则空串。
+
+    与 admin_api._task_shim() 同策略 —— 两处必须一致, 否则同一个脚本
+    在不同入口下会显示成不同进程名。
+    """
+    for p in (OPENAI_TASK_SHIM, OPENAI_TASK_SHIM_ROOT):
+        if os.path.isfile(p):
+            return p
+    return ''
 
 
 def _script_py():
     """优先 open-ai-task.exe shim (品牌化), 回退 venv python。"""
-    if os.path.isfile(OPENAI_TASK_SHIM):
-        return OPENAI_TASK_SHIM
+    shim = _task_shim()
+    if shim:
+        return shim
     if os.path.isfile(OPENAI_VENV_PY):
         return OPENAI_VENV_PY
     return sys.executable
@@ -270,10 +285,33 @@ def trae_model_rates():
 
 def _wb_family_model_rates(provider_key, host, default_domain, default_product,
                            known_extra=None):
-    """WorkBuddy 系 (国内/国际) 模型目录拉取: GET /v2/enterprises/personal/models。
+    """WorkBuddy 系 (国内/国际) 模型目录拉取 —— 主源 GET /v3/config。
 
-    国际版与国内版同路径、同响应结构, 差异只有 host 与 X-Product-Code。
-    known_extra: 标准目录不返回但可直接调用的模型 (id -> 显示名), 合并进结果。
+    ★ 2026-09-18 换源 (master 反馈「国际版 gpt-6-astra 倍率为 0」) ★
+    ------------------------------------------------------------------
+    原先只用 GET /v2/enterprises/personal/models (下称「目录接口」)。实测该接口
+    **不是客户端真正用的数据源**, 它有两个致命缺陷:
+
+      1. **模型不全**: 国际版目录只返回 18 个, 而客户端实际展示 22 个。
+         `gpt-6-astra` 根本不在目录里 —— 代码只好在 KNOWN_EXTRA 里硬编码补一条,
+         且因目录没有它的 credits, 补出来的倍率是 None → 界面显示 0.00。
+         但客户端截图里它明明写着 **6.67x**。
+      2. **倍率会过期**: 目录里 hy4-preview 是 'x0.00', 而 v3/config 里是
+         'x0.29' —— 目录那份是旧的。
+
+    真正的主源是 GET /v3/config → data.models[].credits, 实测:
+        gpt-6-astra          'x6.67'   ← 与客户端截图 6.67x 完全一致
+        deepseek-v4.1-flash  'x0.00'   ← 与截图 0.00x 一致 (真·0, 非未知)
+    国内版同接口更全: 52 个模型 vs 目录接口 30 个 (差额里含 glm-5.0-turbo /
+    minimax-m2.7 / hy4-preview-dev 等目录漏掉的模型)。
+
+    因此本函数改为: **v3/config 优先, 失败再回退目录接口**(保持旧行为不劣化)。
+    另顺带取 data.modelPromotions 里的限免活动 (badge 'Free now', factor 0) ——
+    它与截图上的红色「Free now」角标同源, 但注意: 活动只是**展示层**的营销
+    信息, 其 modelIds 的 credits 本来就已经是 'x0.00', 故不参与倍率计算,
+    仅在限免模型的显示名后加标记, 避免与「未知(--)」混淆。
+
+    known_extra: 两源都不返回但可直接调用的模型 (id -> 显示名), 兜底合并。
     返回 [(model_id, display_name, credits, err_or_None)], err 非 None 表示整体失败。
     """
     try:
@@ -294,7 +332,13 @@ def _wb_family_model_rates(provider_key, host, default_domain, default_product,
         'Accept': 'application/json',
         'Content-Type': 'application/json',
         'Authorization': f"Bearer {acc.get('accessToken', '')}",
-        'X-User-Id': acc.get('userId', ''),
+        # ★ X-User-Id 必须**非空**, 否则 /v3/config 直接返回 models:null ★
+        # 实测 (2026-09-18): 该头才是 /v3/config 出数据的开关 ——
+        #   X-User-Id 缺失或空串  → models: null (拿不到任何模型与倍率)
+        #   X-User-Id 任意非空值  → 22 个模型 (值真假不影响, Authorization 也不参与校验)
+        # 账号里缺 userId 时若不兜底, 这里会发一个空头, 结果静默变成「无倍率」。
+        # 故给一个非空占位值 —— 只为过开关, 不代表任何真实身份。
+        'X-User-Id': acc.get('userId') or 'open-ai',
         'X-Domain': domain,
         'X-Product': product,
         'User-Agent': UA_WB,
@@ -302,27 +346,63 @@ def _wb_family_model_rates(provider_key, host, default_domain, default_product,
     }
     if host.endswith('workbuddy.ai'):
         headers['X-Product-Code'] = product
-    code, raw = post_json(
-        f'https://{host}/v2/enterprises/personal/models', headers,
-        None, timeout=20, method='GET')
-    if code != 200:
-        return None, f'HTTP {code}'
-    try:
-        d = json.loads(raw)
-    except Exception:
-        return None, '响应解析失败'
-    models = ((d.get('data') or {}).get('models')) if isinstance(d, dict) else None
+
+    def _fetch(path):
+        """GET 一个端点并返回解析后的 data 段 (失败返回 None)。"""
+        try:
+            code, raw = post_json(f'https://{host}{path}', headers,
+                                  None, timeout=20, method='GET')
+            if code != 200:
+                return None
+            d = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return None
+        return d.get('data') if isinstance(d, dict) else None
+
+    # ── 主源: /v3/config (客户端真正用的那份, 模型最全、倍率最新) ──
+    models = None
+    promotions = {}
+    cfg_data = _fetch('/v3/config')
+    if isinstance(cfg_data, dict) and isinstance(cfg_data.get('models'), list):
+        models = cfg_data['models']
+        # 限免活动 (badge 'Free now'): 仅用于给显示名加标记, 不参与倍率计算 ——
+        # 其 credits 本身已是 'x0.00', 改倍率反而会掩盖真值。
+        for p in (cfg_data.get('modelPromotions') or []):
+            if not isinstance(p, dict) or not p.get('enabled'):
+                continue
+            if (p.get('discount') or {}).get('factor') != 0:
+                continue
+            for mid in (p.get('modelIds') or []):
+                promotions[mid] = (p.get('badge') or {}).get('label') or 'Free'
+
+    # ── 回退: /v2/enterprises/personal/models (旧主源; v3/config 不可用时沿用) ──
     if models is None:
-        return None, f"响应无 models: {str(d)[:80]}"
+        dir_data = _fetch('/v2/enterprises/personal/models')
+        if isinstance(dir_data, dict) and isinstance(dir_data.get('models'), list):
+            models = dir_data['models']
+        else:
+            return None, f'HTTP/解析失败 ({host})'
+
     items = []
     for m in models:
         if not isinstance(m, dict):
             continue
         mid = m.get('id', '')
+        if not mid:
+            continue
         name = m.get('name') or mid
         credits = m.get('credits')
+        # credits 为空字符串 = 上游对该模型未标注倍率 (如国内版 auto / 各类
+        # 内部 completion 模型)。**保持 None**, 由 admin_api 转成「未知」哨兵 ——
+        # 不能当成 0, 那正是本次要修的「未知显示成 0」。注意这与 'x0.00'
+        # (上游明确写 0) 是两回事, 后者仍应正常显示 0.00。
+        if credits == '':
+            credits = None
+        if mid in promotions:
+            name = f'{name} ({promotions[mid]})'
         items.append((mid, name, credits, None))
-    # 合并标准目录缺失但可直接调用的已知模型 (避免重复)
+    # 两源都没返回、但可直接调用的已知模型 (现在的 v3/config 已覆盖 astra,
+    # 保留此兜底是为了上游接口再变时不至于连条目一起消失)
     known_ids = {i[0] for i in items}
     items.extend((mid, name, None, None)
                  for mid, name in (known_extra or {}).items() if mid not in known_ids)
@@ -341,7 +421,10 @@ def wb_model_rates():
 def intl_model_rates():
     """拉取 WorkBuddy 国际版 (www.workbuddy.ai) 全部模型及其积分倍率。
     返回 [(model_id, display_name, credits, err_or_None)]"""
-    # 标准目录接口不返回、但软件可直接调用/显示的模型 (id -> 显示名)
+    # 兜底条目: 主源 /v3/config 现在已包含这两个模型 (且带真实倍率:
+    # astra=x6.67 / deepseek-v4.1-flash=x0.00), 此处仅在主源与目录接口
+    # **双双**不可用时保证条目不消失 —— 那种情况下倍率为 None(未知),
+    # 由 admin_api 转成哨兵显示为「--」, 不再冒充 0 倍率。
     KNOWN_EXTRA = {
         'deepseek-v4.1-flash': 'DeepSeek V4.1 Flash',
         'gpt-6-astra': 'GPT-6 Astra',
@@ -446,7 +529,7 @@ def wb_credits(acc, domain, product):
         'Accept': 'application/json',
         'Content-Type': 'application/json',
         'Authorization': f"Bearer {acc.get('accessToken', '')}",
-        'X-User-Id': acc.get('userId', ''),
+        'X-User-Id': acc.get('userId') or 'open-ai',   # 不可用空串, 见上文字段说明
         'X-Domain': domain,
         'X-Product': product,
         'User-Agent': UA_WB,

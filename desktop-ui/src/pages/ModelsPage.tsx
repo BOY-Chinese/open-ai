@@ -398,12 +398,26 @@ export function ModelsPage() {
                   </td>
 
                   <td className="px-3 text-right">
-                    <span className="tabular text-base text-fg-muted">
-                      {m.ratio.toFixed(2)}
-                      <span className="ml-1 text-sm text-fg-subtle">
-                        {m.ratioUnit === 'credits' ? 'credits' : '×'}
+                    {/* 倍率三态：未知显示「--」，真·0 显示 0.00（如 hy3 确实免费）。
+                        混在一起显示 0.00 会让人误以为 gpt-6-astra 免费 —— 它其实
+                        收费，只是上游目录里没有、倍率从未拉到。
+                        用 `!== false` 而非 `=== true`：旧缓存/演示数据没有该字段，
+                        应按「已知」原样显示，不能一律变成「--」。 */}
+                    {m.ratioKnown !== false ? (
+                      <span className="tabular text-base text-fg-muted">
+                        {m.ratio.toFixed(2)}
+                        <span className="ml-1 text-sm text-fg-subtle">
+                          {m.ratioUnit === 'credits' ? 'credits' : '×'}
+                        </span>
                       </span>
-                    </span>
+                    ) : (
+                      <span
+                        className="tabular text-base text-fg-subtle"
+                        title="上游未提供该模型的倍率（多为目录外模型），非 0 倍率"
+                      >
+                        --
+                      </span>
+                    )}
                   </td>
 
                   {/* 请求模型名称 = 实际路由表模型名（通道前缀 + 上游模型名） */}

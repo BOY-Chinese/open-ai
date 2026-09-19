@@ -6,7 +6,9 @@ open-ai 内部签到脚本 (不依赖任何外部脚本/目录)
 合并原 auto_renew.py + checkin_all.py 的功能, 数据源全部来自 open-ai 自身 config:
   * TRAE token 自动续期   : config.json providers.trae (accounts[].cookie -> GetUserToken)
   * WorkBuddy 每日签到    : config.json providers.workbuddy (copilot.tencent.com)
-  * WB 国际版每日签到     : config.json providers.workbuddy_intl (www.workbuddy.ai)
+  * WB 国际版每日活跃     : config.json providers.workbuddy_intl (www.workbuddy.ai)
+                            ★ 无签到渠道, 改为发一条网页端对话拿每日 +30
+                              (见 wb_intl_checkin_one 与 scripts/wb_web_daily.py)
   * TRAE 每日签到         : config.json providers.trae (api.trae.cn)
 
 用法:
@@ -270,8 +272,8 @@ def wb_checkin_one(acc, domain, product,
        同一时刻新接口 active=true/streak=13/total=1300), 官方 web/IDE 均只用新接口。
     2. active=false 时跳过领取: 官方 UI 在 active=false 时连签到入口都不渲染,
        此时 daily-checkin 必返回 10001"签到活动未开启或已过期"。
-       国际版 (workbuddy.ai) 目前无签到渠道, 账号恒为该形态 —— 每天只打 1 次状态
-       探测, 不再每 10 秒白打领取请求。
+       国际版 (workbuddy.ai) 目前无签到渠道, 账号恒为该形态 —— 故国际版
+       整个绕过本函数, 改走 wb_intl_checkin_one (网页端发对话拿活跃 +30)。
     3. 10001 是终态 (官方错误映射: 1001=已领 1002=无资格 1003=活动结束,
        其余未知), 不再"补领"—— 补领 100% 失败, 只是刷日志。
     4. 仅 HTTP 200 + JSON 解析成功 + code==0 才算签到成功。
@@ -322,8 +324,56 @@ WB_INTL_BASE = 'https://www.workbuddy.ai'
 
 
 def wb_intl_checkin_one(acc, domain, product):
-    """WorkBuddy 国际版签到 (www.workbuddy.ai)。"""
-    wb_checkin_one(acc, domain, product, base=WB_INTL_BASE, tag='WB国际签到')
+    """WorkBuddy 国际版每日积分 (www.workbuddy.ai)。
+
+    ★ 2026-09-18 五期实验判决后改道 —— 不再走 daily-checkin。
+    ------------------------------------------------------------------
+    国际版**没有签到渠道**: 服务端对国际账号恒报 active=false,
+    `/billing/meter/daily-checkin` 必返回 10001「签到活动未开启或已过期」,
+    且 10001 是终态 (补领 100% 无效, 旧版每 10 秒白打一次纯刷日志)。
+
+    五期对照实验排除了四条「非使用行为」路径 (HTTP 轮询 / 遥测上报 /
+    Centrifugo WS 长连接 / 心跳), 唯一幸存假设 =「真实使用行为」:
+    网页端调一次 `POST /console/chat/completions` 发条对话 → 每日 +30。
+    2026-09-17→18 双账号对照实测成立 (网页端 02:03:47 入账 +30)。
+
+    故此处只做**活跃动作** (发一条对话), 不再打签到接口 —— 积分由服务端
+    延迟自动入账 (Bonus Pack, 约 03:12 前后分批到账), 客户端无法主动领取。
+    活跃脚本内聚在 scripts/wb_web_daily.py (同样不依赖外部目录)。
+
+    补救机制 (2026-09-18 新增)
+    --------------------------
+    * **脚本内退避重试**: wb_web_daily.post_sse_retry 对瞬时故障 (超时/DNS/
+      TLS/5xx/429) 退避 3 次 (2s/6s/18s); 4xx 业务错误不重试 (重试无意义)。
+    * **当日去重**: 成功过就置 data/.wb_intl_activity_state = done:<今天>,
+      当天不再重发 —— 否则 30 分钟一轮的 --wb-only 一天白发几十条。
+      去重是**逐账号**判定的: 某个账号成功不影响其它账号继续补。
+    * **失败保留重试机会**: 失败的账号不写状态, daemon 30 分钟一轮的
+      --wb-only 会继续补, 直到成功。
+    """
+    uid = acc.get('userId', '?')
+    if acc.get('enabled') is False:
+        log('WB国际活跃', f'账号{uid} enabled=false, 跳过')
+        return
+    try:
+        import wb_web_daily as _wd
+    except Exception as e:  # noqa: BLE001 — 脚本缺失时明确报错, 不静默吞掉
+        log('WB国际活跃', f'账号{uid} 活跃脚本不可用: {e}')
+        return
+    # 当日去重: 该账号今天已成功发过就不再打扰 (daemon 每 30 分钟会来一趟)
+    if _wd.account_done_today(uid):
+        log('WB国际活跃', f'账号{uid} 今日已完成, 跳过')
+        return
+    ok, detail = _wd.run_one(acc, domain, product,
+                             _wd.DEFAULT_TEXT, _wd.DEFAULT_MODEL,
+                             _wd.DEFAULT_TIMEOUT, quiet=True)
+    if ok:
+        _wd.mark_account_done(uid)
+        log('WB国际活跃', f'账号{uid} 对话已发送 — 积分由后台延迟自动入账')
+    elif str(detail).startswith('skipped'):
+        pass  # 禁用/无 token 已由 run_one 自己写明原因
+    else:
+        log('WB国际活跃', f'账号{uid} 活跃动作失败: {detail} (30 分钟后自动重试)')
 
 
 # ================= Loomy 每日登录积分 =================
@@ -514,7 +564,7 @@ def main():
         i_domain = wbai.get('domain', 'www.workbuddy.ai')
         i_product = wbai.get('product', 'workbuddy-ai')
         if wbai_accs:
-            log('WB国际签到', f'--wb-only 补签检查 ({len(wbai_accs)} 个账号)')
+            log('WB国际活跃', f'--wb-only 活跃检查 ({len(wbai_accs)} 个账号)')
             for acc in wbai_accs:
                 wb_intl_checkin_one(acc, i_domain, i_product)
         # Loomy 白天补签 (2026-09-15): 新登录/当天漏签的账号 30 分钟一轮补上。
@@ -562,12 +612,14 @@ def main():
         for acc in wb_accs:
             wb_checkin_one(acc, domain, product)
 
-        # 2.5) WorkBuddy 国际版签到 (host=www.workbuddy.ai)
+        # 2.5) WorkBuddy 国际版每日活跃 (host=www.workbuddy.ai)
+        #      ★ 2026-09-18 起不再签到 (国际版无签到渠道), 改发一条网页端对话
+        #        触发「真实使用行为」→ 服务端延迟自动入账 +30。
         wbai = providers.get('workbuddy_intl') or {}
         wbai_accs = wbai.get('accounts') or []
         i_domain = wbai.get('domain', 'www.workbuddy.ai')
         i_product = wbai.get('product', 'workbuddy-ai')
-        log('WB国际签到', f'WorkBuddy 国际版签到 ({len(wbai_accs)} 个账号)')
+        log('WB国际活跃', f'WorkBuddy 国际版每日活跃 ({len(wbai_accs)} 个账号)')
         for acc in wbai_accs:
             wb_intl_checkin_one(acc, i_domain, i_product)
 

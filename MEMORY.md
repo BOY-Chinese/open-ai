@@ -50,6 +50,37 @@
 - `the model is unknown` → 基础名没带 `__dev`/`__max` 变体。
 - `Cronet Error: code=N` → 网络抖动/风控，**不是**模型名问题，等几秒重试即可。
 
+## trae 通道「经常返回不全面」根因与修复（2026-09-18，trae/server.js）
+
+**症状**：流式请求经常空回复或答案写到一半戛然而止，finish_reason 却是正常的 `stop`，客户端毫无报错线索。
+
+**根因（按主次）**
+1. **流式路径把一切错误静默伪装成正常结束**：HTTP handler 里 `onError: () => endStream('stop')` 和
+   `catch (e) { endStream('stop') }` —— 上游 `event:error`（param invalid / model unknown /
+   服务不可用）、账号池为空、任何异常，全部以 `finish_reason='stop'` 正常收尾。日志证明
+   `event:error` 频发（param invalid 50 次 / model unknown 11 次 / service unavailable 1 次）。
+2. **`watchdogTripped` TDZ 引用错误**：9-15 加看门狗时把 `let watchdogTripped = null` 声明在读流段，
+   而重试循环的 catch 与「重试耗尽」汇总处都先引用它 → 任何一次 TTNet/Cronet 抖动或 429/5xx 三连
+   直接抛 `ReferenceError: Cannot access 'watchdogTripped' before initialization`，3 次重试+轮换账号
+   机制整体失效，异常再被上面的 `catch → endStream('stop')` 静默吞掉（**所以日志里一条痕迹都没有**）。
+   9-15 之前「抖动→重试→成功」的保护一直在，改造后才出现症状高发。
+3. **看门狗错误从不透传**：`traeChat()` 只转发 `deferredErr`（event:error 路径），
+   `traeChatOnce` 返回值 `r1.error`（读流中断 120s / AbortError）从不交给 handlers.onError。
+4. **SSE 尾包丢失**：读流 `if (done) break` 直接丢弃 buffer —— 上游最后一条事件
+   （常为结尾正文或 done）没有换行结尾时整条丢掉；decoder 也没有 final flush。
+
+**修复（trae/server.js，4 处）**
+- `watchdogTripped` 声明前移到重试循环之前（修 TDZ，恢复重试机制）。
+- 流式新增 `endStreamError()`：错误时先发 `{"error":{...}}` 数据块（形态与网关 main.py
+  流式失败一致）再以 `finish_reason='error'` 收尾，不再伪装成 stop；catch 同样走它。
+- `traeChat()` 补 `else if (r1 && r1.error)` 透传看门狗/中止错误（流式与非流式都受益）。
+- 读流抽出 `processLine()` 并在流结束后 `decoder.decode()` 冲洗 + 解析残留无换行尾包。
+
+**排查提示**：若客户端看到 `finish_reason='error'` + error 块，是本次修复后的**正常透传**，
+按 error.message 对号入座（模型名形态 / 账号失效 / 上游抖动）；不再是「莫名空回复」。
+改动需重启 trae 后端（或整个 open-ai）才生效。
+
+
 ## device_id 由 Trae 客户端生成（核心约束）
 
 **结论**：open-ai 网关对接 Trae 所需的 `device_id`（HTTP 头 `x-device-id`）**必须由 Trae 桌面客户端生成**，网关自身不会、也不能生成合法值。
@@ -75,6 +106,105 @@
 
 **结论**：国际版与国内版（`copilot.tencent.com`）**接口路径完全相同**，只有 host 与产品标识不同，
 因此 `providers/workbuddy_intl.py` 直接继承国内版 provider，只覆写差异部分。
+
+## 国际版拿分链路（2026-09-19 **二次**修正：Cloud Agent，最新，必读）
+
+**结论：国际版网页端拿活跃，唯一正确路径是 `POST /console/as/conversations/`
+（Cloud Agent 任务）。此前两版（`/console/chat/completions`、webchat 三步链路）
+都打在了另一套体系上，怎么调都不会出现在 master 界面里，活跃也不计入。**
+
+### ★★ 两套独立体系（最容易踩的坑）
+
+| 界面 | 接口前缀 | ID 形态 | 算活跃 |
+| --- | --- | --- | --- |
+| `/chat/` | `/console/webchat/*` + `/console/chat/completions` | UUID（`537f7031-…`） | **✗ 否** |
+| **`/app/`** | **`/console/as/*`** | **长整型（`2100473510…`）** | **✅ 是** |
+
+master 的界面是 **`/app/`（web_agents）**，其"会话"就是 Cloud Agent 任务。
+判别铁证：master 09-17 的真实会话 `2100473510743687168`（name=「你好」）在
+`GET /console/as/conversations/` 里查得到，manifest 明写
+`CLIENT_INFO_PLATFORM=web_agents` / `CLIENT_INFO_IDE_TYPE=WorkBuddy_Web`；
+而 webchat 那套接口**永远看不到它** —— 这就是「网页端没有新会话」的真相。
+
+### ★ 核心教训：循环验证
+
+前两版都在**错误体系内自洽**：建会话→对话→回写 全部 HTTP 200，
+回读也能看到自己造的会话 —— 于是"自证成功"。
+**用错误的体系验证错误的体系，永远成功。**
+→ 验收必须换**独立路径**：master 的界面 / 官方条款 / 另一个接口体系。
+  绝不能拿「我调用的接口回读我自己造的数据」当证据。
+
+### 正确调用（实测 HTTP 200）
+
+```
+POST https://www.workbuddy.ai/console/as/conversations/
+     {"prompt": "你好", "model": "hy3"}
+  → {"id": "2101201130699665408", "name": "你好", "status": "CREATING",
+     "session": {"sessionId": ..., "sandboxId": ..., "link": ".../acp", "cwd": "/workspace"}}
+```
+
+⚠️ **路径必须带尾斜杠**：`/console/as/conversations`（不带）→ **403 access_denied**；
+`/console/as/conversations/`（带）→ 200。旧文档把这条记成「别走这条通道」，是**误判**。
+
+配套接口：
+| 用途 | 接口 |
+| --- | --- |
+| 建任务 | `POST /console/as/conversations/` body `{prompt, model}` |
+| 任务详情 | `GET /console/as/conversations/{id}` |
+| 任务列表 | `GET /console/as/conversations/`（**带尾斜杠**） |
+| 任务时间线 | `GET /console/as/conversations/{id}/timeline` |
+| Cloud Agent 配额 | `GET /v2/user/cloudagent/quota`（`agentLimit/agentUsed`） |
+
+### 消耗：hy3 + 极简内容 = 免费（已实测）
+
+用 `model=hy3` + 「你好」创建任务后，资源包 `CapacityUsedPrecise` **保持 0**
+（`GET /billing/meter/get-user-resource` 回读，字段是 `CapacityRemainPrecise` /
+`CapacityUsedPrecise`，不是 `Balance`）。任务仍会**真实执行**
+（`CREATING → working → completed`，起真实 sandbox）——这正是"真实使用行为"的形态。
+
+### 关于官方条款的矛盾（**仍待复核**）
+
+官方文档《Limited-Time Daily Activity Reward Terms》写：
+> "…initiate at least one valid AI conversation or task **through the WorkBuddy or
+> CodeBuddy client**…" / "**Conversations or tasks initiated on the web do not
+> count**" / 不算有效活跃含 "Activity generated through **scripts**, plug-ins…"
+
+**但 master 实测网页端对话确实拿到过日活**（09-17 `你好` → 09-18 02:03 入账 +30）。
+以实测为准，但条款风险与「脚本刷活跃」的合规问题由 master 评估。
+
+### 历史（两版错误路径，勿重蹈）
+
+1. **2026-09-18 首版**：只打 `/console/chat/completions` —— HTTP 200、模型真作答，
+   但**无会话、无落库**，网页端看不到，活跃不计入。
+2. **2026-09-19 一版**：补成 webchat「三步链路」（建会话→对话→回写）——
+   在 webchat 体系内完全自洽，但**仍是错误的体系**，master 界面依然看不到。
+3. **2026-09-19 二版（当前）**：改走 `/console/as/conversations/` ✅
+
+### 五期实验排除过程（前四条全部判失败）
+
+| 期次 | 方案 | 结果 |
+| --- | --- | --- |
+| 一期 | HTTP 轮询（msg-summary + buddy/info） | ✗ |
+| 三期 | 遥测上报（`/v2/report` + dosage + config） | ✗ |
+| 四期 | Centrifugo WS 长连接（4 频道订阅） | ✗ |
+| **五期** | **Cloud Agent 任务（`/console/as/`）** | ✅ |
+
+### 积分是延迟自动入账的
+
+Bonus Pack（`TCACA_code_007`），约 03:12 前后分批到账 ——
+**客户端无法主动领取，也无法通过刷新主动获取**。所以：
+- 界面对国际版**不渲染「未签到」**（会误导），tooltip 写
+  「积分由后台自动入账，无法通过刷新主动获取」；
+- 刷新提示文案要**剔除国际版**（`WorkBuddy_IE:` 前缀），否则每天误报一次「未签上」；
+- 判成功只看**隔天的资源包入账**（`POST /billing/meter/get-user-resource`，必须 POST），
+  发完当天别急着查。
+
+### ⚠️ 测试会留下真实任务
+
+`/console/as/` 无简单 HTTP 删除接口（删除走 ACP 协议层 `client.sessions.delete`），
+`DELETE /console/as/conversations/{id}` → 404。**调试时建的任务会留在 master 界面里**，
+需从界面手动清理。2026-09-19 调试期间在 `ae1c0d1a` 留下若干「早上好」/「你好」任务。
+
 
 ## 国际版签到（2026-09-13 深扒定论，必读）
 
@@ -759,3 +889,28 @@ release 元数据**，只有二进制换了）：
 新 asset 没传上去 —— 中间态等于把资产弄丢**。正确姿势：`curl --retry 3
 --retry-all-errors --connect-timeout 30 --speed-time 120 --speed-limit 10240
 --data-binary @file`（无总时限，只在链路真的停住时才放弃），先删后传要经得起重试。
+
+
+
+## Auto 路由链多链化（2026-09-18，v3.2）
+
+master 需求：名称更正 + 单链 → 多链 + GUI 重做。全部落地，见提交 `b50509b`（后端）与后续前端提交。
+
+1. **名称更正**：对外名称统一「Auto路由链」（旧名「Auto路由连」为笔误）。
+   `AUTO_MODEL = "Auto路由链"`，别名 `("Auto路由连", "Auto-mode")` 继续兼容识别，老客户端不受影响。
+2. **多链配置**：`auto_chain.chains[]`，每条 `{id, name, enabled, models:[{model, timeout}]}`；
+   旧单链格式 `{enabled, timeout, models[]}` 读取时自动迁移为一条「无名1」（不回写，保存时才落新格式）。
+   链名按名路由（忽略大小写/首尾空白），重名链读取时自动补序号；**链名与真实模型重名时让位给真实模型**。
+   `/v1/models` 只把每条「启用且有模型」的链以**链名**作为虚拟模型暴露
+   （总名「Auto路由链」当晚即按 master 要求从模型列表移除，仅保留请求侧兼容）。
+3. **GUI 重做**（`desktop-ui/src/pages/AutoRouterPage.tsx` 重写）：
+   - 「编辑路由链」→「添加新路由链」（自动命名「无名N」），全局启用开关与单模型超时栏取消；
+   - 链行：名称 | 模型数量 | 状态（绿=启用/黄=关闭）| 行尾「<」展开模型简报；
+   - 右键链：编辑 / 检查 / 启用或关闭 / 删除；右键简报里的模型：单独检查；
+   - 简报列：顺序 | 请求模型名称 | 所属通道 | 状态（绿=正常/黄=繁忙/红=断连，未检查显示「未检查」）；
+   - 编辑页：链名可改、模型加/删/上下移、逐模型超时（0=provider 默认）；
+   - 「选择模型」与模型列表页同源（`listModels`）：**隐藏模型不出现、置顶模型排最前**。
+4. **检查探活**：`auto_router.check_model` 发 `CHECK_PROMPT = "回复ok"`（原话「如果能看到这条消息，请回复ok」的极短版），
+   等待上限 30s；429/5xx/超时→busy，401/403/连接失败等→down。
+5. **测试**：`tests/test_auto_router.py`（9 项，`python3 tests/test_auto_router.py` 可独立运行）。
+6. ⚠️ **生效条件**：后端改动需**重启网关**；桌面端改动需重打包（`desktop-ui` 的 dist 已用 WSL node + `vite build` 重新生成，Tauri exe 仍需 Windows 侧 `npm run tauri:build` 才带上新 GUI）。

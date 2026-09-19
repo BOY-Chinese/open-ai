@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Plus, RefreshCw, Link2, Users, Check } from 'lucide-react'
+import { Plus, RefreshCw, Link2, Users, Check, Rocket } from 'lucide-react'
 import { PageShell, PageHeader, PageToolbar, PageBody, PageFooter, ToolbarDivider } from '@/components/layout/PageShell'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -66,6 +66,48 @@ export function AccountsPage() {
 
   /** Loomy 图形化登录向导开关（点「添加 Loomy 账号」弹出，全程无命令行） */
   const [loomyDialog, setLoomyDialog] = useState(false)
+
+  /* ═══════════ 定制：启动dsh（仅 master 本机使用，不必同步到 dev / portable 发布版） ═══════════
+   *
+   * 功能：一键启动 DeepSeek Harness Web GUI（WSL 内 dsh web，地址
+   * http://127.0.0.1:3080）。后端经 wsl.exe 调 `bash ~/dsh-web.sh start`，
+   * 脚本幂等（已在运行就不重复拉），所以这里不查状态、点了就发。
+   *
+   * ★ DSH 已在运行时，后端会自动用系统默认浏览器**新开** DSH 页面
+   *   （定制需求：不判断浏览器里是否已有该页，每次点击都开一个新的）。
+   *   刚拉起的冷启动分支不开 —— 端口未就绪时会开出错误页。
+   *
+   * 按钮位置：PageHeader 的 actions 插槽 —— 标题「账号管理」右侧的空白区，
+   * 即 master 指定的「右上空白部分」。placed 在此页仅因 master 要求放这里；
+   * 后端端点是全局的，日后想挪到别处只需搬这一个 Button。
+   */
+  const [dshBusy, setDshBusy] = useState(false)
+
+  const onLaunchDsh = useCallback(async () => {
+    setDshBusy(true)
+    try {
+      const r = await backend.launchDsh()
+      if (!r.ok) {
+        toast(`启动dsh 失败：${r.output || `退出码 ${r.exitCode}`}`, 'error', 6000)
+      } else if (r.alreadyRunning) {
+        // 后端已自动用默认浏览器新开 DSH 页（r.openedInBrowser），
+        // 文案只需告知「替你打开好了」；开失败则提示手动访问
+        toast(
+          r.openedInBrowser
+            ? 'dsh 已在运行，已在浏览器打开 DSH 页面'
+            : 'dsh 已在运行，请访问 http://127.0.0.1:3080',
+          'info',
+          5000
+        )
+      } else {
+        toast('DeepSeek Harness 已启动：http://127.0.0.1:3080', 'success', 6000)
+      }
+    } catch (e) {
+      toast(`启动dsh 失败：${e instanceof Error ? e.message : String(e)}`, 'error', 6000)
+    } finally {
+      setDshBusy(false)
+    }
+  }, [toast])
 
   const { data: accounts, loading, reload, setData } = useAsync(
     () => backend.listAccounts(filter),
@@ -137,8 +179,12 @@ export function AccountsPage() {
           // 补签后仍未出现在签到表里的账号 —— 上游没签上（繁忙/活动未参与）。
           // ★ 用 `in` 判存在而不是判真假：签到项的 value 可能是空对象（假值），
           //   用 `!obj[id]` 会把「已签到」误报成「未签上」，提示文案就说谎了。
+          //
+          // ★ 国际版要单独剔除：它的活跃动作（后台发一条网页端对话）确实执行了，
+          //   但积分由服务端**延迟自动入账**，当天本来就不会出现在签到表里 ——
+          //   把它算进「未签上」等于每天误报一次失败（2026-09-18 纳入补签时发现）。
           const stillPending = r.pending.filter(
-            (id) => !(id in r.signin.signin)
+            (id) => !(id in r.signin.signin) && !id.startsWith('WorkBuddy_IE:')
           )
           signinNote =
             stillPending.length > 0
@@ -293,6 +339,18 @@ export function AccountsPage() {
       <PageHeader
         title="账号管理"
         description="Trae / WorkBuddy / WorkBuddy 国际 / Loomy 四通道统一视图"
+        /* 定制：右上空白区的「启动dsh」按钮（仅 master 本机使用，不必同步发布版） */
+        actions={
+          <Button
+            variant="outline"
+            onClick={() => void onLaunchDsh()}
+            loading={dshBusy}
+            title="一键启动 DeepSeek Harness (WSL dsh web)；已在运行时自动在浏览器打开 DSH 页面"
+          >
+            {!dshBusy && <Rocket />}
+            {dshBusy ? '启动中…' : '启动dsh'}
+          </Button>
+        }
       />
 
       {/* 工具栏：筛选 + 刷新当前通道 + 重连当前通道 */}
@@ -438,10 +496,13 @@ export function AccountsPage() {
                                 已签到
                               </Badge>
                             ) : a.channel === 'WorkBuddy_IE' ? (
-                              /* 国际版无签到渠道 (2026-09-13 官方确认): gain 表恒无记录,
-                                 显示「未签到」是误导 —— 按无渠道语义渲染「—」。
-                                 (Loomy 已接入按天状态缓存 data/loomy_signin_state.json,
-                                  有「今日已领」凭证, 走正常渲染, 不再按无渠道处理。) */
+                              /* 国际版 (2026-09-18 五期实验判决后):
+                                 积分走**网页端活跃**路径 —— 后台每日自动发一条
+                                 /console/chat/completions 对话, 由服务端**延迟自动入账**
+                                 +30 (Bonus Pack, 约 03:12 前后到账)。当天发完 gain 表也
+                                 不会立刻有记录, 所以这里既不能渲染「未签到」(会误导),
+                                 也不能靠刷新去催 (客户端没有主动领取接口) ——
+                                 维持「—」中性渲染, 真实语义交给 tooltip。 */
                               <span className="inline-flex justify-center text-base text-fg-faint">
                                 —
                               </span>
@@ -454,7 +515,7 @@ export function AccountsPage() {
                           {sg
                             ? `今日已签到成功：入账 ${fmtCredit(sg.amount)} 积分（${sg.kinds.join('、')}）· ${fmtTime(sg.ts)}`
                             : a.channel === 'WorkBuddy_IE'
-                              ? 'WorkBuddy 国际版暂无签到渠道，无每日签到积分'
+                              ? 'WorkBuddy 国际版积分由后台自动入账，无法通过刷新主动获取'
                               : a.channel === 'Loomy'
                                 ? '今日尚未领取每日登录积分；后台每日自动领取，可稍后刷新查看'
                                 : `今日尚未签到成功${signin.day ? `（统计日 ${signin.day}）` : ''}；后台每日自动签到，可稍后刷新查看`}

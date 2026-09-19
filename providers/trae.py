@@ -25,6 +25,48 @@ from providers.base import Provider, make_chunk_id
 
 logger = logging.getLogger("openapi.trae")
 
+# ======================= 上游「无效模型」屏蔽表 =======================
+# 上游 get_detail_param 返回的 config_info_list 里混着一批**不可用**的名字,
+# 它们不是真实聊天模型, 列出来只会让用户点了报错:
+#
+#   1. custom_model_*  —— Trae 客户端「自定义模型」功能的占位/代理配置。
+#      实测(2026-09-18, 上游 18787 + 网关 8000 双向核对)共 15 个:
+#        custom_model_placeholder / custom_model_1M[_text] / custom_model_200k[_text]
+#        custom_model_gemini / custom_model_vercel[_gemini] / custom_model_kimi
+#        custom_model_gpt-5 / custom_model_gpt-6 / custom_model_no-fc
+#        custom_model_deepseek_v4 / custom_model_deepseek_chat / custom_model_deepseek_reasoner
+#      这些是「用户自配模型」的槽位, 真身取决于客户端本地配置, 走网关调用必然失败。
+#   2. 内部工具名 —— Trae IDE 自身的辅助功能, 不是给人对话用的模型:
+#        summary(上下文摘要) / fast_apply[_new](代码快进应用)
+#        title_generation(会话标题生成) / input_optimization(输入优化)
+#
+# ★ 屏蔽只作用于「对外暴露的模型列表」, 不影响请求侧:
+#   normalize_model() 仍然照常解析这些名字, 保证已有 auto_chain / 客户端里
+#   残留的旧模型名不会从「列表消失」直接变成「请求 500」。
+MODEL_BLOCKLIST_PREFIXES = ("custom_model_",)
+MODEL_BLOCKLIST_EXACT = {
+    "summary",
+    "fast_apply",
+    "fast_apply_new",
+    "title_generation",
+    "input_optimization",
+}
+
+
+def is_usable_model(name: str) -> bool:
+    """该上游模型名是否应该对外暴露 (False = 无效/内部模型, 需屏蔽)。
+
+    大小写不敏感 —— 上游 config_name 大小写并不统一 (如 DeepSeek-V4-Flash 与
+    custom_model_gpt-5 混排), 只按全小写比对才不会漏。
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    if n in MODEL_BLOCKLIST_EXACT:
+        return False
+    return not any(n.startswith(p) for p in MODEL_BLOCKLIST_PREFIXES)
+
+
 class TraeProvider(Provider):
     name = "trae"
 
@@ -75,6 +117,14 @@ class TraeProvider(Provider):
                             data = resp.json()
                             models = [m.get("id") for m in (data.get("data") or [])
                                       if m.get("id")]
+                            # 入口就屏蔽无效模型 (custom_model_* / 内部工具名):
+                            # 缓存里一旦混进这些名字, 后面每个出口都得再过滤一遍,
+                            # 在唯一的入口处拦掉最省心 (见 is_usable_model 注释)。
+                            dropped = [m for m in models if not is_usable_model(m)]
+                            models = [m for m in models if is_usable_model(m)]
+                            if dropped:
+                                logger.info("trae 已屏蔽 %d 个无效模型: %s",
+                                            len(dropped), ", ".join(sorted(dropped)[:8]))
                             if models:
                                 self._node_models = models
                                 self._node_synced_at = time.time()
@@ -110,6 +160,11 @@ class TraeProvider(Provider):
         names = set(self._node_models) | set(self.aliases.values()) \
             | set(self.aliases.keys())
         names.add(self._default)
+        # 出口二次屏蔽 (纵深防御): sync_models 已在入口过滤, 但若 Node 后端是
+        # 未更新的旧版 server.js (其 /v1/models 原样透传上游), 缓存里仍会带进
+        # custom_model_* —— 这里再拦一道, 保证「重启了 Python 但没重启 Node」
+        # 或「只换 Python 不换 JS」时都不会漏出。别名/默认模型同样过筛。
+        names = {m for m in names if is_usable_model(m)}
         return [{"id": f"tr-{m}", "object": "model", "created": 0, "owned_by": "trae-proxy"}
                 for m in sorted(names)]
 

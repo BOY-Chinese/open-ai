@@ -72,9 +72,16 @@ class SigninTargetsTest(unittest.TestCase):
         self.addCleanup(lambda: setattr(A, '_read_config', self._orig))
 
     def test_all_signed_in_runs_nothing(self):
-        """全部已有当日凭证 → 不跑任何脚本（刷新不该白等一次联网）。"""
+        """全部已有当日凭证 → 不跑任何脚本（刷新不该白等一次联网）。
+
+        ★ 2026-09-18：国际版已纳入补签（活跃动作路径），故这里必须连同
+          `WorkBuddy_IE:wbie-1` 一起给凭证，才算「全部签到」。
+          国际版**积分由服务端延迟自动入账**，当天通常拿不到凭证 ——
+          那不叫「没签上」，只是结算没到（见 test_intl_triggers_wb_activity）。
+        """
         t = A._signin_targets(None, {
-            'Trae:trae-1': {}, 'WorkBuddy:wb-1': {}, LOOMY_ROW_ID: {},
+            'Trae:trae-1': {}, 'WorkBuddy:wb-1': {}, 'WorkBuddy_IE:wbie-1': {},
+            LOOMY_ROW_ID: {},
         })
         self.assertFalse(t['wb'], '已全部签到却仍要跑 WB 补签')
         self.assertFalse(t['trae'], '已全部签到却仍要跑 TRAE 补签')
@@ -93,12 +100,32 @@ class SigninTargetsTest(unittest.TestCase):
         self.assertTrue(t['wb'])
         self.assertFalse(t['trae'])
 
-    def test_intl_never_triggers(self):
-        """国际版无签到渠道（2026-09-13 官方确认）→ 永不进补签。"""
+    def test_intl_triggers_wb_activity(self):
+        """国际版（2026-09-18 起）纳入补签 —— 走网页端活跃路径。
+
+        历史：旧版这里断言「永不触发」，理由是 2026-09-13 确认国际版无签到渠道
+        （服务端恒报 active=false，daily-checkin 必 10001 终态）。
+        五期实验判决后国际版**改道**：`signin_all.py --wb-only` 内部改调
+        `scripts/wb_web_daily.py` 发一条 `/console/chat/completions` 对话
+        （「真实使用行为」路径），该动作确实会触发每日 +30，故必须进补签。
+
+        注意 pending 里的 id 必须与签到表 key 同构（`WorkBuddy_IE:<userId>`），
+        前端靠 `startsWith('WorkBuddy_IE:')` 把它从「未签上」文案里剔除。
+        """
         t = A._signin_targets('WorkBuddy_IE', {})
-        self.assertFalse(t['wb'], '国际版无渠道，不该触发补签')
+        self.assertTrue(t['wb'], '国际版已接入活跃路径，应触发 --wb-only')
         self.assertFalse(t['trae'])
-        self.assertEqual(t['pending'], [])
+        self.assertEqual(t['pending'], ['WorkBuddy_IE:wbie-1'])
+
+    def test_intl_activity_does_not_need_proof(self):
+        """国际版没有当日入账凭证时仍要跑活跃动作。
+
+        积分是**延迟自动入账**（Bonus Pack，约 03:12 前后到账），所以
+        「今天还没凭证」是常态而非失败 —— 若无条件跳过，活跃动作就永远不会发，
+        第二天也就永远等不到那 +30。
+        """
+        t = A._signin_targets('WorkBuddy_IE', {})
+        self.assertIn('WorkBuddy_IE:wbie-1', t['pending'])
 
     def test_loomy_rides_wb_script(self):
         """Loomy 的补领挂在 --wb-only 里（见 signin_all.main 的补签段）。"""

@@ -45,7 +45,13 @@ export interface ModelCacheSnapshot {
   stale: boolean
 }
 
-/** 单条模型记录的最小形状校验（缺一即认为整份缓存不可信） */
+/**
+ * 单条模型记录的最小形状校验（缺一即认为整份缓存不可信）。
+ *
+ * 注意：**不校验 `ratioKnown`**。旧版本缓存没有这个字段，若在此判为非法，
+ * 用户升级后第一次打开会被整份丢弃 → 又回到「每次都空等网络」的老问题。
+ * 缺失时由 {@link withRatioKnown} 补一个合理默认。
+ */
 function isModelEntry(v: unknown): v is ModelEntry {
   if (!v || typeof v !== 'object') return false
   const m = v as Record<string, unknown>
@@ -58,6 +64,18 @@ function isModelEntry(v: unknown): v is ModelEntry {
     typeof m.hidden === 'boolean' &&
     typeof m.pinned === 'boolean'
   )
+}
+
+/**
+ * 补齐旧缓存缺失的 `ratioKnown`（结构演进兼容）。
+ *
+ * 旧版本行为等价于「倍率非 0 即已知」：那时 0 既可能是真 0 也可能是未知，
+ * 无从分辨，只能按旧口径还原 —— 至少不会把原本正常显示的数字变掉。
+ * 注意这里**不写 undefined**：显式落一个 boolean，避免下游反复判空。
+ */
+function withRatioKnown(m: ModelEntry): ModelEntry {
+  if (typeof m.ratioKnown === 'boolean') return m
+  return { ...m, ratioKnown: typeof m.ratio === 'number' && m.ratio > 0 }
 }
 
 /**
@@ -78,7 +96,8 @@ export function readModelCache(): ModelCacheSnapshot | null {
     if (!list.every(isModelEntry)) return null
     const ts = typeof savedAt === 'number' && Number.isFinite(savedAt) ? savedAt : 0
     return {
-      list,
+      // 补齐旧缓存缺失的 ratioKnown（结构演进兼容，见函数注释）
+      list: list.map(withRatioKnown),
       savedAt: ts,
       stale: ts > 0 && Date.now() - ts > MODEL_CACHE_TTL_MS,
     }

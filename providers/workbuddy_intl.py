@@ -40,6 +40,9 @@ INTL_HOST = "www.workbuddy.ai"
 INTL_DOMAIN = "www.workbuddy.ai"
 INTL_PRODUCT = "workbuddy-ai"
 # 国际版模型目录 (真实接口, 与 account_manager.intl_model_rates 同源)
+# 主源用 /v3/config (客户端实际读取的那份, 模型更全: 22 个 vs 目录 18 个,
+# 且含 gpt-6-astra 等目录缺失的模型); 目录接口作回退。
+INTL_CONFIG_PATH = "/v3/config"
 INTL_MODELS_PATH = "/v2/enterprises/personal/models"
 
 INTL_DEFAULT_MODEL = "deepseek-v4.1-flash"
@@ -147,7 +150,11 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
             self.accounts = fresh if fresh else self.accounts
         except Exception:
             pass  # 读取失败则沿用内存 accounts
-        enabled = [a for a in self.accounts if a.get("enabled", True)]
+        # 凭据观察 + 跳过运行态失效账号 (与国内版 _pick_account 同口径)
+        for a in self.accounts:
+            self._health.observe_token(a.get("userId"), a.get("accessToken"))
+        enabled = [a for a in self.accounts if a.get("enabled", True)
+                   and not self._health.is_invalid(a.get("userId"))]
         if not enabled:
             return {}
         self._req_count += 1
@@ -157,10 +164,14 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
 
     # ---------- 动态模型 (国际版目录接口) ----------
     async def _fetch_upstream_models(self) -> list[str]:
-        """GET /v2/enterprises/personal/models 取国际版模型目录。
+        """取国际版模型目录 —— 主源 GET /v3/config, 回退 /v2/.../models。
 
-        与国内版 /v3/config 不同, 该接口直接返回 data.models[].id;
-        遍历账号, 401/403 由 _refresh_token 处理。
+        ★ 2026-09-18 换源 (master 反馈「国际版 gpt-6-astra 倍率为 0」) ★
+        旧实现只打 /v2/enterprises/personal/models, 实测它**不是客户端用的
+        那份数据**: 国际版只返回 18 个模型, 而客户端展示 22 个 (gpt-6-astra
+        等根本不在其中, 只能靠在 _INTL_KNOWN_EXTRA 里硬编码补)。
+        客户端真正读的是 GET /v3/config → data.models (与国内版同一接口),
+        该接口模型更全、倍率也更新。故改为 config 优先、目录兜底。
         """
         if not self.accounts:
             raise RuntimeError("workbuddy-intl 无账号, 无法拉取上游模型")
@@ -171,23 +182,36 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
             try:
                 headers = _intl_headers(account)
                 client = self.get_client()
+                models: list[str] = []
+                # ── 主源: /v3/config → data.models ──
                 resp = await client.get(
-                    f"https://{INTL_HOST}{INTL_MODELS_PATH}",
+                    f"https://{INTL_HOST}{INTL_CONFIG_PATH}",
                     headers=headers, timeout=30.0)
-                if resp.status_code in (401, 403):
+                if resp.status_code == 200:
+                    cfg_models = ((resp.json().get("data") or {})
+                                  .get("models") or [])
+                    for m in cfg_models:
+                        if isinstance(m, dict) and m.get("id"):
+                            models.append(str(m["id"]))
+                elif resp.status_code in (401, 403):
                     last_err = f"{resp.status_code}"
                     continue
-                if resp.status_code != 200:
-                    last_err = f"HTTP {resp.status_code}"
-                    continue
-                data = resp.json()
-                models: list[str] = []
-                for m in ((data.get("data") or {}).get("models") or []):
-                    if isinstance(m, dict) and m.get("id"):
-                        models.append(str(m["id"]))
-                    elif isinstance(m, str) and m:
-                        models.append(m)
-                # 目录缺失但可直接调用的已知模型
+                # ── 回退: /v2/enterprises/personal/models ──
+                if not models:
+                    resp2 = await client.get(
+                        f"https://{INTL_HOST}{INTL_MODELS_PATH}",
+                        headers=headers, timeout=30.0)
+                    if resp2.status_code in (401, 403):
+                        last_err = f"{resp2.status_code}"
+                        continue
+                    if resp2.status_code == 200:
+                        for m in ((resp2.json().get("data") or {})
+                                  .get("models") or []):
+                            if isinstance(m, dict) and m.get("id"):
+                                models.append(str(m["id"]))
+                            elif isinstance(m, str) and m:
+                                models.append(m)
+                # 两源都缺失但可直接调用的已知模型
                 for mid in _INTL_KNOWN_EXTRA:
                     if mid not in models:
                         models.append(mid)
@@ -257,6 +281,11 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
                 if resp.status_code != 200:
                     logger.warning("workbuddy-intl refresh HTTP %s: %s",
                                    resp.status_code, resp.text[:200])
+                    if resp.status_code in (401, 403):
+                        # 刷新凭据本身被上游拒绝 → refreshToken 已死, 标记失效
+                        self._health.mark_invalid(
+                            account.get("userId"),
+                            reason=f"refresh 被拒 HTTP {resp.status_code}")
                     return False
                 data = resp.json().get("data", {})
                 if data.get("accessToken"):
@@ -323,8 +352,14 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
         if resp.status_code != 200:
             err_text = (await resp.aread()).decode("utf-8", errors="replace")
             await resp.aclose()
+            if resp.status_code in (401, 403):
+                # 首发被拒且刷新重试仍被拒 → 凭据已被上游判死, 沉淀运行态
+                self._health.mark_invalid(
+                    account.get("userId"),
+                    reason=f"chat 被拒 HTTP {resp.status_code} (含刷新重试)")
             raise RuntimeError(
                 f"workbuddy-intl upstream HTTP {resp.status_code}: {err_text[:300]}")
+        self._health.mark_ok(account.get("userId"))
         try:
             async for line in resp.aiter_lines():
                 obj = _parse_sse_line(line)

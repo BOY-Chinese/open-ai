@@ -27,7 +27,7 @@ import time
 
 import httpx
 
-from .base import Provider, make_chunk_id
+from .base import AccountHealth, Provider, make_chunk_id
 
 logger = logging.getLogger("openapi.providers.loomy")
 
@@ -174,6 +174,8 @@ class LoomyProvider(Provider):
         self._lock = asyncio.Lock()
         # 最近一次成功使用的账号 (日志/排查用)
         self._last_account: dict | None = None
+        # 账号运行态 (2026-09-19): 上游明确拒绝鉴权时标记, 账号管理页展示「真状态」
+        self._health = AccountHealth()
 
     def get_client(self) -> httpx.AsyncClient:
         return self._client
@@ -298,6 +300,19 @@ class LoomyProvider(Provider):
             raise AccountUnavailable(
                 "loomy 无可用账号, 请先在账号管理中登录 Loomy")
 
+        # 凭据观察: session 变化(重新登录)自动解除失效标记 —— loomy 每次请求
+        # 实时读 config, 重新登录后无需重启即重新参与轮询 (新凭据给新机会)
+        for _a in accounts:
+            self._health.observe_token(_a.get("userid"), _a.get("_token"))
+        # 跳过运行态已失效的账号: 上游明确判死, 再打也是白打 (省一次注定
+        # 失败的请求); 全部失效时直接给出可读结论
+        alive = [a for a in accounts
+                 if not self._health.is_invalid(a.get("userid"))]
+        if not alive:
+            raise AccountUnavailable(
+                "loomy 账号全部已失效(运行态), 请在账号管理中重新登录")
+        accounts = alive
+
         n = len(accounts)
         start = await self._pick_start(n)
 
@@ -323,6 +338,9 @@ class LoomyProvider(Provider):
                 if resp.status_code in self.AUTH_STATUS or \
                         any(c in err_text for c in self.AUTH_BIZ_CODES):
                     logger.warning("loomy 账号 %s session 失效, 换下一个账号", label)
+                    self._health.mark_invalid(
+                        account.get("userid"),
+                        reason=f"HTTP {resp.status_code} 鉴权拒绝")
                     continue
                 raise RuntimeError(last_err)
 
@@ -339,6 +357,9 @@ class LoomyProvider(Provider):
                 if code in self.AUTH_BIZ_CODES:
                     logger.warning("loomy 账号 %s 登录已失效 (%s), 换下一个账号",
                                    label, code)
+                    self._health.mark_invalid(
+                        account.get("userid"),
+                        reason=f"业务码 {code} 登录失效")
                     continue
                 raise RuntimeError(last_err)
             try:
@@ -351,6 +372,7 @@ class LoomyProvider(Provider):
             finally:
                 await resp.aclose()
             self._last_account = account
+            self._health.mark_ok(account.get("userid"))
             return
         raise RuntimeError(f"loomy 所有账号均不可用: {last_err}")
 

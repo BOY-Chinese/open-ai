@@ -23,9 +23,11 @@ Open-API — 统一 OpenAI 兼容聚合网关 (open-ai, 端口 8000)
   模型名含 "workbuddy" 或以 "wb-" 开头 → workbuddy provider
   其他 → 第一个 provider (workbuddy)
 
-虚拟模型 Auto路由连 (auto_router.py):
-  model == "Auto路由连" (兼容历史名 "Auto-mode") 时按 config.json 的
-  auto_chain.models 顺序做故障转移, 与上游内置 auto 别名无关。
+虚拟模型 Auto路由链 (auto_router.py):
+  多条自定义路由链 (config.json auto_chain.chains, 每条链可自定义名称、
+  链上模型逐个设超时)。model == "Auto路由链" (兼容历史名 "Auto路由连"/
+  "Auto-mode") 时用第一条启用链; model == 某条启用链的名称时用该链。
+  均按链内顺序做故障转移, 与上游内置 auto 别名无关。
 
 模型列表: 三通道均每日自动同步上游 (/v1/models 无需改代码跟随上游更新)。
   国际版走 /v2/enterprises/personal/models 目录接口。
@@ -46,8 +48,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from providers import build_providers, route_provider
 from anthropic_api import (anthropic_to_openai, openai_to_anthropic,
                            openai_stream_to_anthropic, aggregate_stream)
-from auto_router import (is_auto_model, auto_chat, auto_stream, AutoExhausted,
-                         AUTO_MODEL, load_auto_chain)
+from auto_router import (auto_chat, auto_stream, AutoExhausted,
+                         resolve_auto_chain, load_auto_chains)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -256,10 +258,13 @@ async def list_models(request: Request):
     data = []
     for p in PROVIDERS.values():
         data.extend(p.list_models())
-    # Auto 路由连: 自定义路由链 (仅当已配置链时暴露)
-    chain = load_auto_chain()
-    if chain.get("enabled", True) and (chain.get("models") or []):
-        data.append({"id": AUTO_MODEL, "object": "model", "created": 0,
+    # Auto 路由链: 多条自定义路由链。每条启用且配置了模型的链, 以链名作为
+    # 虚拟模型暴露 (客户端 model 填链名即调用该链)。
+    # ★ 总名 "Auto路由链" 按 master 要求**不再列出**(2026-09-18); 但请求侧
+    #   仍兼容总名/旧名 (resolve_auto_chain 把它们解析为第一条启用链)。
+    chains = [c for c in load_auto_chains() if c.get("enabled", True) and c.get("models")]
+    for _c in chains:
+        data.append({"id": _c["name"], "object": "model", "created": 0,
                      "owned_by": "auto-chain"})
     return {"object": "list", "data": data}
 
@@ -283,8 +288,9 @@ async def chat_completions(request: Request):
 
     model = body.get("model", "")
 
-    # Auto 路由连: 自定义模型路由链 (与平台内置 auto 无关)
-    if is_auto_model(model):
+    # Auto 路由链: 多条自定义模型路由链 (总名 / 链名均可命中, 与平台内置 auto 无关)
+    chain = resolve_auto_chain(model, PROVIDERS)
+    if chain is not None:
         if not body.get("messages"):
             return JSONResponse({"error": {"message": "messages 不能为空",
                                            "type": "invalid_request_error"}}, status_code=400)
@@ -292,17 +298,17 @@ async def chat_completions(request: Request):
 
         async def run_auto_stream():
             try:
-                async for kind, payload in auto_stream(route_provider, PROVIDERS, body):
+                async for kind, payload in auto_stream(route_provider, PROVIDERS, body, chain):
                     if kind == "meta":
                         continue
                     yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
             except AutoExhausted as e:
-                logger.warning("Auto 路由连 全部模型失败: %s", e)
-                err = {"error": {"message": f"Auto路由连 全部模型失败: {e}",
+                logger.warning("Auto 路由链「%s」全部模型失败: %s", chain.get("name"), e)
+                err = {"error": {"message": f"Auto路由链「{chain.get('name')}」全部模型失败: {e}",
                                  "type": "upstream_error"}}
                 yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
             except Exception as e:  # noqa: BLE001
-                logger.exception("Auto 路由连 流式失败")
+                logger.exception("Auto 路由链流式失败")
                 err = {"error": {"message": str(e)[:300], "type": "upstream_error"}}
                 yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
             yield "data: [DONE]\n\n"
@@ -312,12 +318,12 @@ async def chat_completions(request: Request):
                                      headers={"Cache-Control": "no-cache",
                                               "X-Accel-Buffering": "no"})
         try:
-            return JSONResponse(await auto_chat(route_provider, PROVIDERS, body))
+            return JSONResponse(await auto_chat(route_provider, PROVIDERS, body, chain))
         except AutoExhausted as e:
-            return JSONResponse({"error": {"message": f"Auto路由连 全部模型失败: {e}",
+            return JSONResponse({"error": {"message": f"Auto路由链「{chain.get('name')}」全部模型失败: {e}",
                                            "type": "upstream_error"}}, status_code=502)
         except Exception as e:  # noqa: BLE001
-            logger.exception("Auto 路由连 非流式失败")
+            logger.exception("Auto 路由链非流式失败")
             return JSONResponse({"error": {"message": str(e)[:300],
                                            "type": "upstream_error"}}, status_code=502)
 

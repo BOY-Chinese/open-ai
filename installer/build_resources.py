@@ -93,6 +93,10 @@ REQUIRED_ENTRIES = [
     'app_paths.py', 'auto_router.py',
     'providers/__init__.py', 'providers/loomy.py',
     'scripts/task_main.py', 'scripts/loomy_client.py',
+    # v3.2 改动 B（WorkBuddy 国际版网页端活跃）: 签到链路改调 wb_web_daily，
+    # 缺这个脚本 → signin_all 走到国际版分支时 ModuleNotFoundError，被 except
+    # 吞掉只写日志 → **界面全绿但国际版活跃动作彻底不发生**（无任何外部症状）。
+    'scripts/wb_web_daily.py',
     'trae/server.js', 'trae/lib/sscronet.dll',
     'desktop/open-ai-desktop.exe',
     'uninstall.exe',

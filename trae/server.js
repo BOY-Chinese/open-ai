@@ -105,6 +105,10 @@ const CHECK_INTERVAL = 3600 * 1000;
 const HEALTH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0';
 let healthCheckRunning = false;
 
+// 验证结果三态: 'ok'(有效) / 'auth'(token 被上游拒绝) / 'network'(网络或上游异常)
+// ★ 2026-09-19 修复: 旧版把 fetch 异常与 401 混为同一个 false —— 机器唤醒/
+//   网络未就绪的瞬间, 一次网络抖动就把健康账号误标成[已失效], 整通道断连
+//   到下个整点检查才自愈。铁律: **网络异常绝不作为判死依据**。
 async function verifyAccount(acc) {
   try {
     const resp = await fetch(CREDITS_URL, {
@@ -117,14 +121,24 @@ async function verifyAccount(acc) {
       },
       body: JSON.stringify({ require_usage: true, req_source: 1 }),
     });
-    return resp.status === 200;
+    if (resp.status === 200) return 'ok';
+    if (resp.status === 401 || resp.status === 403) return 'auth';
+    console.error(`[健康检查] 验证异常(uid=${acc.uid}): HTTP ${resp.status} (按网络异常处理, 不判失效)`);
+    return 'network';
   } catch (e) {
-    return false;
+    console.error(`[健康检查] 验证网络异常(uid=${acc.uid}): ${e.message} (不判失效)`);
+    return 'network';
   }
 }
 
+// 续期结果: { tok: 新token|null, kind: 'ok'|'no-cookie'|'network'|'auth'|'http-<n>'|'verify-<三态>' }
+// 旧版静默返回 null, 失败原因全黑箱（2026-09-19 排障时无从判断是 cookie 死了
+// 还是网络抖了）—— 现在每个失败分支都落一条原因日志。
 async function renewByCookie(acc) {
-  if (!acc.cookie) return null;
+  if (!acc.cookie) {
+    console.error(`[健康检查] cookie 续期跳过(uid=${acc.uid}): 账号没有 cookie`);
+    return { tok: null, kind: 'no-cookie' };
+  }
   try {
     const resp = await fetch(GET_TOKEN_URL, {
       method: 'POST',
@@ -139,11 +153,16 @@ async function renewByCookie(acc) {
     });
     const j = await resp.json().catch(() => ({}));
     const tok = j && j.Result && j.Result.Token;
-    if (!tok) return null;
-    const ok = await verifyAccount({ token: tok });
-    return ok ? tok : null;
+    if (!tok) {
+      const kind = (resp.status === 401 || resp.status === 403) ? 'auth' : `http-${resp.status}`;
+      console.error(`[健康检查] cookie 续期失败(uid=${acc.uid}): GetUserToken HTTP ${resp.status} 未返回 Token (kind=${kind})`);
+      return { tok: null, kind };
+    }
+    const v = await verifyAccount({ token: tok, uid: acc.uid });
+    return { tok, kind: v === 'ok' ? 'ok' : `verify-${v}` };
   } catch (e) {
-    return null;
+    console.error(`[健康检查] cookie 续期网络异常(uid=${acc.uid}): ${e.message} (不判失效)`);
+    return { tok: null, kind: 'network' };
   }
 }
 
@@ -190,23 +209,31 @@ async function healthCheck(reason) {
     console.log(`[健康检查] ${reason} — 当前 ${ACCOUNTS.length} 个账号, 逐账号验证...`);
     const updatedTokens = {};
     for (const acc of ACCOUNTS) {
-      let ok = await verifyAccount(acc);
+      const v = await verifyAccount(acc);
+      let ok = v === 'ok';
       let note = '有效';
-      if (!ok) {
-        const newTok = await renewByCookie(acc);
-        if (newTok) {
-          acc.token = newTok;
-          updatedTokens[acc.uid] = newTok;
+      if (ok) {
+        acc.invalid = false;
+      } else if (v === 'network') {
+        // 网络/上游异常: 不动现有 invalid 标志, 更不据此判死（旧版误报的根源）
+        note = '网络/上游异常(保留现状态, 不判失效)';
+      } else {
+        const rr = await renewByCookie(acc);
+        if (rr.tok) {
+          acc.token = rr.tok;
+          updatedTokens[acc.uid] = rr.tok;
           ok = true;
           note = 'token 失效 → 已用 cookie 续期复活';
           acc.invalid = false;
+        } else if (rr.kind === 'network' || rr.kind === 'verify-network') {
+          // token 确实失效, 但续期路上网络抖了 —— 死因存疑, 不标记
+          note = 'token 失效但续期遇网络异常(暂不标记失效)';
         } else {
-          // 关键健壮性修复: 验证失败只标记[已失效], 绝不删除账号 / 不写回清空 config
+          // cookie 确认续不动(GetUserToken 拒绝/无 Token/无 cookie):
+          // 关键健壮性修复: 只标记[已失效], 绝不删除账号 / 不写回清空 config
           note = 'token 失效(标记[已失效], 保留账号)';
           acc.invalid = true;
         }
-      } else {
-        acc.invalid = false;
       }
       console.log(`  ${ok ? '✓' : '✗'} ${acc.name || acc.uid} (uid=${acc.uid}) — ${note}`);
     }
@@ -223,6 +250,29 @@ async function healthCheck(reason) {
 // ======================= 动态模型 (启动/每日刷新, 失败回退配置表) =======================
 // 调用上游 get_detail_param 实时拉取 Trae 模型列表, 缓存到内存。
 // 每天至多刷新一次(默认), 拉取失败回退 config.json 的 providers.trae.models。
+
+// ---- 无效模型屏蔽表 (与 ../providers/trae.py 的 MODEL_BLOCKLIST_* 保持一致) ----
+// 上游 get_detail_param 会把一批**不可用**的名字混在 config_info_list 里返回:
+//   1. custom_model_*  —— Trae「自定义模型」功能的槽位/占位配置 (共 15 个:
+//      placeholder / 1M[_text] / 200k[_text] / gemini / vercel[_gemini] / kimi /
+//      gpt-5 / gpt-6 / no-fc / deepseek_v4 / deepseek_chat / deepseek_reasoner)。
+//      真身取决于客户端本地配置, 经网关调用必然失败, 列出来只会误导用户。
+//   2. 内部工具名 —— summary / fast_apply[_new] / title_generation / input_optimization,
+//      是 Trae IDE 自身的辅助能力, 不是给人对话的模型。
+// 在这里(拉取入口)统一剔除, /v1/models 与网关同步结果就都干净了。
+const MODEL_BLOCKLIST_PREFIXES = ['custom_model_'];
+const MODEL_BLOCKLIST_EXACT = new Set([
+  'summary', 'fast_apply', 'fast_apply_new', 'title_generation', 'input_optimization',
+]);
+
+function isUsableModel(name) {
+  // 大小写不敏感: 上游 config_name 大小写不统一 (见 providers/trae.py 同名函数)
+  const n = String(name || '').trim().toLowerCase();
+  if (!n) return false;
+  if (MODEL_BLOCKLIST_EXACT.has(n)) return false;
+  return !MODEL_BLOCKLIST_PREFIXES.some(p => n.startsWith(p));
+}
+
 const MODEL_REFRESH_INTERVAL = (CFG.modelRefreshInterval || 86400) * 1000; // 秒→ms
 let DYNAMIC_MODELS = [];        // 最近一次拉到的上游 config_name 数组
 let DYNAMIC_LAST_OK = 0;        // 上次成功拉取时间戳(ms)
@@ -267,9 +317,15 @@ async function fetchUpstreamModels() {
   }
   const data = await resp.json().catch(() => ({}));
   const list = (data && data.config_info_list) || [];
-  const names = list
+  const raw = list
     .map(c => c && c.config_name)
     .filter(n => typeof n === 'string' && n.length > 0);
+  // 入口剔除无效模型 (custom_model_* / 内部工具名), 见 isUsableModel 注释
+  const names = raw.filter(isUsableModel);
+  const dropped = raw.filter(n => !isUsableModel(n));
+  if (dropped.length > 0) {
+    console.log(`[动态模型] 已屏蔽 ${dropped.length} 个无效模型: ${dropped.slice(0, 8).join(', ')}${dropped.length > 8 ? '...' : ''}`);
+  }
   if (names.length === 0) throw new Error('get_detail_param 返回空模型列表');
   return names;
 }
@@ -451,7 +507,10 @@ async function traeChat(body, handlers) {
     return { error: null, queueTimeout: true, lastPosition };
   }
   // 无回退: 把缓冲的 error/done 按原语义补报给调用方
+  // 修复(2026-09-18): r1.error (看门狗中止/读流异常路径写入的 lastError) 以前从不透传,
+  // 导致"长回答中途被看门狗掐断/客户端中止"也被当成正常 stop 静默收尾 → 半截回复无任何提示。
   if (deferredErr) handlers.onError && handlers.onError(deferredErr);
+  else if (r1 && r1.error) handlers.onError && handlers.onError(r1.error);
   if (deferredDone) handlers.onDone && handlers.onDone(deferredDone);
   return r1;
 }
@@ -485,6 +544,12 @@ async function traeChatOnce(body, configName, modelName, { onOutput, onUsage, on
   // 任一触发都中止上游 —— AbortSignal.any 需要 Node 20+, 本项目 runtime 满足。
   const ac = new AbortController();
   const upstreamSignal = signal ? AbortSignal.any([signal, ac.signal]) : ac.signal;
+  // 看门狗状态: 必须先于重试循环声明! 下面 catch 与「重试耗尽」汇总处都会读它。
+  // 修复(2026-09-18): 原先声明在读流段里, 重试路径一引用就抛 TDZ ReferenceError
+  // ("Cannot access 'watchdogTripped' before initialization"), 导致 3 次重试+轮换账号
+  // 机制整体失效 —— 任何一次 TTNet/Cronet 抖动或 429/5xx 三连都直接炸,
+  // 异常再被流式 handler 的 catch 静默吞掉, 客户端只看到"莫名空回复/半截回复"。
+  let watchdogTripped = null;
   const MAX_ATTEMPTS = 3;
   let resp = null;
   let lastFetchErr = null;
@@ -554,7 +619,7 @@ async function traeChatOnce(body, configName, modelName, { onOutput, onUsage, on
   // 无新字节, 就 abort 上游连接并抛错, 让网关/客户端立刻收到失败,
   // 而不是被自己的心跳喂成无限等待。(排队场景不受影响: 上游每 ~1.16s
   // 就有 request_wait_in_queue 事件, 计时器不断被喂, 不会误杀)
-  let watchdogTripped = null;
+  // watchdogTripped 声明已前移到重试循环之前 (修 TDZ, 见上)
   const armWatchdog = (ms, label) => {
     return setTimeout(() => {
       if (watchdogTripped) return;
@@ -569,6 +634,70 @@ async function traeChatOnce(body, configName, modelName, { onOutput, onUsage, on
     wd = armWatchdog(120000, '读流中断');
   };
 
+  // 单行 SSE 解析 (event:/data: 分发)。抽成独立函数, 是为了流结束后能把
+  // 「最后一行没有换行结尾」的残留事件再走一遍同一套逻辑 (防丢尾巴)。
+  const processLine = (rawLine) => {
+    const line = String(rawLine || '').replace(/\r$/, '');
+    if (line.startsWith('event:')) {
+      currentEvent = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      const data = line.slice(5).trim();
+      if (currentEvent === 'output') {
+        try {
+          const obj = JSON.parse(data);
+          onOutput({
+            response: obj.response || '',
+            reasoning_content: obj.reasoning_content || null,
+            tool_calls: obj.tool_calls || null,
+          });
+        } catch { /* ignore */ }
+      } else if (currentEvent === 'token_usage') {
+        try {
+          const u = JSON.parse(data);
+          onUsage(u);
+        } catch { /* ignore */ }
+      } else if (currentEvent === 'done') {
+        try {
+          const d = JSON.parse(data);
+          if (d.finish_reason) onDone(d.finish_reason);
+        } catch { /* ignore */ }
+      } else if (currentEvent === 'error') {
+        try {
+          const e = JSON.parse(data);
+          lastError = e.message || JSON.stringify(e);
+          console.error('[trae-err] event:error:', lastError.slice(0, 300));
+          onError(lastError);
+        } catch { /* ignore */ }
+      } else if (currentEvent === 'queue_begin') {
+        // 排队开始: 此时只有 queue_id, 还拿不到位次 → 不对外发提示
+        try {
+          const q = JSON.parse(data);
+          if (onQueue) onQueue({ phase: 'begin', queueId: q.queue_id || '', requestUuid: q.request_uuid || '' });
+        } catch { /* ignore */ }
+      } else if (currentEvent === 'request_wait_in_queue') {
+        // 排队等待: 带实时位次 position (实测上游每 ~1.16s 推一条, 位次递但不匀速)
+        try {
+          const q = JSON.parse(data);
+          // 注意 Number(null) === 0 且 isFinite 为真, 必须排除 null/空串
+          const raw = q.position;
+          const pos = (raw === null || raw === undefined || raw === '') ? NaN : Number(raw);
+          if (onQueue && Number.isFinite(pos) && pos > 0) {
+            onQueue({
+              phase: 'wait',
+              position: pos,
+              message: q.message || '',
+              queueId: q.queue_id || '',
+              requestUuid: q.request_uuid || '',
+            });
+          }
+        } catch { /* ignore */ }
+      } else if (currentEvent === 'progress_notice') {
+        // 保活事件 ("Processing_<ts>" / ";Processing"): 仅用于心跳, 不产生内容
+      }
+      currentEvent = null;
+    }
+  };
+
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -576,71 +705,20 @@ async function traeChatOnce(body, configName, modelName, { onOutput, onUsage, on
       FEED();
       buffer += decoder.decode(value, { stream: true });
 
-    let nlIdx;
-    while ((nlIdx = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, nlIdx).replace(/\r$/, '');
-      buffer = buffer.slice(nlIdx + 1);
-
-      if (line.startsWith('event:')) {
-        currentEvent = line.slice(6).trim();
-      } else if (line.startsWith('data:')) {
-        const data = line.slice(5).trim();
-        if (currentEvent === 'output') {
-          try {
-            const obj = JSON.parse(data);
-            onOutput({
-              response: obj.response || '',
-              reasoning_content: obj.reasoning_content || null,
-              tool_calls: obj.tool_calls || null,
-            });
-          } catch { /* ignore */ }
-        } else if (currentEvent === 'token_usage') {
-          try {
-            const u = JSON.parse(data);
-            onUsage(u);
-          } catch { /* ignore */ }
-        } else if (currentEvent === 'done') {
-          try {
-            const d = JSON.parse(data);
-            if (d.finish_reason) onDone(d.finish_reason);
-          } catch { /* ignore */ }
-        } else if (currentEvent === 'error') {
-          try {
-            const e = JSON.parse(data);
-            lastError = e.message || JSON.stringify(e);
-            console.error('[trae-err] event:error:', lastError.slice(0, 300));
-            onError(lastError);
-          } catch { /* ignore */ }
-        } else if (currentEvent === 'queue_begin') {
-          // 排队开始: 此时只有 queue_id, 还拿不到位次 → 不对外发提示
-          try {
-            const q = JSON.parse(data);
-            if (onQueue) onQueue({ phase: 'begin', queueId: q.queue_id || '', requestUuid: q.request_uuid || '' });
-          } catch { /* ignore */ }
-        } else if (currentEvent === 'request_wait_in_queue') {
-          // 排队等待: 带实时位次 position (实测上游每 ~1.16s 推一条, 位次递但不匀速)
-          try {
-            const q = JSON.parse(data);
-            // 注意 Number(null) === 0 且 isFinite 为真, 必须排除 null/空串
-            const raw = q.position;
-            const pos = (raw === null || raw === undefined || raw === '') ? NaN : Number(raw);
-            if (onQueue && Number.isFinite(pos) && pos > 0) {
-              onQueue({
-                phase: 'wait',
-                position: pos,
-                message: q.message || '',
-                queueId: q.queue_id || '',
-                requestUuid: q.request_uuid || '',
-              });
-            }
-          } catch { /* ignore */ }
-        } else if (currentEvent === 'progress_notice') {
-          // 保活事件 ("Processing_<ts>" / ";Processing"): 仅用于心跳, 不产生内容
-        }
-        currentEvent = null;
+      let nlIdx;
+      while ((nlIdx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nlIdx);
+        buffer = buffer.slice(nlIdx + 1);
+        processLine(line);
       }
     }
-  }
+    // 流收尾(修复 2026-09-18): 冲洗 decoder 残留字节 + 解析最后一行没有换行结尾的残留事件。
+    // 以前直接 break 丢弃 buffer —— 上游最后一条事件(常为结尾正文或 done)会被整条丢掉,
+    // 表现为回答结尾"少一句"。
+    buffer += decoder.decode();
+    if (buffer.length > 0) {
+      for (const line of buffer.split('\n')) processLine(line);
+    }
   } catch (e) {
     // 看门狗 abort / 上游读流异常: 明确抛错, 让客户端立刻失败而非无限等待
     if (watchdogTripped) {
@@ -729,15 +807,17 @@ const server = http.createServer(async (req, res) => {
     const makeEntry = (id) => ({ id, object: 'model', created: 0, owned_by: 'trae-proxy' });
     let data;
     if (hasDynamicModels()) {
-      data = DYNAMIC_MODELS.map(makeEntry);
+      // 出口二次屏蔽: 缓存可能是旧版代码拉取时留下的, 或进程内被外部改写
+      data = DYNAMIC_MODELS.filter(isUsableModel).map(makeEntry);
     } else {
-      const fromCfg = Object.entries(CFG.models || {}).map(([id]) => makeEntry(id));
+      const fromCfg = Object.entries(CFG.models || {})
+        .filter(([id]) => isUsableModel(id)).map(([id]) => makeEntry(id));
       // 补上 default_model 与反向别名, 确保 /v1/models 完整
       const seen = new Set(fromCfg.map(e => e.id));
       for (const [alias, name] of Object.entries(CFG.models || {})) {
-        if (!seen.has(name)) { fromCfg.push(makeEntry(name)); seen.add(name); }
+        if (!seen.has(name) && isUsableModel(name)) { fromCfg.push(makeEntry(name)); seen.add(name); }
       }
-      if (CFG.default_model && !seen.has(CFG.default_model)) {
+      if (CFG.default_model && !seen.has(CFG.default_model) && isUsableModel(CFG.default_model)) {
         fromCfg.push(makeEntry(CFG.default_model));
       }
       data = fromCfg;
@@ -781,6 +861,25 @@ const server = http.createServer(async (req, res) => {
           send(openaiChunk(model, id, created, {}, fr || 'stop'));
           res.write('data: [DONE]\n\n');
           res.end();
+        };
+
+        // 错误透传(修复 2026-09-18): 先发一条 OpenAI 风格 error 数据块, 再以
+        // finish_reason='error' 收尾。以前 onError/catch 一律 endStream('stop'),
+        // 上游任何失败(param invalid / model unknown / 服务不可用 / 看门狗掐断 /
+        // 账号池为空 / TDZ 异常…)都被伪装成「正常说完」, 客户端只能看到一条
+        // 莫名为空或半截的回复 —— 这就是 trae 通道"经常返回不全面"的直接根源。
+        // error 块形态与网关 main.py 流式失败时的 {"error":{...}} 保持一致。
+        const endStreamError = (msg) => {
+          if (finished) return;
+          const text = String(msg || 'unknown error');
+          console.error('[trae-err] 流式失败透传给客户端:', text.slice(0, 300));
+          try {
+            send(JSON.stringify({
+              id, object: 'chat.completion.chunk', created, model,
+              error: { message: text.slice(0, 500), type: 'upstream_error', provider: 'trae' },
+            }));
+          } catch { /* 客户端可能已断开, 忽略 */ }
+          endStream('error');
         };
 
         // 排队提示: 只报位次, 禁止百分比/ETA —— 实测位次推进不匀速
@@ -834,13 +933,13 @@ const server = http.createServer(async (req, res) => {
             onUsage: () => {},
             onQueue: onQueueHint,
             onDone: (fr) => endStream(fr),
-            onError: () => endStream('stop'),
+            onError: (msg) => endStreamError(msg),
             signal: clientAbort.signal,
           });
           if (merger.calls.size > 0) endStream('tool_calls');
           else endStream('stop');
         } catch (e) {
-          endStream('stop');
+          endStreamError((e && e.message) || e);
         } finally {
           clearInterval(hb);
         }

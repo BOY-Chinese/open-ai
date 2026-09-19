@@ -394,21 +394,133 @@ def _account_status(acc: dict) -> str:
     return "enabled" if has_cred else "disconnected"
 
 
+# ─────────────────────────── Trae 运行态探测（「真状态」接入） ───────────────────────────
+# 背景（2026-09-19 trae 全通道断连事故）：账号状态原先**纯离线**读 config，
+# trae server 运行时给账号打的 invalid 标志只活在其进程内存里 —— 结果服务
+# 侧已判「账号池全部失效」，本页却永远显示绿「启用」，直接误导排障方向。
+# trae server 专门开了 GET /v1/admin/accounts 暴露 {uid: invalid}
+# （见 trae/server.js「账号管理接口」段），这里把它真正接上。
+
+def _trae_base_url(cfg: dict | None = None) -> str:
+    """trae server 基地址（端口/监听取 config，不写死 18787）。"""
+    seg = ((cfg or {}).get("providers") or {}).get("trae") or {}
+    port = int(seg.get("port") or 18787)
+    host = str(seg.get("listen") or "127.0.0.1")
+    return f"http://{host}:{port}"
+
+
+def _trae_runtime_state(cfg: dict | None = None) -> "dict[str, bool] | None":
+    """拉取 trae server 内存账号态：{uid: invalid}；服务不可达返回 None。
+
+    - 1.5s 超时：探测是锦上添花，账号列表的响应性优先；
+    - 任何异常（连不上/超时/解析失败）一律 None，调用方按「服务未响应」处理。
+    """
+    url = _trae_base_url(cfg) + "/v1/admin/accounts"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        accounts = data.get("accounts") or []
+        return {str(a.get("uid")): bool(a.get("invalid"))
+                for a in accounts if a.get("uid") is not None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _runtime_row_status(base_status: str, uid, runtime, *,
+                        down_detail: str, invalid_detail: str) -> tuple[str, str]:
+    """单行账号的 (status, detail) 终判（叠加通道运行态，通用版）。
+
+    runtime: {uid: invalid} 字典；None 表示通道服务不可用/未注册。
+      - 服务不可用 → disconnected（此刻通道整体不可用, 绿「启用」同样是误导;
+        detail 与「账号失效」区分开 —— 两者修法不同）；
+      - 运行态 invalid=true → disconnected（凭据被上游明确判死）；
+      - 其余 → 维持离线判据 base_status。
+    """
+    if runtime is None:
+        return "disconnected", down_detail
+    if runtime.get(str(uid or "")):
+        return "disconnected", invalid_detail
+    return base_status, ""
+
+
+def _trae_row_status(base_status: str, uid, runtime) -> tuple[str, str]:
+    """单行 Trae 账号的 (status, detail) 终判（_runtime_row_status 的 trae 特化）。"""
+    return _runtime_row_status(
+        base_status, uid, runtime,
+        down_detail="trae 服务未响应(进程未启动或端口不通)",
+        invalid_detail="账号已失效(trae 运行态; 可试「重新连接」)")
+
+
+# config 段名 → main.PROVIDERS 注册键（★ 国际版注册名带连字符, 与段名下划线不同）
+_PROVIDER_INSTANCE_KEYS = {
+    "workbuddy": "workbuddy",
+    "workbuddy_intl": "workbuddy-intl",
+    "loomy": "loomy",
+}
+
+
+def _provider_runtime_state(pkey: str) -> "dict[str, bool] | None":
+    """读网关进程内 provider 的账号运行态 {uid: invalid}。
+
+    - main.py 启动时已把 __main__ 登记为 "main"（见 main.py「先把本模块登记
+      为 main」段）, 这里的 import main 拿到的是**正在服务的同一份 PROVIDERS**；
+    - provider 未注册 / 读取异常 → None（调用方按「通道未加载」标红）。
+    """
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+    except Exception:  # noqa: BLE001  非网关进程(如单测)里 main 不可导入
+        return None
+    prov = providers.get(_PROVIDER_INSTANCE_KEYS.get(pkey, pkey))
+    if prov is None:
+        return None
+    try:
+        return dict(prov.runtime_account_state() or {})
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _channel_runtime(cfg: dict, pkey: str, cache: dict) -> "dict[str, bool] | None":
+    """取通道运行态（懒探测, 每次账号列表调用对每通道只探一次）。
+
+    trae → HTTP 探测内嵌 node 服务; 其余 → 进程内 provider 实例。
+    返回 {uid: invalid}；None = 通道服务不可用/未注册。
+    """
+    if pkey in cache:
+        return cache[pkey]
+    if pkey == "trae":
+        rt = _trae_runtime_state(cfg)
+    else:
+        rt = _provider_runtime_state(pkey)
+    cache[pkey] = rt
+    return rt
+
+
 def _load_accounts_raw() -> list[dict]:
-    """读取三通道账号，产出前端 Account[] 形状（不含联网积分）。
+    """读取四通道账号，产出前端 Account[] 形状（不含联网积分）。
 
     Loomy 特例（2026-09-14 整合）：同一手机号的「桌面账号（session）」与
     「Web 账号（cookies）」在 config 里是两条记录，但它们是同一个人，
     界面合并成**一行** —— 行 id/名字用桌面账号的（`Loomy(手机号)`，
     能鉴权对话的那条）；积分/签到的数据源仍走 Web 账号（见
     refresh_account_credits / accounts_signin）。
+
+    「真状态」（2026-09-19）：四通道账号行均叠加通道运行态 ——
+      trae        → HTTP 探测 node 服务内存 invalid 标志；
+      workbuddy*  → 进程内 provider 的 AccountHealth（chat/refresh 被上游
+                    明确拒绝鉴权时标记）；
+      loomy       → 同上（session 失效时标记）。
+    服务不可用/未注册 → 整通道标红「断连」，detail 区分与「账号失效」。
     """
     cfg = _read_config()
     prov = cfg.get("providers") or {}
     out: list[dict] = []
+    rt_cache: dict[str, "dict[str, bool] | None"] = {}
     for channel, pkey in CHANNEL_TO_PROVIDER.items():
         seg = prov.get(pkey) or {}
         if channel == "Loomy":
+            rt = _channel_runtime(cfg, pkey, rt_cache)
             for phone, g in _loomy_groups(seg.get("accounts") or []).items():
                 d, w = g.get("desktop"), g.get("web")
                 if d:
@@ -420,26 +532,43 @@ def _load_accounts_raw() -> list[dict]:
                     rid, name = _account_id("Loomy", acc, idx), \
                         acc.get("name") or f"Loomy Web({phone})"
                 status, enabled = _loomy_row_state(g)
+                # 行 id 形如 "Loomy:<userid>" —— 剥掉通道前缀即运行态 key
+                status, detail = _runtime_row_status(
+                    status, rid.split(":", 1)[-1], rt,
+                    down_detail="通道服务未加载(provider 未注册)",
+                    invalid_detail="登录态已失效(运行态; 请重新登录)")
                 out.append({
                     "id": rid,
                     "channel": channel,
                     "name": name,
                     "enabled": enabled,
                     "status": status,
+                    "detail": detail,
                     "credits": 0,
                     "workCredits": 0,
                     "refreshedAt": 0,
                 })
             continue
+        rt = _channel_runtime(cfg, pkey, rt_cache)
         for i, acc in enumerate(seg.get("accounts") or []):
             uid = str(acc.get("uid") or acc.get("userId") or acc.get("userid") or "")
             name = acc.get("name") or (uid or f"#{i + 1}")
+            status = _account_status(acc)
+            status, detail = _runtime_row_status(
+                status, uid, rt,
+                down_detail="trae 服务未响应(进程未启动或端口不通)"
+                if channel == "Trae" else "通道服务未加载(provider 未注册)",
+                invalid_detail="账号已失效(trae 运行态; 可试「重新连接」)"
+                if channel == "Trae" else
+                "账号已失效(运行态; 凭据被上游拒绝, 重新登录或重载通道)")
             out.append({
                 "id": _account_id(channel, acc, i),
                 "channel": channel,
                 "name": name,
                 "enabled": acc.get("enabled", True) is not False,
-                "status": _account_status(acc),
+                "status": status,
+                # 断连原因（enabled/disabled 时为空串；前端暂不展示，API 先行）
+                "detail": detail,
                 # credits / workCredits 由「刷新积分」接口填充（需联网）
                 "credits": 0,
                 "workCredits": 0,
@@ -525,6 +654,29 @@ def _run_blocking(coro):
 
 # ─────────────────── 签到补签（供 POST /accounts/signin/refresh 使用） ───────
 
+def _task_shim() -> str:
+    """短命脚本的品牌载体 `open-ai-task.exe` 路径（不存在则返回空串）。
+
+    ★ 为什么源码态也优先用它（2026-09-18 master 要求「纳入 open-ai 进程树」）：
+      shim 是 procname 现场复制的**品牌化解释器副本**，跑起来在任务管理器里
+      显示 `open-ai-task.exe`（描述 "open-ai task (scripts)"、带 open-ai 图标），
+      而 `.venv\\Scripts\\python.exe` 显示为裸 `python.exe` —— 用户看到的
+      「open-ai 到底跑了什么」是断的，且与 gateway/trae/daemon 不一致。
+
+      环境等价性已实测：shim 的 site-packages 经 junction 指向 .venv，
+      `import playwright` 等第三方依赖照常可用（runtime\\pyvenv.cfg 指向真实
+      解释器根）。故品牌化不牺牲任何功能。
+
+      与 `scripts/account_manager._script_py()` 的策略保持一致。
+    """
+    shim = os.path.join(BASE, "runtime", "Scripts", "open-ai-task.exe")
+    if os.path.exists(shim):
+        return shim
+    # 打包态没有 runtime\\ 这一层, 品牌 exe 直接躺在安装根
+    root_shim = os.path.join(BASE, "open-ai-task.exe")
+    return root_shim if os.path.exists(root_shim) else ""
+
+
 def _signin_argv(script_name: str, extra: list[str]) -> list[str]:
     """拼出「跑一个内置脚本」的完整命令行 —— **必须按安装形态分叉**。
 
@@ -534,7 +686,10 @@ def _signin_argv(script_name: str, extra: list[str]) -> list[str]:
     一致：把脚本路径当「路由标记」传给 task shim，由 `task_main` 按文件名
     路由到内置模块。路径参数本身不要求存在。
 
-    源码态则用项目自带 `.venv`，缺失时回落到当前解释器。
+    ★ 源码态（2026-09-18 起）**同样优先用 task shim**：脚本进程因此显示为
+      `open-ai-task.exe`，与 gateway / trae / daemon 同属 open-ai 进程树。
+      shim 缺失（如全新源码检出、尚未跑过 procname.populate）时回落到
+      `.venv` 解释器，再回落到当前解释器 —— 保证任何形态都能跑起来。
     """
     import sys as _sys
     script = os.path.join(BASE, "scripts", script_name)
@@ -542,6 +697,9 @@ def _signin_argv(script_name: str, extra: list[str]) -> list[str]:
         return [os.path.join(BASE, "open-ai-task.exe"), script] + list(extra)
     if not os.path.exists(script):
         raise HTTPException(status_code=501, detail=f"{script_name} 不存在")
+    shim = _task_shim()
+    if shim:
+        return [shim, script] + list(extra)
     exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
     return [exe if os.path.exists(exe) else _sys.executable, script] + list(extra)
 
@@ -576,11 +734,21 @@ def _signin_targets(channel: str | None, signin: dict) -> dict:
     （决定要不要拉起 `--wb-only` / `--trae-only`），pending 是这些账号的
     **id 列表**（与 GET /accounts/signin 的 key 同构，供前端复核补签结果）。
 
-    WorkBuddy 国际版恒不计入 —— 官方无签到渠道（2026-09-13 确认），
-    补签只会白打一次状态探测。
+    WorkBuddy 国际版（2026-09-18 起**纳入**）——
+    此前恒不计入，理由是「官方无签到渠道，补签只白打一次状态探测」。
+    五期实验判决后国际版改走**网页端活跃**路径（`signin_all.py --wb-only`
+    内调用 `scripts/wb_web_daily.py` 发一条 `/console/chat/completions` 对话），
+    该动作确实会触发每日 +30，故 `WorkBuddy_IE` 与国内版合并计一笔 `wb`
+    （两者共用 `--wb-only` 入口，无需新增分支）。
+
+    ⚠️ 但国际版**积分是服务端延迟自动入账**（Bonus Pack，约 03:12 前后到账），
+    发完对话当下 gain 表仍无记录 —— 所以这里把它计入 pending 只是「值得再跑
+    一次活跃动作」，前端复核时会看到它仍不在签到表里，属**正常现象**，
+    不应报成「未签上」；界面对该通道的文案已按此语义单独渲染。
 
     判定依据是**本地凭证的缺席**（GET /accounts/signin 的语义），因此
-    脚本本身仍需自行判定「已签/未参与」，重复调用无副作用。
+    脚本本身仍需自行判定「已签/未参与」，重复调用无副作用
+    （国际版的活跃动作本身也幂等：多发一条对话不影响入账结果）。
     """
     cfg = _read_config()
     prov = cfg.get("providers") or {}
@@ -588,8 +756,6 @@ def _signin_targets(channel: str | None, signin: dict) -> dict:
     for ch, pkey in CHANNEL_TO_PROVIDER.items():
         if channel and ch != channel:
             continue
-        if ch == "WorkBuddy_IE":
-            continue  # 无签到渠道
         seg = prov.get(pkey) or {}
         accounts = seg.get("accounts") or []
         if ch == "Loomy":
@@ -644,9 +810,13 @@ def _history_accounts():
 
 @router.get("/accounts")
 async def list_accounts(channel: str | None = None):
-    """账号列表（只读本地配置，毫秒级）。
+    """账号列表（本地配置 + 四通道运行态叠加）。
 
     channel: Trae / WorkBuddy / WorkBuddy_IE，缺省返回全部。
+
+    ★ 「真状态」（2026-09-19）：每通道叠加一次运行态探测（trae 探 18787
+      内嵌服务、其余读进程内 provider 的 AccountHealth，共 ≤1.5s）——
+      运行态失效或服务不可用的账号标红「断连」，detail 写明原因。
     """
     rows = await _in_thread(_load_accounts_raw)
     if channel and channel != "all":
@@ -678,8 +848,12 @@ async def accounts_signin(channel: str | None = None):
     today_checked_in 或当日入账的资源包，注册/订阅类礼包已排除）。
     这是**客观入账凭证**，比问上游签到接口可靠。
 
-    注：WorkBuddy 国际版无签到渠道（2026-09-13 官方确认，服务端对国际账号
-    恒报 active=false），gain 表天然无记录 → 前端按「无渠道」渲染「—」。
+    注：WorkBuddy 国际版（2026-09-18 起）走的是**网页端活跃**路径 ——
+    `scripts/wb_web_daily.py` 每日发一条 `/console/chat/completions` 对话，
+    由服务端**延迟自动入账** +30（Bonus Pack，约 03:12 前后分批到账）。
+    因此该通道的 gain 表记录**当天发完也不会立刻出现**，
+    「今日积分」按天看才是权威判据；前端对该通道不再渲染「未签到」，
+    而是明确文案「后台自动入账，无法通过刷新主动获取」。
 
     Loomy：不进流水库（usage_collector 不采集），其凭证来自
     `data/loomy_signin_state.json` —— signin_all 每日领取（Web 账号 = 登录
@@ -792,8 +966,11 @@ async def refresh_account_signin(payload: dict = Body(default={})):
 
     实现复用既有脚本，不重复实现协议：
       * WorkBuddy 系（含国际版）：`signin_all.py --wb-only`
-        —— 内部用官方 checkin-activity-status 判定 today_checked_in/active，
-           幂等（已签/未参与直接返回），只在 WB 通道被请求时拉起；
+        —— 国内版用官方 checkin-activity-status 判定 today_checked_in/active，
+           幂等（已签/未参与直接返回）；
+        —— 国际版内部改走 `scripts/wb_web_daily.py` 发一条网页端对话
+           （「真实使用行为」路径，五期实验判决结论），同样幂等；
+        只在 WB 通道被请求时拉起；
       * TRAE：`signin_all.py --trae-only`
         —— 状态查询 + claim，**不做 token 续期**（force 续期会重写
            config.json 里的 token，正是「重新连接」按钮的职责，刷新不该顺带做）；
@@ -1055,9 +1232,14 @@ async def launch_login(payload: dict = Body(default={})):
             exe = os.path.join(BASE, "open-ai-task.exe")
             cmd = [exe, script]
         else:
-            exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
-            if not os.path.exists(exe):
-                exe = sys.executable
+            # ★ 源码态 (2026-09-18 起) 同样优先 task shim —— 登录助手进程
+            #   因此也显示为 open-ai-task.exe, 与 gateway/trae/daemon 一致
+            #   (master 要求「纳入 open-ai 进程树」)。shim 缺失才回落 venv。
+            exe = _task_shim()
+            if not exe:
+                exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
+                if not os.path.exists(exe):
+                    exe = sys.executable
             cmd = [exe, script]
 
         # ★ 必须 CREATE_NO_WINDOW：登录脚本本身只在终端里打印进度，
@@ -1176,7 +1358,28 @@ async def reconnect_accounts(payload: dict = Body(default={})):
         # 这里只要把它拉起来即可（异步、不等待）。
         proc = subprocess.Popen(argv, cwd=BASE, creationflags=flags,  # noqa: S603
                                 stdin=subprocess.DEVNULL)
-        return {"ok": True, "started": True, "pid": proc.pid}
+
+        # ★ Trae 运行态联动（2026-09-19）：顺手触发 trae server 的
+        #   /v1/admin/reconnect —— 它内部立即跑一轮健康检查（重载 config 里的
+        #   最新 token、清掉内存 invalid 标志）并回传账号态。没有这一步，
+        #   signin 续期写回的新 token 要等 trae 侧下个整点检查才被认领
+        #   （getNextAccount 会把内存 invalid 粘回新账号），页面就持续假红。
+        #   失败不阻断：signin_all 已在跑，只是页面状态可能滞后。
+        trae_runtime: dict = {}
+        try:
+            url = _trae_base_url(_read_config()) + "/v1/admin/reconnect"
+            req = urllib.request.Request(
+                url, data=b"{}", method="POST",
+                headers={"Content-Type": "application/json",
+                         "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            trae_runtime = {"ok": True, "accounts": body.get("accounts") or []}
+        except Exception as e:  # noqa: BLE001
+            trae_runtime = {"ok": False, "error": str(e)[:120]}
+
+        return {"ok": True, "started": True, "pid": proc.pid,
+                "traeRuntime": trae_runtime}
 
     return await _in_thread(_work)
 
@@ -1185,6 +1388,21 @@ async def reconnect_accounts(payload: dict = Body(default={})):
 
 # 从「x0.05」「x2.20 credits」「0.8」这类文案里抽出数字
 _CREDIT_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+# 「倍率未知」哨兵值 —— 与「真·0 倍率」在协议层严格区分。
+#
+# 为什么需要它（2026-09-18 master 反馈「国际版 gpt-6-astra 倍率为 0」）:
+#   倍率表的取值有三态，而原实现把后两态压成了同一个 0，界面于是撒谎:
+#     1. 上游给了数字（含 'x0.00'）→ 真·倍率，可能是 0（hy3/hy4-preview 确实免费）
+#     2. 上游目录里根本没有这个模型（如 gpt-6-astra，由 KNOWN_EXTRA 硬编码补入）
+#        → 倍率**从未被拉到**，未知
+#     3. 上游返回了但格式无法解析（'' / 'abc'）→ 未知
+#   2、3 两种必须与 1 区分：实测 gpt-6-astra 调用正常且返回体带 credit 字段，
+#   说明它有倍率，只是这份数据没拿到 —— 显示 0.00 会让人误以为它免费。
+#
+# 取值用 -1 而不是 None：JSON 里 null 会在前端 `?? 0` 之类的兜底处被吞掉，
+# 而倍率不可能是负数，用 -1 当哨兵既安全又能被 `rate < 0` 一眼识别。
+RATE_UNKNOWN = -1.0
 
 
 def _norm_rate_key(name: Any) -> str:
@@ -1203,7 +1421,7 @@ def _norm_rate_key(name: Any) -> str:
 
 
 def _parse_credit_value(raw: Any) -> float | None:
-    """把上游返回的倍率转成数字；无法解析返回 None（调用方跳过该条）。
+    """把上游返回的倍率转成数字；**未知返回 None**（调用方与 RATE_UNKNOWN 区分）。
 
     ★ 为什么不能直接 float()：上游三个通道返回的格式并不统一，实测有
         Trae        0.8                 （已是数字）
@@ -1214,19 +1432,28 @@ def _parse_credit_value(raw: Any) -> float | None:
       **整条记录被静默丢弃**，倍率表里于是只剩那些 credits 为 None 的条目
       （全被算成 0），前端「积分倍率」列因此整列为 0（本机实测 bug）。
       改为「抽出字符串里第一个数字」，前缀与单位都不再影响结果。
+
+    ★★ 2026-09-18 修正 (master 反馈「国际版 gpt-6-astra 倍率为 0」) ★★
+      原实现对 `raw is None` **按 0 记**，于是「上游没给倍率」与「上游明确给
+      了 x0.00」在界面上完全无法区分:
+          hy4-preview / hy3   上游明确返回 'x0.00' → 真·0 倍率（界面该显示 0）
+          gpt-6-astra         目录里没这个模型, 代码补条目时 credits=None
+                              → 倍率**未知**（界面显示 0 是骗人的）
+      实测 gpt-6-astra 可正常调用且返回体带 `credit: 0.05`，即它确实有倍率，
+      只是这份数据从没被拉到过。现在 None → None(未知)，由调用方转成
+      {@link RATE_UNKNOWN} 下发前端，界面显示「--」而不是「0.00」。
     """
     if raw is None:
-        # 上游没给倍率：按 0 记（与旧行为一致），而不是丢弃整条记录
-        return 0.0
+        return None          # 未知，不是 0（见上面 ★★ 注释）
     if isinstance(raw, bool):
         return None
     if isinstance(raw, (int, float)):
-        return float(raw)
+        return float(raw)    # 上游直接给数字，含 0 → 真·0
     m = _CREDIT_NUM_RE.search(str(raw).replace(",", ""))
     if not m:
-        return None
+        return None          # '' / 'abc' 之类无法解析 → 未知
     try:
-        return float(m.group())
+        return float(m.group())   # 'x0.00' → 0.0，真·0
     except ValueError:
         return None
 
@@ -1283,7 +1510,10 @@ def _model_rates() -> dict:
                 continue                       # 单模型失败，跳过
             r = _parse_credit_value(rate)
             if r is None:
-                continue                       # 彻底无法解析才跳过
+                # 解析不出来 = 倍率未知（不是 0），登记哨兵让界面显示「--」。
+                # 不能 continue 丢掉：丢掉会让前端查不到键而落到 `?? 0`，
+                # 又变回「未知显示成 0」——正是本次要修的毛病。
+                r = RATE_UNKNOWN
             _put(table, [cfg_name, model_name, display_name,
                          f"tr-{cfg_name}", f"tr-{model_name}",
                          f"tr-{display_name}"], r)
@@ -1310,7 +1540,9 @@ def _model_rates() -> dict:
                     continue
                 r = _parse_credit_value(credits)
                 if r is None:
-                    continue
+                    # 倍率未知（上游没给 / 解析不出）→ 登记哨兵，界面显示「--」。
+                    # 见 RATE_UNKNOWN 注释：这里正是 gpt-6-astra 显示 0 的源头。
+                    r = RATE_UNKNOWN
                 _put(table, [model_id, display_name,
                              f"{prefix}{model_id}", f"{prefix}{display_name}"], r)
             out[channel] = table
@@ -1462,28 +1694,21 @@ async def refresh_models(payload: dict = Body(default={})):
 
 # ─────────────────────────── 积分 / 流水 ───────────────────────────
 
-# ─────────────────────────── Auto 路由连（虚拟模型路由链） ───────────────────────────
-# config.json:
-#   "auto_chain": {"enabled": true, "timeout": 120, "models": ["tr-...", "wb-...", "loomy-..."]}
-# 虚拟模型名与核心逻辑见 auto_router.py；本端点只做配置读写。
-
-def _load_auto_chain_cfg(cfg: dict | None = None) -> dict:
-    """读取 Auto 路由连配置（归一化后返回）。"""
-    cfg = cfg if cfg is not None else _read_config()
-    ch = cfg.get("auto_chain") or {}
-    try:
-        timeout = int(ch.get("timeout") or 120)
-    except (TypeError, ValueError):
-        timeout = 120
-    return {"enabled": bool(ch.get("enabled", True)),
-            "timeout": timeout,
-            "models": [m for m in (ch.get("models") or []) if m]}
+# ─────────────────────────── Auto 路由链（多条自定义模型路由链） ───────────────────────────
+# config.json (v3.2 多链格式):
+#   "auto_chain": {"chains": [
+#       {"id": "c1726...", "name": "无名1", "enabled": true,
+#        "models": [{"model": "tr-...", "timeout": 120}, ...]}]}
+# 归一化 / 旧单链格式迁移 / 按链名路由的核心逻辑见 auto_router.py；
+# 本端点只做配置读写 + 「检查」探活的编排。
 
 
 @router.get("/auto-chain")
 async def get_auto_chain():
-    """读取 Auto 路由连配置 + 当前全量可选模型（供链编辑界面下拉）。"""
-    chain = _load_auto_chain_cfg()
+    """读取全部路由链 + 当前全量可选模型（供链编辑界面下拉兜底）。"""
+    import auto_router as _ar  # type: ignore
+
+    chains = _ar.load_auto_chains()
     all_models: list[str] = []
     try:
         import main as gateway  # type: ignore
@@ -1495,35 +1720,91 @@ async def get_auto_chain():
                 continue
     except Exception as e:  # noqa: BLE001
         logger.warning("auto-chain 取模型列表失败: %s", e)
-    return {"chain": chain,
+    return {"chains": chains,
             "availableModels": sorted(set(all_models)),
             "ts": _now()}
 
 
 @router.post("/auto-chain")
 async def set_auto_chain(payload: dict = Body(...)):
-    """保存 Auto 路由连配置。body: {enabled, timeout, models[]}。"""
-    models = payload.get("models")
-    if not isinstance(models, list):
-        raise HTTPException(status_code=400, detail="models 必须是数组")
-    models = [str(m).strip() for m in models if str(m).strip()]
-    timeout = payload.get("timeout", 120)
+    """整份保存路由链配置。body: {chains: [{id, name, enabled, models[]}]}。"""
+    import auto_router as _ar  # type: ignore
+
     try:
-        timeout = max(0, int(timeout))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="timeout 必须是整数秒")
+        chains = _ar.sanitize_chains(payload.get("chains"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     def _work() -> dict:
         cfg = _read_config()
-        cfg["auto_chain"] = {
-            "enabled": bool(payload.get("enabled", True)),
-            "timeout": timeout,
-            "models": models,
-        }
+        cfg["auto_chain"] = {"chains": chains}
         _write_config(cfg)
-        return {"ok": True, "chain": cfg["auto_chain"]}
+        return {"ok": True, "chains": cfg["auto_chain"]["chains"]}
 
     return await _in_thread(_work)
+
+
+@router.post("/auto-chain/create")
+async def create_auto_chain():
+    """添加一条新路由链：自动命名为「无名N」（N 取未被占用的最小正整数）。"""
+    import auto_router as _ar  # type: ignore
+
+    def _work() -> dict:
+        cfg = _read_config()
+        # load_auto_chains 兼容旧单链格式（自动迁移为「无名1」），再统一归一化
+        chains = _ar.sanitize_chains(_ar.load_auto_chains(cfg))
+        used = {c["name"] for c in chains}
+        n = 1
+        while f"无名{n}" in used:
+            n += 1
+        created = {"id": _ar.new_chain_id(), "name": f"无名{n}",
+                   "enabled": True, "models": []}
+        chains.append(created)
+        cfg["auto_chain"] = {"chains": chains}
+        _write_config(cfg)
+        return {"ok": True, "chains": chains, "created": created}
+
+    return await _in_thread(_work)
+
+
+@router.post("/auto-chain/check")
+async def check_auto_chain(payload: dict = Body(default={})):
+    """「检查」路由链连通性：对链上每个模型向上游发一条极短探测请求。
+
+    body: {chainId: str, model?: str}
+      - 只传 chainId     → 检查该链上全部模型（并发）；
+      - 再传 model       → 只检查链上这一个模型（右键单模型「检查」）。
+    返回: {results: [{model, status: ok|busy|down, latencyMs, detail}]}
+      ok=正常(绿) busy=繁忙(黄, 限流/5xx/超时) down=断连(红, 其余失败)
+    """
+    import asyncio as _aio
+    import auto_router as _ar  # type: ignore
+    from providers import route_provider as _rp  # type: ignore
+
+    chain_id = str(payload.get("chainId") or "")
+    only_model = str(payload.get("model") or "").strip()
+    chain = next((c for c in _ar.load_auto_chains() if c.get("id") == chain_id), None)
+    if chain is None:
+        raise HTTPException(status_code=404, detail="路由链不存在")
+    targets = chain.get("models") or []
+    if only_model:
+        targets = [m for m in targets if m.get("model") == only_model]
+        if not targets:
+            raise HTTPException(status_code=400, detail="该模型不在这条路由链上")
+    if not targets:
+        raise HTTPException(status_code=400, detail="路由链上没有模型")
+
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"无法访问 PROVIDERS: {e}")
+
+    results = await _aio.gather(*[
+        _ar.check_model(_rp, providers, m["model"], m.get("timeout"))
+        for m in targets
+    ])
+    return {"results": list(results), "ts": _now()}
 
 
 @router.get("/credits/today")
@@ -1974,7 +2255,7 @@ async def list_logs(lines: int = 300):
 
 @router.get("/version")
 async def admin_version():
-    """当前版本 / 更新通道 / 发布仓库。
+    """当前版本 / 通道 / 发布仓库（设置页版本信息卡片的唯一数据源）。
 
     ★ 为什么把 `repo` 也放进来：前端原先自己硬编码了一个 `UPDATE_REPO`
       占位常量用于「检查更新」的提示文案，于是**检查之前**（还没有

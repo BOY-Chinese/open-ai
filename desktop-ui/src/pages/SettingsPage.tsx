@@ -29,9 +29,10 @@ import type { UpdateCheckResult } from '@/types/domain'
  * ★ 仓库名**不再**由前端硬编码。此前这里有一个 `const UPDATE_REPO =
  *   'owner/open-ai'` 占位常量，用于「检查更新」的提示文案 —— 结果是
  *   **点检查之前**界面显示的是 `github.com/owner/open-ai/releases`，
- *   一个并不存在的仓库。真实仓库只有后端知道（`version.py` 的 `UPDATE_REPO`，
- *   可被环境变量 `OPEN_AI_UPDATE_REPO` 覆盖），故改由 `GET /v1/admin/version`
- *   下发；拿不到时提示文案里干脆不写地址，而不是编一个出来。
+ *   一个并不存在的仓库（用户实测反馈：「怎么还是显示 owner/open-ai」）。
+ *   真实仓库只有后端知道（`version.py` 的 `UPDATE_REPO`，可被环境变量
+ *   `OPEN_AI_UPDATE_REPO` 覆盖），故改由 `GET /v1/admin/version` 下发；
+ *   拿不到时提示文案里干脆不写地址，而不是编一个出来。
  */
 
 /**

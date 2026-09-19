@@ -15,7 +15,7 @@
  * 记进去只会用噪声把真正的操作淹掉。这与 v2.3 的行为一致 —— 那里的
  * `_run()` 只包住「用户按下按钮」的动作。
  */
-import type { Channel, ChannelFilter, ModelEntry } from '@/types/domain'
+import type { AutoChain, Channel, ChannelFilter, ModelEntry } from '@/types/domain'
 import { append, runOperation } from '@/lib/oplog'
 
 /**
@@ -93,14 +93,28 @@ const MUTATIONS: Record<
     title: '设置开机自启动',
     detail: (a) => (a[0] ? '开启' : '关闭'),
   },
-  saveAutoChain: {
-    tag: 'Auto路由连',
-    title: '保存模型路由链',
+  // ── 定制：启动 dsh（仅 master 本机使用，不必同步到 dev / portable 发布版）──
+  launchDsh: {
+    tag: '设置',
+    title: '一键启动 DeepSeek Harness',
+  },
+  saveAutoChains: {
+    tag: 'Auto路由链',
+    title: '保存路由链配置',
     detail: (a) => {
-      const chain = (a[0] as { enabled?: boolean; timeout?: number; models?: string[] }) ?? {}
-      const n = chain.models?.length ?? 0
-      return `启用=${chain.enabled ? '是' : '否'} 超时=${chain.timeout ?? '—'}s 模型数=${n}`
+      const chains = (a[0] as AutoChain[] | undefined) ?? []
+      const on = chains.filter((c) => c.enabled).length
+      return `共 ${chains.length} 条（启用 ${on} / 关闭 ${chains.length - on}）`
     },
+  },
+  createAutoChain: {
+    tag: 'Auto路由链',
+    title: '添加新路由链',
+  },
+  checkAutoChain: {
+    tag: 'Auto路由链',
+    title: '检查路由链连通性',
+    detail: (a) => `链=${String(a[0])}${a[1] ? ` 模型=${String(a[1])}` : '（整条链）'}`,
   },
   sendLoomyDesktopCode: {
     tag: '账号',

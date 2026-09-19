@@ -79,23 +79,59 @@ class ReconnectFrozenArgvTest(unittest.TestCase):
         self.assertNotIn('python.exe', joined)
         self.assertNotIn(sys.executable.lower(), joined)
 
-    def test_source_mode_uses_venv_or_current_interpreter(self):
-        """源码态仍走 .venv（缺失才回落当前解释器）—— 两种形态行为都要钉住。"""
+    def test_source_mode_also_branded(self):
+        """源码态也走 task shim（品牌化）—— 2026-09-18 起的行为。
+
+        历史：此处原先断言源码态必须以 `.venv\\Scripts\\python.exe` 拉起。
+        master 要求「把国际版签到脚本纳入 open-ai 进程树」后改为主态优先
+        shim —— 短命脚本进程因此显示 `open-ai-task.exe`，与 gateway / trae /
+        daemon 一致（否则用户在任务管理器里只看到一个裸 python.exe，
+        「open-ai 到底跑了什么」是断的）。
+
+        ⚠️ shim 不存在时必须仍能回落 —— 否则全新源码检出（还没跑过
+           procname.populate）会直接跑不起来。见下一个用例。
+
+        ★ 发布版适配：dev / portable 发布仓**不含 runtime\\**（shim 由
+          procname.populate 现场生成，不入库），故此处无 shim 时跳过「必须
+          品牌化」的断言 —— 那种形态的正确行为恰恰是下一个用例覆盖的回落。
+          本机端（有 shim）该断言照常生效。
+        """
+        if not A._task_shim():
+            self.skipTest('本仓无 runtime\\Scripts\\open-ai-task.exe shim（发布仓形态）')
         _, cap = self._run(frozen=False)
         argv = cap['argv']
         self.assertEqual(os.path.basename(argv[1]), 'signin_all.py')
+        self.assertTrue(argv[0].lower().endswith('open-ai-task.exe'),
+                        f'源码态未品牌化，argv[0]={argv[0]!r}')
+
+    def test_source_mode_falls_back_when_shim_missing(self):
+        """shim 缺失 → 回落 .venv python，再回落当前解释器（不得抛错）。"""
+        with mock.patch.object(A, '_task_shim', return_value=''), \
+                mock.patch.object(sys, 'frozen', False, create=True):
+            argv = A._signin_argv('signin_all.py', ['--wb-only'])
         self.assertTrue(argv[0].lower().endswith('python.exe'), argv[0])
+        self.assertNotIn('open-ai-task', argv[0].lower())
 
     def test_signin_argv_two_modes(self):
-        """_signin_argv 是所有「拉起内置脚本」的唯一出口，两种形态各断言一次。"""
+        """_signin_argv 是所有「拉起内置脚本」的唯一出口，两种形态各断言一次。
+
+        ★ 两种形态现在**都**以 task shim 品牌化开头，区别只在脚本路径参数：
+          打包态是「路由标记」（不要求存在），源码态是真实脚本路径。
+
+        ★ 发布版适配：源码态分支需 shim 存在才有意义（见上一个用例说明）；
+          无 shim 的发布仓跳过该分支，打包态分支照常断言。
+        """
         with mock.patch.object(sys, 'frozen', True, create=True):
             argv = A._signin_argv('usage_collector.py', ['--collect'])
         self.assertTrue(argv[0].lower().endswith('open-ai-task.exe'))
         self.assertEqual(argv[-1], '--collect')
 
+        if not A._task_shim():
+            return  # 发布仓无 shim：源码态品牌化不适用（行为由回落用例覆盖）
         with mock.patch.object(sys, 'frozen', False, create=True):
             argv = A._signin_argv('usage_collector.py', ['--collect'])
-        self.assertTrue(argv[0].lower().endswith('python.exe'))
+        self.assertTrue(argv[0].lower().endswith('open-ai-task.exe'),
+                        f'源码态未品牌化：{argv[0]!r}')
         self.assertEqual(os.path.basename(argv[1]), 'usage_collector.py')
 
 

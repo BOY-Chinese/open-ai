@@ -8,9 +8,11 @@ import type {
   Account,
   ApiKey,
   AutoChain,
+  ChainCheckResult,
   Channel,
   ChannelFilter,
   DailyUsage,
+  DshLaunchResult,
   GatewayInfo,
   ModelEntry,
   SigninBundle,
@@ -185,6 +187,25 @@ let MODELS: ModelEntry[] = [
   { id: 'm-i19', channel: 'WorkBuddy_IE', name: 'primary-model', ratio: 1.2, ratioUnit: '×', routeModelId: 'wbie-primary-model', hidden: false, pinned: false },
   { id: 'm-i20', channel: 'WorkBuddy_IE', name: 'default-model', ratio: 1.0, ratioUnit: '×', routeModelId: 'wbie-default-model', hidden: false, pinned: false },
   // Loomy 模型不进演示数据：演示包只随三通道种子，Loomy 列表一律由真实网关提供
+]
+
+/** 演示用路由链（与真实数据同构：{id, name, enabled, models[{model, timeout}]}） */
+let MOCK_CHAINS: AutoChain[] = [
+  {
+    id: 'c-demo-1',
+    name: '无名1',
+    enabled: true,
+    models: [
+      { model: 'tr-DeepSeek-V4-Flash-Official', timeout: 120 },
+      { model: 'wb-deepseek-v4.1-flash', timeout: 120 },
+    ],
+  },
+  {
+    id: 'c-demo-2',
+    name: '备用链',
+    enabled: false,
+    models: [{ model: 'wb-hy4-preview', timeout: 60 }],
+  },
 ]
 
 /** 生成近 N 天流水（含历史日，便于今日/本周两个视图复用） */function seedUsage(): UsageRow[] {
@@ -465,7 +486,8 @@ export const mockBackend = {
     midnight.setHours(0, 5, 0, 0)
     const ts = Math.floor(midnight.getTime() / 1000)
     const scoped = ACCOUNTS.filter((a) => filter === 'all' || a.channel === filter)
-    // 国际版无签到渠道：既不算 pending，也不会被补成已签到
+    // 国际版：活跃动作会跑（后台每日发一条对话），但积分由服务端**延迟自动入账**，
+    // 因此演示态里不把它补成「已签到」—— 与真实语义一致（刷新拿不到）。
     const pending = scoped.filter(
       (a) => a.channel !== 'WorkBuddy_IE' && (!DEMO_SIGNIN[a.id] || force)
     )
@@ -696,24 +718,52 @@ export const mockBackend = {
     ]
   },
 
-  /* ── Auto 路由连（演示） ── */
-  async getAutoChain(): Promise<{ chain: AutoChain; availableModels: string[] }> {
+  /* ── Auto 路由链（演示） ── */
+  async getAutoChains(): Promise<{ chains: AutoChain[]; availableModels: string[] }> {
     await sleep(LATENCY)
     return {
-      chain: {
-        enabled: true,
-        timeout: 120,
-        models: [
-          'tr-DeepSeek-V4-Flash-Official',
-          'wb-deepseek-v4.1-flash',
-        ],
-      },
+      chains: MOCK_CHAINS.map((c) => ({ ...c, models: c.models.map((m) => ({ ...m })) })),
       availableModels: MODELS.map((m) => m.routeModelId).sort(),
     }
   },
 
-  async saveAutoChain(_chain: AutoChain): Promise<void> {
+  async saveAutoChains(chains: AutoChain[]): Promise<void> {
     await sleep(LATENCY)
+    MOCK_CHAINS = chains.map((c) => ({ ...c, models: c.models.map((m) => ({ ...m })) }))
+  },
+
+  async createAutoChain(): Promise<{ chains: AutoChain[] }> {
+    await sleep(LATENCY)
+    // 与后端同规则：自动命名为「无名N」，N 取未被占用的最小正整数
+    const used = new Set(MOCK_CHAINS.map((c) => c.name))
+    let n = 1
+    while (used.has(`无名${n}`)) n += 1
+    MOCK_CHAINS = [
+      ...MOCK_CHAINS,
+      { id: `c-${Date.now()}`, name: `无名${n}`, enabled: true, models: [] },
+    ]
+    return { chains: MOCK_CHAINS.map((c) => ({ ...c, models: c.models.map((m) => ({ ...m })) })) }
+  },
+
+  async checkAutoChain(chainId: string, model?: string): Promise<{ results: ChainCheckResult[] }> {
+    await sleep(LATENCY * 3)
+    const chain = MOCK_CHAINS.find((c) => c.id === chainId)
+    const targets = chain
+      ? chain.models.filter((m) => !model || m.model === model).map((m) => m.model)
+      : []
+    // 演示数据：大部分「正常」，掺少量「繁忙/断连」让三态都可见
+    const demo: ChainCheckResult['status'][] = ['ok', 'ok', 'ok', 'busy', 'down']
+    return {
+      results: targets.map((m, i) => {
+        const status = demo[(i + m.length) % demo.length]
+        return {
+          model: m,
+          status,
+          latencyMs: 200 + ((i * 137 + m.length) % 900),
+          detail: status === 'ok' ? 'ok' : status === 'busy' ? '模拟限流' : '模拟断连',
+        }
+      }),
+    }
   },
 
   /* ── Loomy 登录（演示） ── */
@@ -804,6 +854,21 @@ export const mockBackend = {
 
   async setAutostart(_enabled: boolean): Promise<void> {
     await sleep(LATENCY)
+  },
+
+  /* ═══════════ 定制：启动 dsh（仅 master 本机使用，不必同步发布版） ═══════════ */
+
+  /** Mock 版：演示模式下模拟一次成功的启动（真实实现见 httpBackend.launchDsh） */
+  async launchDsh(): Promise<DshLaunchResult> {
+    await sleep(LATENCY)
+    return {
+      ok: true,
+      alreadyRunning: false,
+      exitCode: 0,
+      output: '已启动: http://127.0.0.1:3080',
+      url: 'http://127.0.0.1:3080',
+      openedInBrowser: false,
+    }
   },
 
   async getVersion(): Promise<{ current: string; latest?: string; repo?: string }> {

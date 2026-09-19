@@ -30,7 +30,7 @@ export interface NavItem {
 
 /**
  * 导航分两组，中间由 flex spacer 撑开：
- *   顶部组 — 业务高频（账号 / API / 模型 / 积分 / Auto 路由连）
+ *   顶部组 — 业务高频（账号 / API / 模型 / 积分 / Auto 路由链）
  *   底部组 — 低频工具（日志 / 设置）
  */
 export const NAV_TOP: NavItem[] = [
@@ -64,9 +64,9 @@ export const NAV_TOP: NavItem[] = [
   },
   {
     key: 'auto_router',
-    label: 'Auto路由连',
-    title: 'Auto路由连',
-    description: '虚拟模型 Auto路由连：按顺序故障转移的模型路由链',
+    label: 'Auto路由链',
+    title: 'Auto路由链',
+    description: '多条自定义路由链：按链内顺序故障转移的虚拟模型',
     icon: Workflow,
   },
 ]

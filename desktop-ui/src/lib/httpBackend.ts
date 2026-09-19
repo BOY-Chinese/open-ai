@@ -17,9 +17,11 @@ import type {
   Account,
   ApiKey,
   AutoChain,
+  ChainCheckResult,
   Channel,
   ChannelFilter,
   DailyUsage,
+  DshLaunchResult,
   GatewayInfo,
   ModelEntry,
   SigninBundle,
@@ -364,8 +366,18 @@ export const httpBackend = {
       // 路由名去掉通道前缀即上游模型名，用它去倍率表里查
       const bare = m.routeModelId.replace(/^(tr-|wb-|wbie-|lm-|loomy-)/, '')
       const table = rates.rates[m.channel] ?? {}
-      const rate = table[m.routeModelId] ?? table[bare] ?? table[m.name] ?? 0
-      return { ...m, ratio: rate || m.ratio || 0, ...(prefs[m.id] ?? {}) }
+      // ★ 不能用 `?? 0`：查不到（undefined）与「查到 0」是两回事。
+      //   后端用 -1 作「倍率未知」哨兵（见 admin_api.RATE_UNKNOWN），
+      //   这里先取到原始值再判三态，否则「未知」会又变成显示的 0.00。
+      const raw = table[m.routeModelId] ?? table[bare] ?? table[m.name]
+      const known = typeof raw === 'number' && raw >= 0
+      const ratio = known ? raw : 0
+      return {
+        ...m,
+        ratio,
+        ratioKnown: known,
+        ...(prefs[m.id] ?? {}),
+      }
     })
     const all = merged.slice().sort((a, b) => Number(b.pinned) - Number(a.pinned))
     return filterModelView(all, opts?.channel ?? 'all', opts?.showHidden ?? false)
@@ -418,14 +430,30 @@ export const httpBackend = {
     await req('/v1/admin/credits/refresh', { method: 'POST', body: {}, timeoutMs: 120000 })
   },
 
-  /* ═══════════════ Auto 路由连 ═══════════════ */
+  /* ═══════════════ Auto 路由链 ═══════════════ */
 
-  async getAutoChain(): Promise<{ chain: AutoChain; availableModels: string[] }> {
-    return req<{ chain: AutoChain; availableModels: string[] }>('/v1/admin/auto-chain')
+  /** 全部路由链 + 后端当前可选模型（兜底用；主数据源走 listModels 的统一模型列表） */
+  async getAutoChains(): Promise<{ chains: AutoChain[]; availableModels: string[] }> {
+    return req<{ chains: AutoChain[]; availableModels: string[] }>('/v1/admin/auto-chain')
   },
 
-  async saveAutoChain(chain: AutoChain): Promise<void> {
-    await req('/v1/admin/auto-chain', { method: 'POST', body: chain })
+  /** 整份保存路由链数组（启用/关闭、删除、编辑均提交全量） */
+  async saveAutoChains(chains: AutoChain[]): Promise<void> {
+    await req('/v1/admin/auto-chain', { method: 'POST', body: { chains } })
+  },
+
+  /** 添加新路由链：后端自动命名为「无名N」，返回建好后的全量链 */
+  async createAutoChain(): Promise<{ chains: AutoChain[] }> {
+    return req<{ chains: AutoChain[] }>('/v1/admin/auto-chain/create', { method: 'POST', body: {} })
+  },
+
+  /** 「检查」：向上游发极短探测请求。不传 model 检查整条链，传了只查一个模型 */
+  async checkAutoChain(chainId: string, model?: string): Promise<{ results: ChainCheckResult[] }> {
+    return req<{ results: ChainCheckResult[] }>('/v1/admin/auto-chain/check', {
+      method: 'POST',
+      body: { chainId, ...(model ? { model } : {}) },
+      timeoutMs: 60000,
+    })
   },
 
   /* ═══════════════ Loomy 登录（图形化向导用） ═══════════════ */
@@ -490,6 +518,26 @@ export const httpBackend = {
 
   async setAutostart(enabled: boolean): Promise<void> {
     await req('/v1/admin/settings/autostart', { method: 'POST', body: { enabled } })
+  },
+
+  /* ═══════════════ 定制：启动 dsh（仅 master 本机使用，不必同步发布版） ═══════════════ */
+
+  /**
+   * 一键启动 DeepSeek Harness Web GUI（master 个人定制）。
+   *
+   * 后端经 wsl.exe 调 WSL 内的 `bash ~/dsh-web.sh start`（幂等：DSH 已在跑
+   * 时脚本直接返回「已在运行」）。同步等待最长 30s —— dsh web 冷启动几秒内
+   * 就绪，等一下能让 toast 直接报最终结果；后端超时也返回 ok（脚本已转后台）。
+   *
+   * 定制需求：DSH 已在运行时，后端会自动用系统默认浏览器**新开** DSH 页面
+   * （不判断浏览器里是否已有该页），见返回体的 openedInBrowser。
+   */
+  async launchDsh(): Promise<DshLaunchResult> {
+    return req<DshLaunchResult>('/v1/admin/dsh/launch', {
+      method: 'POST',
+      body: {},
+      timeoutMs: 40000, // 后端最多等 30s，留出网络与重试余量
+    })
   },
 
   /**

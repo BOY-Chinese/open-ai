@@ -24,7 +24,7 @@ import uuid
 
 import httpx
 
-from providers.base import Provider, make_chunk_id
+from providers.base import AccountHealth, Provider, make_chunk_id
 
 # 每次 _pick_account 都从 config.json 实时读取启用状态
 # ★ 打包态 __file__ 指向解包临时目录, 相对路径会读错 config —— 钉死安装根。
@@ -128,7 +128,10 @@ def _upstream_headers(account: dict, domain: str, product: str,
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Authorization": f"Bearer {account.get('accessToken', '')}",
-        "X-User-Id": account.get("userId", ""),
+        # ★ 必须非空: 上游 /v3/config 以该头为「出数据」的开关, 空串会让
+        #   data.models 变成 null (模型与倍率全部拿不到)。实测见
+        #   scripts/account_manager._wb_family_model_rates 的注释。
+        "X-User-Id": account.get("userId") or "open-ai",
         "X-Domain": domain,
         "X-Product": product,
         "User-Agent": USER_AGENT,
@@ -204,6 +207,8 @@ class WorkBuddyProvider(Provider):
         self.aliases.update({k: v for k, v in (cfg.get("models") or {}).items()})
         self._client: httpx.AsyncClient | None = None
         self._refresh_lock = asyncio.Lock()
+        # 账号运行态 (2026-09-19): 上游明确拒绝鉴权时标记, 账号管理页展示「真状态」
+        self._health = AccountHealth()
         # ---- 动态模型拉取 (启动/每日刷新, 失败回退静态表) ----
         self._upstream_models: list[str] = []       # 最近一次从 /v3/config 拉到的上游模型名
         self._upstream_fetched_at: float = 0.0      # 上次成功拉取时间戳
@@ -225,8 +230,13 @@ class WorkBuddyProvider(Provider):
             self.accounts = _fresh if _fresh else self.accounts
         except Exception:
             pass  # 读取失败则沿用内存 accounts
-        # 过滤出启用的账号
-        enabled = [a for a in self.accounts if a.get("enabled", True)]
+        # 凭据观察: token 变化(重新登录/续期)自动解除失效标记 (新凭据给新机会)
+        for _a in self.accounts:
+            self._health.observe_token(_a.get("userId"), _a.get("accessToken"))
+        # 过滤出启用的账号, 并跳过运行态已失效的账号 (上游明确判死, 再打也是白打;
+        # 全部失效时返回 {} —— 与 trae 侧「账号池为空」同语义)
+        enabled = [a for a in self.accounts if a.get("enabled", True)
+                   and not self._health.is_invalid(a.get("userId"))]
         if not enabled:
             return {}
         self._req_count += 1
@@ -357,6 +367,11 @@ class WorkBuddyProvider(Provider):
                 if resp.status_code != 200:
                     logger.warning("workbuddy refresh HTTP %s: %s",
                                    resp.status_code, resp.text[:200])
+                    if resp.status_code in (401, 403):
+                        # 刷新凭据本身被上游拒绝 → refreshToken 已死, 标记失效
+                        self._health.mark_invalid(
+                            account.get("userId"),
+                            reason=f"refresh 被拒 HTTP {resp.status_code}")
                     return False
                 data = resp.json().get("data", {})
                 if data.get("accessToken"):
@@ -402,7 +417,14 @@ class WorkBuddyProvider(Provider):
         if resp.status_code != 200:
             err_text = (await resp.aread()).decode("utf-8", errors="replace")
             await resp.aclose()
+            if resp.status_code in (401, 403):
+                # 走到这里 = 首发被拒且刷新重试仍被拒 (或无 refreshToken 可刷)
+                # → 该账号的凭据已被上游判死, 沉淀运行态供账号管理页标红
+                self._health.mark_invalid(
+                    account.get("userId"),
+                    reason=f"chat 被拒 HTTP {resp.status_code} (含刷新重试)")
             raise RuntimeError(f"workbuddy upstream HTTP {resp.status_code}: {err_text[:300]}")
+        self._health.mark_ok(account.get("userId"))
         try:
             async for line in resp.aiter_lines():
                 obj = _parse_sse_line(line)

@@ -4,12 +4,49 @@
 OpenAI 兼容接口（`/v1/chat/completions`、`/v1/models`）与 Anthropic 兼容接口（`/v1/messages`），
 供 Claude Code、CC Switch、OpenAI 客户端等任意兼容工具统一调用。
 
-> **当前版本: v3.0**（`version.py` 单源定义 `APP_VERSION` / `UPDATE_CHANNEL`）
-> - **dev 版**（开源/开发者版）: `APP_VERSION='v3.0-dev'`、通道 `dev`，需自备 Python 3.10+ 运行环境；
-> - **portable 版**（普通用户版）: `APP_VERSION='portable-v3.0'`、通道 `portable`，安装包内建运行时，
+> **当前版本: v3.2**（`version.py` 单源定义 `APP_VERSION` / `UPDATE_CHANNEL`）
+> - **dev 版**（开源/开发者版）: `APP_VERSION='dev-v3.2'`、通道 `dev`，需自备 Python 3.10+ 运行环境；
+> - **portable 版**（普通用户版）: `APP_VERSION='portable-v3.2'`、通道 `portable`，安装包内建运行时，
 >   对电脑运行环境要求大大降低。
 > 两个通道互不干扰，「一键更新」按 `UPDATE_CHANNEL` 在 GitHub Release Assets 中精确匹配对应安装包
 > （dev → `open-ai-installer-dev.exe`；portable → `open-ai-installer-portable.exe`）。
+>
+> **v3.2 起 dev 与 portable 两个通道功能完全一致**，区别只在交付形态（前者装源码、需自备 Python；
+> 后者装冻结 exe + 内建运行时）。因此两个安装包的界面与功能一一对应，无需分别维护功能清单。
+
+## v3.2 更新内容
+
+1. **Auto 路由链多链化**：由原先单条链改为**多条自定义路由链**。请求时 `model` 填链名即可调用该链，
+   链内按顺序故障转移、第一个成功的模型胜出；支持链名自定义、启用/关闭、逐模型超时、
+   右键菜单（编辑 / 检查 / 启用关闭 / 删除），以及行尾展开的模型简报（顺序 · 模型 · 通道 · 三态状态）。
+   「添加新路由链」自动命名「无名N」。`/v1/models` 不再暴露总名「Auto路由链」（请求侧仍兼容）。
+   > v3.2 修订：Auto 路由链页空态文案原先整体贴左（不居中）—— 原因是 `TableEmpty` 渲染的是
+   > `<tr><td>`，却被直接放进 `<div>`，脱离表格布局后匿名表格盒按内容宽度收缩。已补上
+   > `<table><tbody>` 容器修复，实测图标/标题/描述中心与表格中心偏差 0.0px。
+
+2. **一键更新全链路打通**（原实现只有「查 release」，按钮点了不下载也不安装，是半个空壳）：
+   检查 → 下载（后台线程，`.part` 后原子改名并核对 `Content-Length`）→ UAC 提权安装（ShellExecuteExW
+   `runas`）。安装器路径有白名单（只接受 `data\updates\` 下的 exe），防止「以管理员权限运行任意程序」。
+   新增下载进度 / 确认安装对话框。
+3. **版本判定改为数字段比较**：原先 `latest != APP_VERSION` 的字符串不等判断会导致
+   `v3.1` vs `local-v3.1` 恒判有更新、上游更旧时被降级覆盖；现按数字段比较，
+   解析不出数字一律**不提示**更新。
+4. **仓库地址改由后端下发**：修掉「点检查前界面显示 `github.com/owner/open-ai`」这个占位地址；
+   前端删除硬编码 `UPDATE_REPO`，拿不到就不写地址而不是编造。
+5. **Trae「模型返回不全面」修复**：`trae/server.js` 四处修复（`watchdogTripped` TDZ 前移 /
+   `endStreamError` 错误透传 / `traeChat` 转发 `r1.error` / `processLine` 抽取 + SSE 尾包 flush）。
+6. **WorkBuddy 国际版「网页端拿积分」并入**：改走 Cloud Agent（`/console/as/`）活跃路径；
+   前端文案改为「积分由后台自动入账，无法通过刷新主动获取」，刷新提示剔除 `WorkBuddy_IE`
+   （避免延迟入账被每天误报一次失败）。
+7. **Trae 屏蔽无效模型 + 倍率三态**：双层屏蔽 `custom_model_*` 与内部工具名；
+   新增 `RATE_UNKNOWN(-1)` 哨兵，倍率「未知」与「真 0」分开显示（未知显示 `--`，不再显示 `0.00`）；
+   倍率主源换 `/v3/config`（目录接口降为回退）；修 `X-User-Id` 空串缺陷
+   （空串会让 `/v3/config` 静默返回 `models=null`）。
+8. **四通道「真状态」全部打通**：Trae / WorkBuddy / WorkBuddy 国际 / Loomy 接入运行态真实状态
+   （运行态失效或服务未响应标红断连）。`providers/base.py` 新增线程安全 `AccountHealth`；
+   鉴权判死钩子会自动跳过失效账号并在 `observe_token` 时复活；网络异常**绝不判死**。
+9. **Trae 排队透传 / Chromium 登录 / 便携版路径修复 / 刷新逻辑**（v3.1 起）：
+   登录助手优先使用包内自带 Chromium（不再强拉系统 Edge），便携版路径与刷新补签逻辑修正。
 
 ## v3.0 更新内容
 

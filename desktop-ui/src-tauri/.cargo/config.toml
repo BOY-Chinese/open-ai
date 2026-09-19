@@ -2,9 +2,18 @@
 # （本机 rustup 元数据不完整，shim 会报 "Missing manifest"）
 #
 # ★ 用**相对路径**而不是绝对路径: 绝对路径一旦写死, 换机器/换盘符就编译不了,
-#   而本仓库定位为可移植的开发副本。此处相对 src-tauri/ 上溯三级即仓库根。
+#   而本仓库定位为可移植的开发副本。
+#
+# ★★ 上溯级数 = 2（修正 2026-09-19）: cargo 的 rustc 相对路径是**相对
+#   src-tauri/**（cargo 的工作目录即本文件所在目录）解析的，而本仓库层级为
+#   <仓库根>/desktop-ui/src-tauri/ —— 故仓库根 = 上溯两级。
+#   此前写的是 "../../../"（三级），指向 <父目录>/toolchain，实际并不存在：
+#   cargo 报 `could not execute process ...\rustc.exe -vV (never executed)
+#   Caused by: 系统找不到指定的路径 (os error 3)`，exit=101 直接构建失败。
+#   该错误在「toolchain 恰好位于上三级」的私有布局下可能侥幸不暴露，
+#   换到本仓（以及任何标准 clone）必然失败。
 [build]
-rustc = "../../../toolchain/bin/rustc.exe"
+rustc = "../../toolchain/bin/rustc.exe"
 
 [net]
 git-fetch-with-cli = true

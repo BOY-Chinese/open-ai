@@ -62,7 +62,17 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                  #   mock / 演示数据一字未动; 已按本仓 sanitize_known_values.txt
                  #   (14 条真值) 扫描产物: 0 命中 (唯一 sk- 命中是既有的
                  #   DEMO-KEY-NOT-REAL 占位)。
-                 'index-j58bi9IW.js']
+                 'index-j58bi9IW.js',
+                 # BsQeg5Rl: 2026-09-19 **v3.2 全量前端**（dev 仓）—— 本次同步
+                 #   了改动 B/C/D/E 的全部前端:
+                 #     B 国际版文案改「后台自动入账」+ 刷新剔除 WorkBuddy_IE;
+                 #     C AutoRouterPage 整页重做(多链/右键菜单/模型简报三态);
+                 #     D 倍率三态(未知显示 `--` 而非 0.00) + modelCache 兼容旧结构;
+                 #     E 一键更新对话框(下载进度/确认安装) + 删除硬编码仓库地址
+                 #       (改由后端 /v1/admin/version 下发 repo)。
+                 #   由 `node node_modules/vite/bin/vite.js build` 产出(2493 模块),
+                 #   同批 CSS 为 index-fW-_RaXL.css。
+                 'index-BsQeg5Rl.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

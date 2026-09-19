@@ -68,6 +68,24 @@ export function fmtTime(sec: number): string {
   )}`
 }
 
+/**
+ * 字节数 → 人类可读（安装包体积展示用：`34.6 MB`）。
+ *
+ * 用 1024 进制（与 Windows 资源管理器的「MB」一致），保留一位小数；
+ * 小于 1KB 时直接给字节数，避免出现「0.0 KB」这种没有信息量的显示。
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '—'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let v = bytes
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i += 1
+  }
+  return i === 0 ? `${Math.round(v)} B` : `${v.toFixed(1)} ${units[i]}`
+}
+
 /** Date → 'YYYY-MM-DD'（本地时区，避免 toISOString 的 UTC 偏移） */
 export function toDayKey(d: Date): string {
   const p = (n: number) => String(n).padStart(2, '0')

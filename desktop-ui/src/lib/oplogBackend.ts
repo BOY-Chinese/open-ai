@@ -123,6 +123,7 @@ const MUTATIONS: Record<
     detail: (a) => `手机号=${String(a[0])}`,
   },
   checkUpdate: { tag: '更新', title: '检查更新' },
+  startUpdateDownload: { tag: '更新', title: '下载更新包' },
 }
 
 /** 包装后已登记的方法名，用于开发期自检（见下方 withOpLog 末尾） */

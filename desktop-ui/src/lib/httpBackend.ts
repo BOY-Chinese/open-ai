@@ -25,6 +25,9 @@ import type {
   SigninBundle,
   SigninStatus,
   TodayBundle,
+  UpdateCheckResult,
+  UpdatePhase,
+  UpdateState,
   UsageRow,
   WeekBundle,
 } from '@/types/domain'
@@ -489,16 +492,51 @@ export const httpBackend = {
     await req('/v1/admin/settings/autostart', { method: 'POST', body: { enabled } })
   },
 
-  async getVersion(): Promise<{ current: string; latest?: string }> {
-    return req<{ current: string }>('/v1/admin/version')
+  /**
+   * 当前版本 / 通道 / 发布仓库。
+   *
+   * `repo` 由后端下发（`version.py` 的 UPDATE_REPO）—— 前端不再持有仓库常量，
+   * 否则「检查更新」的提示文案在检查之前会显示一个占位假地址。
+   */
+  async getVersion(): Promise<{ current: string; latest?: string; repo?: string }> {
+    return req<{ current: string; repo?: string }>('/v1/admin/version')
   },
 
-  async checkUpdate(): Promise<{ hasUpdate: boolean; latest: string }> {
-    const r = await req<{ current: string; latest?: string; hasUpdate?: boolean }>(
+  async checkUpdate(): Promise<UpdateCheckResult> {
+    const r = await req<Partial<UpdateCheckResult>>(
       '/v1/admin/version/check',
       { method: 'POST', body: {}, timeoutMs: 30000 }
     )
-    return { hasUpdate: !!r.hasUpdate, latest: r.latest ?? r.current }
+    return {
+      current: r.current ?? '',
+      latest: r.latest ?? r.current ?? '',
+      channel: r.channel ?? '',
+      repo: r.repo ?? '',
+      hasUpdate: !!r.hasUpdate,
+      assetMissing: !!r.assetMissing,
+      assetName: r.assetName ?? '',
+      assetSize: r.assetSize ?? 0,
+      notes: r.notes ?? '',
+    }
+  },
+
+  /**
+   * 一键更新第二步：让**后端**把本通道安装包下载到 `data/updates/`。
+   *
+   * 为什么不在前端下载：安装包 34MB（portable 400MB），浏览器 fetch 到内存
+   * 再落盘既慢又吃内存；而后续 UAC 提权也必须由本机进程发起。前端只负责
+   * 轮询进度（见 updateState）与在下载完成后弹确认框。
+   */
+  async startUpdateDownload(): Promise<{ phase: UpdatePhase; version: string }> {
+    const r = await req<{ phase?: UpdatePhase; version?: string }>(
+      '/v1/admin/version/download',
+      { method: 'POST', body: {}, timeoutMs: 30000 }
+    )
+    return { phase: r.phase ?? 'downloading', version: r.version ?? '' }
+  },
+
+  async updateState(): Promise<UpdateState> {
+    return req<UpdateState>('/v1/admin/version/update-state')
   },
 }
 

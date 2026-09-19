@@ -323,6 +323,177 @@ fn open_logs_dir<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
     Ok(dir.to_string_lossy().into_owned())
 }
 
+// ─────────────────────────── 一键更新 ───────────────────────────
+
+/// 判断路径是不是「我们下载下来的更新包」，而不是任意 exe。
+///
+/// 更新包由后端落在 `<安装根>\data\updates\`（见 admin_api.UPDATE_DIR），
+/// 前端把该路径原样回传。这里必须**校验来源目录**：
+/// 该命令会以管理员身份启动一个 exe，若接受任意路径，等于给前端开了一个
+/// 「以管理员权限运行任意程序」的入口 —— 这是绝不能有的能力。
+fn is_update_installer(root: &Path, path: &Path) -> bool {
+    let updates = root.join("data").join("updates");
+    let ok_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| n.to_lowercase().ends_with(".exe"))
+        .unwrap_or(false);
+    if !ok_name || !path.is_file() {
+        return false;
+    }
+    // 父目录必须是 data\updates（比对规范化路径，避免 `..\..` 绕过）
+    match (path.parent().and_then(|p| p.canonicalize().ok()),
+           updates.canonicalize().ok()) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// 以管理员身份启动安装包（触发 UAC），并等它退出。
+///
+/// 为什么用 `ShellExecuteExW` 而不是 `Command::new(exe).spawn()`：
+///   ① 安装包是**带 uac_admin 清单**的 PyInstaller exe，普通 CreateProcess
+///      启动会直接失败（ERROR_ELEVATION_REQUIRED 740）；
+///   ② `runas` 动词才会弹出 UAC 授权框 —— 这正是用户要的「自动请求管理员权限」；
+///   ③ `SEE_MASK_NOCLOSEPROCESS` 拿到子进程句柄，才能知道安装器**什么时候退出**，
+///      从而区分「装完了」与「用户点了 UAC 的否」。
+///
+/// 为什么在独立线程里等、命令立即返回：
+///   `#[tauri::command]` 的同步命令跑在主线程上，阻塞等待会让界面在安装期间
+///   完全卡死（用户看到的是「点了没反应」）。故命令只负责启动 + 记录句柄，
+///   等待与收尾放到线程里。
+#[cfg(windows)]
+fn shell_execute_runas(exe: &Path, param: &str) -> Result<isize, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // ShellExecuteEx 要的是 UTF-16 且以 NUL 结尾的宽字符串。
+    // ★ 这些 Vec 必须活得比 ShellExecuteExW 调用久 —— 故先绑定成局部变量，
+    //   再取 as_ptr()；写成临时值会在语句结束就被释放，指针随即悬空。
+    let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let file = wide(exe.as_os_str());
+    let params: Vec<u16> = param.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
+    let dir = wide(exe.parent().unwrap_or(Path::new(".")).as_os_str());
+
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.lpDirectory = dir.as_ptr();
+    info.nShow = SW_SHOWNORMAL;
+
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        // 1223 (ERROR_CANCELLED) = 用户在 UAC 框上点了「否」——
+        // 这不是故障，必须与真正的启动失败区分开，否则用户看到的是
+        // 一句莫名其妙的「操作已被用户取消」加一串错误码。
+        if err.raw_os_error() == Some(1223) {
+            return Err("已取消：未通过 UAC 管理员授权".to_string());
+        }
+        return Err(format!("启动安装包失败：{err}"));
+    }
+    // hProcess 是内核对象句柄（不是栈上指针），返回给调用方后依然有效，
+    // 由等待线程负责 CloseHandle。
+    Ok(info.hProcess as isize)
+}
+
+#[cfg(not(windows))]
+fn shell_execute_runas(_exe: &Path, _param: &str) -> Result<isize, String> {
+    Err("一键更新仅支持 Windows".to_string())
+}
+
+/// 一键更新第三步：以管理员身份运行已下载的安装包，随后退出桌面端。
+///
+/// 顺序（每一步都是必需的，顺序错了就会「安装失败但看不出原因」）：
+///   1. 校验路径确实位于 `data\updates\`（见 is_update_installer）；
+///   2. **先启动安装器**（UAC 框此时弹出，安装包还没碰任何文件）；
+///   3. 用户点「是」之后：把网关 / trae node / 定时任务**全部停掉**，
+///      否则安装器覆盖 exe / .venv 时文件被占用 → 安装到一半失败；
+///   4. 桌面端自己退出，让出 `desktop\open-ai-desktop.exe` 的占用。
+///
+/// ★ 第 3 步必须等 UAC 通过之后再做：若用户在 UAC 上点「否」，
+///   安装器根本没启动（`ShellExecuteExW` 直接返回 ERROR_CANCELLED，
+///   本函数会当场报错，线程压根不会起），此时绝不能先把后端停掉。
+///   线程里再等 3 秒确认安装器仍在运行，才动手收尾。
+#[tauri::command]
+fn install_update<R: Runtime>(app: AppHandle<R>, path: String) -> Result<String, String> {
+    let root = find_root()
+        .ok_or_else(|| "未找到 open-ai 安装目录，无法启动更新包".to_string())?;
+    let exe = PathBuf::from(&path);
+    if !is_update_installer(&root, &exe) {
+        return Err(format!(
+            "更新包路径不合法（只允许 data\\updates\\ 下的安装包）：{path}"
+        ));
+    }
+
+    // 把当前安装目录传给安装器：它是「覆盖安装」，装到别处等于装了两份
+    let param = format!("--dir \"{}\"", root.display());
+    let handle = shell_execute_runas(&exe, &param)?;
+
+    let root_for_thread = root.clone();
+    let exe_display = exe.display().to_string();
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+
+            let h = handle as HANDLE;
+            // UAC 授权框停留期间安装器进程已经存在（但还没开始动文件）。
+            // 等 3 秒：没退出就说明用户已授权，可以安全地停后端了。
+            //
+            // ★ 为什么必须「先等再停」而不是启动后立刻停：
+            //   用户可能在这 3 秒内点掉 UAC（选「否」）或立刻关掉安装器窗口。
+            //   那种情况下把网关停掉纯属白白打断用户 —— 一次更新点击就变成
+            //   「服务莫名断了」。只有确认安装器真的在跑，才值得为它让路。
+            let alive = if h.is_null() {
+                true
+            } else {
+                // WAIT_TIMEOUT(258) 表示仍在运行；WAIT_OBJECT_0(0) 表示已退出
+                unsafe { WaitForSingleObject(h, 3000) != 0 }
+            };
+            if !alive {
+                // 安装器已退出（UAC 被拒或用户立刻关闭）→ 什么都不动，
+                // 界面继续运行，由用户自行决定是否重试。
+                if !h.is_null() {
+                    unsafe { CloseHandle(h) };
+                }
+                return;
+            }
+
+            // 停止全部后端：安装器要覆盖 gateway/daemon/venv，占用会导致失败
+            stop_all_backends(&root_for_thread);
+            // 再等 2 秒让 bootstrap stop 走完（优雅广播 → Job 兜底）
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+
+            // 让出 exe 占用：桌面端不退出，安装器删不掉旧的 desktop\open-ai-desktop.exe
+            QUITTING.store(true, Ordering::SeqCst);
+            app.exit(0);
+
+            // 进程即将退出；若将来改成「安装后自行重启界面」，等待与句柄回收放这里
+            if !h.is_null() {
+                let _ = unsafe { WaitForSingleObject(h, INFINITE) };
+                unsafe { CloseHandle(h) };
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (handle, exe_display);
+        }
+    });
+
+    Ok(format!("已请求管理员权限启动安装包：{exe_display}"))
+}
+
 /// 返回应用版本号（系统设置页「版本信息」卡片使用）
 #[tauri::command]
 fn app_version() -> String {
@@ -438,6 +609,7 @@ pub fn run() {
             start_backend,
             open_logs_dir,
             uninstall_app,
+            install_update,
             app_version
         ])
         .setup(|app| {

@@ -14,21 +14,25 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Skeleton } from '@/components/ui/skeleton'
 import { AppearanceDialog, THEME_MODE_LABEL } from '@/components/settings/AppearanceDialog'
+import { UpdateDialog } from '@/components/settings/UpdateDialog'
 import { useToast } from '@/components/feedback/Toast'
 import { useAsync } from '@/hooks/useAsync'
 import { useTheme } from '@/hooks/useTheme'
 import { backend } from '@/lib/dataSource'
 import { formatVersion } from '@/lib/utils'
 import { inTauri } from '@/lib/gateway'
+import type { UpdateCheckResult } from '@/types/domain'
 
 /**
- * 发布仓库（owner/repo）—— 仅用于「检查更新」的提示文案。
+ * 版本信息卡片的数据源说明
  *
- * 保持占位值是有意的：仓库归属由发布者决定，把某个人的 GitHub 账号写死进
- * 前端产物就等于把身份信息随安装包公开。发布时改这一处即可。
- * （后端查询最新的仓库名走 version.py 的 UPDATE_REPO，两者改一处要同步。）
+ * ★ 仓库名**不再**由前端硬编码。此前这里有一个 `const UPDATE_REPO =
+ *   'owner/open-ai'` 占位常量，用于「检查更新」的提示文案 —— 结果是
+ *   **点检查之前**界面显示的是 `github.com/owner/open-ai/releases`，
+ *   一个并不存在的仓库。真实仓库只有后端知道（`version.py` 的 `UPDATE_REPO`，
+ *   可被环境变量 `OPEN_AI_UPDATE_REPO` 覆盖），故改由 `GET /v1/admin/version`
+ *   下发；拿不到时提示文案里干脆不写地址，而不是编一个出来。
  */
-const UPDATE_REPO = 'owner/open-ai'
 
 /**
  * 版本号格式化统一在 `lib/utils.ts` 的 {@link formatVersion}（侧边栏与设置页
@@ -85,19 +89,21 @@ export function SettingsPage() {
     [autostart, setAutostartState, toast]
   )
 
-  /* ── 第 2 块：版本信息 ── */
+  /* ── 第 2 块：版本信息 + 一键更新 ── */
   const {
     data: version,
     loading: versionLoading,
     error: versionError,
-  } = useAsync<{ current: string; latest?: string }>(
+  } = useAsync<{ current: string; latest?: string; repo?: string }>(
     () => backend.getVersion(),
     [],
     { current: '' }
   )
   const [updating, setUpdating] = useState(false)
-  /** 检查到更新后按钮下次点击的目标版本，空串表示尚未发现新版本 */
-  const [pendingVersion, setPendingVersion] = useState('')
+  /** 检查结果（含本通道安装包信息）；null 表示尚未检查 */
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null)
+  /** 更新对话框开关（下载 / 安装都在对话框内完成） */
+  const [updateOpen, setUpdateOpen] = useState(false)
 
   /**
    * 展示文案：拿到版本号就原样显示（`dev-v3.1`），拿不到就明确写「读取失败」
@@ -111,19 +117,44 @@ export function SettingsPage() {
         ? '读取失败'
         : '未知'
 
-  /** 一键更新：检查 → 有更新则提示并切换按钮文案，全程不阻塞 UI */
+  /**
+   * 一键更新第一步：检查是否有**更新的**版本。
+   *
+   * 判定与「挑哪个安装包」都在后端做（见 admin_api.check_update）：
+   *   - 只有 release 版本号严格新于本机才算有更新 —— 同版本（`v3.1` vs
+   *     `local-v3.1`）与更旧版本都不再误报，避免「点一次下载一次、装完没变化」；
+   *   - 同时按 UPDATE_CHANNEL 匹配安装包，匹配不到就当场说清，
+   *     而不是等下载完才发现通道不对。
+   *
+   * 有更新 → 打开更新对话框（下载进度与安装确认都在里面）；
+   * 无更新 → 一条 toast 收尾，不弹窗打扰。
+   */
   const handleCheckUpdate = useCallback(async () => {
     setUpdating(true)
     try {
       const result = await backend.checkUpdate()
+      setUpdateInfo(result)
       const latest = formatVersion(result.latest)
-      if (!result.hasUpdate) {
-        setPendingVersion('')
-        toast(`当前已是最新版本 ${latest}`, 'info')
-      } else {
-        setPendingVersion(latest)
-        toast(`发现新版本 ${latest}，开始下载...`, 'success')
+
+      if (result.assetMissing) {
+        // 有新版本但这条通道没有包：这不是用户的错，必须给可执行的下一步
+        toast(
+          `发现 ${latest}，但该发布中没有 ${result.channel} 通道的安装包，请稍后再试`,
+          'warn',
+          6000
+        )
+        return
       }
+      if (!result.hasUpdate) {
+        toast(
+          result.notes
+            ? `检查更新失败：${result.notes}`
+            : `当前已是最新版本 ${latest}`,
+          result.notes ? 'error' : 'info'
+        )
+        return
+      }
+      setUpdateOpen(true)
     } catch (e) {
       toast(
         `检查更新失败：${e instanceof Error ? e.message : String(e)}`,
@@ -274,21 +305,42 @@ export function SettingsPage() {
 
               <CardSection
                 label="检查更新"
-                hint={`检查并更新到 GitHub 最新发布版本 (github.com/${UPDATE_REPO}/releases)。`}
+                hint={
+                  /* 仓库名取自后端（检查过则用检查结果里的，更权威）；
+                     两者都没有时只描述动作，不编造地址 */
+                  (() => {
+                    const repo = updateInfo?.repo || version.repo
+                    return repo
+                      ? `检查并更新到 GitHub 最新发布版本 (github.com/${repo}/releases)。`
+                      : '检查并更新到 GitHub 最新发布版本。'
+                  })()
+                }
               >
-                <Button
-                  variant="default"
-                  size="lg"
-                  loading={updating}
-                  onClick={() => void handleCheckUpdate()}
-                >
-                  {!updating && <Download />}
-                  {updating
-                    ? '检查中...'
-                    : pendingVersion
-                      ? `更新到 ${pendingVersion}`
-                      : '一键更新'}
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="default"
+                    size="lg"
+                    loading={updating}
+                    onClick={() => void handleCheckUpdate()}
+                  >
+                    {!updating && <Download />}
+                    {updating
+                      ? '检查中...'
+                      : updateInfo?.hasUpdate
+                        ? `更新到 ${formatVersion(updateInfo.latest)}`
+                        : '一键更新'}
+                  </Button>
+                  {/* 已有下载好的安装包时，不重新检查也能直接进安装流程 */}
+                  {updateInfo?.hasUpdate && !updating && (
+                    <Button
+                      variant="outline"
+                      size="lg"
+                      onClick={() => setUpdateOpen(true)}
+                    >
+                      查看更新详情
+                    </Button>
+                  )}
+                </div>
               </CardSection>
             </CardContent>
           </Card>
@@ -322,6 +374,15 @@ export function SettingsPage() {
 
       {/* ═══════════ 外观设置对话框 ═══════════ */}
       {appearanceOpen && <AppearanceDialog onClose={() => setAppearanceOpen(false)} />}
+
+      {/* ═══════════ 一键更新对话框（下载 → 确认 → 提权安装）═══════════ */}
+      {updateOpen && updateInfo && (
+        <UpdateDialog
+          info={updateInfo}
+          onClose={() => setUpdateOpen(false)}
+          onVersionKnown={(v) => setUpdateInfo((prev) => (prev ? { ...prev, latest: v } : prev))}
+        />
+      )}
 
       {/* ═══════════ 卸载二次确认对话框 ═══════════ */}
       {confirmOpen && (

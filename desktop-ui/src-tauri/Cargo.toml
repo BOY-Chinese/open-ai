@@ -28,6 +28,22 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# windows-sys：一键更新要经 ShellExecuteExW 以 runas 动词启动安装包
+#   —— 安装包带 uac_admin 清单，普通 CreateProcess 会直接失败
+#   (ERROR_ELEVATION_REQUIRED 740)，只有 runas 才会弹出 UAC 授权框；
+#   再用 WaitForSingleObject 等安装器退出，以区分「装完了」与「用户点了否」。
+#   仅 Windows 目标引入，不影响其它平台构建。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    # SHELLEXECUTEINFOW 的 hkeyClass 字段是 HKEY，windows-sys 把整个结构体
+    # 挂在这个 feature 下 —— 少它就会报「no SHELLEXECUTEINFOW in Shell」。
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [features]
 # custom-protocol 是 Tauri 的**生产构建开关**：
 #   启用 → 前端资源经 tauri:// 协议从二进制内嵌资源加载（无需 dev server）

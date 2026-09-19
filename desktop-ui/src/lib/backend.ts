@@ -16,6 +16,9 @@ import type {
   SigninBundle,
   SigninStatus,
   TodayBundle,
+  UpdateCheckResult,
+  UpdatePhase,
+  UpdateState,
   UsageRow,
   WeekBundle,
 } from '@/types/domain'
@@ -803,16 +806,47 @@ export const mockBackend = {
     await sleep(LATENCY)
   },
 
-  async getVersion(): Promise<{ current: string; latest?: string }> {
+  async getVersion(): Promise<{ current: string; latest?: string; repo?: string }> {
     await sleep(LATENCY / 2)
     // 与 version.py 的 APP_VERSION 保持一致的形状（真实版 dev-v3.1）：
     // 演示模式若落后一个版本，视觉回归就会把「版本号显示错」当成正常。
-    return { current: 'dev-v3.1' }
+    // repo 与真实契约同形：演示态也用占位仓库，避免演示数据被当成真实发布地址。
+    return { current: 'dev-v3.1', repo: 'owner/open-ai' }
   },
 
-  async checkUpdate(): Promise<{ hasUpdate: boolean; latest: string }> {
+  async checkUpdate(): Promise<UpdateCheckResult> {
     await sleep(LATENCY * 3)
-    return { hasUpdate: false, latest: 'dev-v3.1' }
+    // 演示模式：恒定「已是最新」，避免视觉回归把「有更新」的状态当成正常；
+    // 字段形状与真实后端一致（见 domain.ts 的 UpdateCheckResult）。
+    return {
+      current: 'dev-v3.1',
+      latest: 'dev-v3.1',
+      channel: 'dev',
+      repo: 'owner/open-ai',
+      hasUpdate: false,
+      assetMissing: false,
+      assetName: 'open-ai-installer-dev.exe',
+      assetSize: 0,
+      notes: '',
+    }
+  },
+
+  async startUpdateDownload(): Promise<{ phase: UpdatePhase; version: string }> {
+    await sleep(LATENCY)
+    return { phase: 'downloading', version: 'dev-v3.1' }
+  },
+
+  async updateState(): Promise<UpdateState> {
+    return {
+      phase: 'idle',
+      percent: 0,
+      received: 0,
+      total: 0,
+      version: '',
+      path: '',
+      error: '',
+      ts: Date.now() / 1000,
+    }
   },
 }
 

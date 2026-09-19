@@ -26,7 +26,10 @@ import json
 import logging
 import os
 import re
+import sys
+import threading
 import time
+import urllib.request
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException
@@ -62,6 +65,188 @@ def _update_repo() -> str:
 
 
 UPDATE_REPO = _update_repo()
+
+
+def _update_channel() -> str:
+    """更新通道（dev / portable），决定在 release assets 里挑哪个安装包。"""
+    try:
+        if BASE not in sys.path:
+            sys.path.insert(0, BASE)
+        from version import UPDATE_CHANNEL as _c  # type: ignore
+        return str(_c or "dev").strip() or "dev"
+    except Exception:  # noqa: BLE001
+        return "dev"
+
+
+UPDATE_CHANNEL = _update_channel()
+
+
+def _app_version() -> str:
+    """当前版本号（读不到时返回 unknown，绝不写死常量）。"""
+    try:
+        if BASE not in sys.path:
+            sys.path.insert(0, BASE)
+        from version import APP_VERSION  # type: ignore
+        return str(APP_VERSION or "unknown")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+# ─────────────────────── 一键更新：版本比较 / 安装包匹配 ───────────────────────
+#
+# ★ 为什么需要「版本比较」而不是简单的 `latest != current`：
+#   原实现用**字符串不等**判定更新（`has = latest != APP_VERSION`），于是
+#   ① 发布通道 tag 是 `v3.1` 而本机 APP_VERSION 是 `local-v3.1` → 恒判「有更新」，
+#      用户点一次下载一次，装完还是同一个版本；
+#   ② 上游比本机旧（或本地是 dev 而 release 是 portable）同样判「有更新」，
+#      一键更新会**降级覆盖**用户手上的新版本。
+#   现改为提取数字段做真比较（见 _version_tuple / _is_newer）。
+
+_VERSION_NUM_RE = re.compile(r"\d+")
+
+
+def _version_tuple(text: Any) -> tuple:
+    """把版本串归一化成可比较的数字元组。
+
+    只取数字段并去掉末尾的 0：`v3.1` / `dev-v3.1` / `3.1.0` 全部得到 (3, 1)，
+    从而「发布通道 tag」与「本机定制版本号」能正确对齐；`v3.10` → (3, 10)
+    也天然大于 `v3.9`（字符串比较会得到相反的错误结论）。
+    """
+    nums = [int(x) for x in _VERSION_NUM_RE.findall(str(text or ""))]
+    while nums and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums)
+
+
+def _is_newer(latest: Any, current: Any) -> bool:
+    """latest 是否**严格新于** current（同版本、更旧版本一律 False）。"""
+    a, b = _version_tuple(latest), _version_tuple(current)
+    if not a or not b:
+        return False          # 任一侧解析不出数字 → 不敢断言有更新
+    return a > b
+
+
+def _pick_asset(assets: list, channel: str) -> dict | None:
+    """在 release assets 中按通道精确匹配安装包。
+
+    匹配规则（与 README 的承诺一致）：
+      1. 文件名含 `installer`（只认安装包，不认 sha256 / 说明文件）；
+      2. 文件名含通道关键词（dev → `dev`；portable → `portable`）；
+      3. 都命中时取第一个 —— release 里同名资产只会有一个。
+    取不到返回 None，由调用方明确报错，**绝不回落到「随便下一个」**：
+    给 portable 用户下 dev 包等于装上一个跑不起来的版本。
+    通道为空同样返回 None —— 「没有通道」不是「dev 通道」，
+    兜底默认值只该出现在 `_update_channel()` 这一处。
+    """
+    ch = (channel or "").strip().lower()
+    if not ch:
+        return None
+    for a in assets or []:
+        name = str((a or {}).get("name") or "").lower()
+        if "installer" in name and ch in name and name.endswith(".exe"):
+            return a
+    return None
+
+
+def _fetch_latest_release() -> dict:
+    """查 GitHub 最新 release（返回 {tag, assets, error}，失败不抛）。"""
+    url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+    req_ = urllib.request.Request(
+        url, headers={"Accept": "application/vnd.github+json",
+                      "User-Agent": "open-ai-gateway"})
+    try:
+        with urllib.request.urlopen(req_, timeout=10) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return {"tag": data.get("tag_name") or "",
+                "assets": data.get("assets") or [], "error": ""}
+    except Exception as e:  # noqa: BLE001
+        logger.info("查询 release 失败: %s", e)
+        return {"tag": "", "assets": [], "error": str(e)}
+
+
+# 更新包落盘目录：`data/updates/`（随安装目录走，卸载时一并清理）
+UPDATE_DIR = os.path.join(BASE, "data", "updates")
+
+# 单次下载的进度状态（进程内共享）。
+#
+# ★ 为什么用模块级状态而不是让前端自己下载：
+#   安装包 34MB（portable 400MB），浏览器 fetch 到内存再落盘既慢又吃内存；
+#   且 UAC 提权必须由**本机进程**发起，浏览器里做不到。故下载放后端，
+#   前端只轮询进度、点确认。
+#
+# ★ 相位只覆盖「下载」这一件事，**不含安装**：
+#   安装是桌面端经 Tauri 命令 `install_update` 发起的（见 Rust lib.rs），
+#   外部工具根本调不到它，所以「launching / 安装完成回报」这类相位没有
+#   任何生产者 —— 与其留一个永远为空的空壳，不如让状态机只管下载。
+#   安装过程中的「等待安装程序」由前端本地状态表达（见 UpdateDialog）。
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_STATE: dict = {
+    "phase": "idle",       # idle | downloading | ready | error
+    "percent": 0.0,
+    "received": 0,
+    "total": 0,
+    "version": "",
+    "path": "",
+    "error": "",
+    "ts": 0.0,
+}
+
+
+def _update_state_set(**kw) -> None:
+    with _UPDATE_LOCK:
+        _UPDATE_STATE.update(kw)
+        _UPDATE_STATE["ts"] = time.time()
+
+
+def _update_state_get() -> dict:
+    with _UPDATE_LOCK:
+        return dict(_UPDATE_STATE)
+
+
+def _download_installer(url: str, dest: str, version: str) -> None:
+    """后台线程：下载安装包到 data/updates/ 并更新进度状态。
+
+    ★ 先写 `.part` 再原子改名：中途断网 / 用户关掉网关时，目录里留下的
+      是半个 `.part`，而不是一个**看起来完整、运行起来报错**的 exe。
+    """
+    tmp = dest + ".part"
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        req_ = urllib.request.Request(
+            url, headers={"User-Agent": "open-ai-gateway"})
+        with urllib.request.urlopen(req_, timeout=60) as resp:  # noqa: S310
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            _update_state_set(phase="downloading", percent=0.0, received=0,
+                              total=total, version=version, path=dest,
+                              error="")
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    pct = (done / total * 100.0) if total else 0.0
+                    _update_state_set(received=done, percent=round(pct, 1))
+        # 字节数对不上（服务端 Content-Length 与实际不符）视为失败
+        if total and os.path.getsize(tmp) != total:
+            raise RuntimeError("下载不完整：收到 %d 字节，应为 %d"
+                               % (os.path.getsize(tmp), total))
+        os.replace(tmp, dest)
+        _update_state_set(phase="ready", percent=100.0,
+                          received=os.path.getsize(dest),
+                          total=os.path.getsize(dest))
+        logger.info("更新包下载完成: %s", dest)
+    except Exception as e:  # noqa: BLE001
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:  # noqa: BLE001
+            pass
+        _update_state_set(phase="error", error=str(e))
+        logger.warning("更新包下载失败: %s", e)
+
 
 # 通道键（对外） → config.json providers 段键（对内）
 CHANNEL_TO_PROVIDER = {
@@ -1789,15 +1974,18 @@ async def list_logs(lines: int = 300):
 
 @router.get("/version")
 async def admin_version():
+    """当前版本 / 更新通道 / 发布仓库。
+
+    ★ 为什么把 `repo` 也放进来：前端原先自己硬编码了一个 `UPDATE_REPO`
+      占位常量用于「检查更新」的提示文案，于是**检查之前**（还没有
+      `updateInfo`）界面显示的是 `github.com/owner/open-ai/releases` ——
+      与真实发布仓库不一致，用户看到的是个假地址。仓库名只有后端知道
+      （`version.py` 的 `UPDATE_REPO`，可用环境变量覆盖），因此由这里下发，
+      前端不再持有任何仓库常量。
+    """
     def _work() -> dict:
-        try:
-            import sys
-            if BASE not in sys.path:
-                sys.path.insert(0, BASE)
-            from version import APP_VERSION, UPDATE_CHANNEL  # type: ignore
-            return {"current": APP_VERSION, "channel": UPDATE_CHANNEL}
-        except Exception:  # noqa: BLE001
-            return {"current": "unknown", "channel": "dev"}
+        return {"current": _app_version(), "channel": UPDATE_CHANNEL,
+                "repo": UPDATE_REPO}
 
     return await _in_thread(_work)
 
@@ -1932,38 +2120,102 @@ async def set_autostart(payload: dict = Body(...)):
 
 @router.post("/version/check")
 async def check_update(payload: dict = Body(default={})):
-    """检查 GitHub 最新 release（失败不抛错，返回无更新）。
+    """检查 GitHub 最新 release 并挑出本通道的安装包。
 
-    只读查询，用于系统设置页的「一键更新」前置判断；真正的下载安装仍由
-    既有 one-click 更新流程负责。
+    判定逻辑（详见上方 `_is_newer` 的说明）：
+      * 只有 latest **严格新于** 本机版本才算「有更新」——
+        同版本（`v3.1` vs `local-v3.1`）与更旧的版本都不再误判；
+      * 同时按 `UPDATE_CHANNEL` 在 assets 里精确匹配安装包，
+        取不到就报 `assetMissing`，让界面说清「这个 release 里没有你这条通道的包」，
+        而不是等到下载完才发现装错通道。
+
+    失败（网络不通 / 仓库不存在）一律返回 `hasUpdate=False` 并带上 `error`，
+    不抛异常 —— 设置页是常驻界面，不能因为 GitHub 抽风就整页报错。
     """
     def _work() -> dict:
-        import sys
-        if BASE not in sys.path:
-            sys.path.insert(0, BASE)
-        try:
-            from version import APP_VERSION  # type: ignore
-        except Exception:  # noqa: BLE001
-            APP_VERSION = "unknown"
-
-        latest = None
-        try:
-            import urllib.request
-            req_ = urllib.request.Request(
-                "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO,
-                headers={"Accept": "application/vnd.github+json",
-                         "User-Agent": "open-ai-gateway"})
-            with urllib.request.urlopen(req_, timeout=8) as resp:  # noqa: S310
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            latest = data.get("tag_name")
-        except Exception as e:  # noqa: BLE001
-            logger.info("检查更新失败（忽略）: %s", e)
-
-        has = bool(latest and latest != APP_VERSION)
-        return {"current": APP_VERSION, "latest": latest or APP_VERSION,
-                "hasUpdate": has}
+        current = _app_version()
+        rel = _fetch_latest_release()
+        tag = rel["tag"]
+        asset = _pick_asset(rel["assets"], UPDATE_CHANNEL)
+        has = bool(tag) and _is_newer(tag, current)
+        # 有更新但匹配不到本通道安装包 → 明确告诉用户，而不是静默「无更新」
+        asset_missing = bool(has and not asset)
+        return {
+            "current": current,
+            "latest": tag or current,
+            "channel": UPDATE_CHANNEL,
+            "repo": UPDATE_REPO,
+            "hasUpdate": has,
+            "assetMissing": asset_missing,
+            "assetName": (asset or {}).get("name") or "",
+            "assetSize": int((asset or {}).get("size") or 0),
+            "notes": rel["error"],
+        }
 
     return await _in_thread(_work)
+
+
+@router.post("/version/download")
+async def download_update(payload: dict = Body(default={})):
+    """下载本通道的最新安装包到 `data/updates/`（后台线程 + 进度状态）。
+
+    幂等：同一版本若已下载完成，直接复用磁盘上的文件，不重复拉 34MB/400MB。
+    返回后前端轮询 `/version/update-state` 展示进度，完成后弹确认框。
+    """
+    def _work() -> dict:
+        st = _update_state_get()
+        # 下载中：直接告诉前端「已经在下了」，避免连点开出两条下载线程
+        if st["phase"] == "downloading":
+            return {"ok": True, "phase": "downloading", "version": st["version"]}
+
+        rel = _fetch_latest_release()
+        tag = rel["tag"]
+        if not tag:
+            raise HTTPException(status_code=502,
+                                detail="查询 GitHub 发布失败：%s"
+                                       % (rel["error"] or "网络不可达"))
+        current = _app_version()
+        if not _is_newer(tag, current):
+            raise HTTPException(status_code=409,
+                                detail="当前已是最新版本（%s）" % current)
+        asset = _pick_asset(rel["assets"], UPDATE_CHANNEL)
+        if not asset:
+            raise HTTPException(
+                status_code=404,
+                detail="release %s 中没有 %s 通道的安装包"
+                       % (tag, UPDATE_CHANNEL))
+
+        url = str(asset.get("browser_download_url") or "")
+        name = str(asset.get("name") or "installer.exe")
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        dest = os.path.join(UPDATE_DIR, name)
+
+        # 同一版本已下载过 → 复用（并核对字节数，防止半个文件被当成完整包）
+        want = int(asset.get("size") or 0)
+        if (st["phase"] == "ready" and st["version"] == tag
+                and os.path.isfile(dest)
+                and (not want or os.path.getsize(dest) == want)):
+            return {"ok": True, "phase": "ready", "version": tag,
+                    "path": dest, "reused": True}
+
+        _update_state_set(phase="downloading", percent=0.0, received=0,
+                          total=want, version=tag, path=dest, error="")
+        threading.Thread(target=_download_installer,
+                         args=(url, dest, tag), daemon=True).start()
+        return {"ok": True, "phase": "downloading", "version": tag,
+                "path": dest, "size": want}
+
+    return await _in_thread(_work)
+
+
+@router.get("/version/update-state")
+async def update_state():
+    """查询更新包下载状态（前端轮询用，只读内存状态）。
+
+    相位只有 idle / downloading / ready / error 四种 —— 安装阶段的进度由
+    桌面端界面本地维护，不经过网关（见上方 `_UPDATE_STATE` 的说明）。
+    """
+    return _update_state_get()
 
 
 @router.get("/health")

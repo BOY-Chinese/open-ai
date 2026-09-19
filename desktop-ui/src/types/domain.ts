@@ -244,6 +244,49 @@ export const EMPTY_SIGNIN: SigninBundle = { day: '', signin: {} }
  */
 export type ThemeMode = 'light' | 'dark' | 'system'
 
+/* ═══════════ 一键更新 ═══════════ */
+
+/** POST /v1/admin/version/check —— 检查更新返回体 */
+export interface UpdateCheckResult {
+  current: string
+  latest: string
+  channel: string
+  repo: string
+  /** 是否真的比本机新（同版本 / 更旧版本都是 false） */
+  hasUpdate: boolean
+  /** 有新版本，但 release 里没有本通道的安装包 */
+  assetMissing: boolean
+  assetName: string
+  assetSize: number
+  /** 查询失败时的错误文案（正常为 ''） */
+  notes: string
+}
+
+/**
+ * 更新包下载相位（GET /v1/admin/version/update-state 轮询）
+ *
+ * ★ 只覆盖**下载**：安装阶段由桌面端界面本地维护（见 UpdateDialog 的
+ *   `installing` 状态）—— 安装必须经 Tauri 命令 `install_update` 发起，
+ *   外部工具调不到，因此后端状态机里没有「正在安装」这一相位。
+ */
+export type UpdatePhase = 'idle' | 'downloading' | 'ready' | 'error'
+
+export interface UpdateState {
+  phase: UpdatePhase
+  /** 下载进度 0~100（非下载相位为 0） */
+  percent: number
+  received: number
+  total: number
+  /** 目标安装包版本（release tag） */
+  version: string
+  /** 已下载安装包的绝对路径 */
+  path: string
+  /** error 相位时为失败文案 */
+  error: string
+  /** 上次状态变更时间（epoch 秒） */
+  ts: number
+}
+
 /* ═══════════ 通用异步状态 ═══════════ */
 
 export type AsyncStatus = 'idle' | 'loading' | 'success' | 'error'

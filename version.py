@@ -14,6 +14,12 @@ APP_VERSION = 'dev-v3.1'
 UPDATE_CHANNEL = 'dev'
 
 # 发布仓库 (owner/repo) —— 「检查更新」与「一键更新」查它的 latest release。
-# 保留为占位值是有意的: 仓库由发布者决定, 不该把某个人的 GitHub 账号写死进源码。
-# 部署时改这一处, 或设环境变量 OPEN_AI_UPDATE_REPO=<owner>/<repo> 覆盖。
-UPDATE_REPO = 'owner/open-ai'
+# ★ 必须填真实发布仓库, 不能留占位值: 本字段是「一键更新」查询 release 的
+#   唯一来源 (admin_api._fetch_latest_release 拼
+#   https://api.github.com/repos/<UPDATE_REPO>/releases/latest)。
+#   留成 'owner/open-ai' 的话, 装机用户点「一键更新」永远查不到任何 release,
+#   界面只会提示「检查更新失败」—— 整条更新链路对最终用户直接失效。
+#   （一键更新是面向**用户**的功能, 不是本机自用功能。）
+# 仍可用环境变量 OPEN_AI_UPDATE_REPO=<owner>/<repo> 临时覆盖, 但那是调试手段,
+# 正式发布必须写在本文件里。
+UPDATE_REPO = 'BOY-Chinese/open-ai'

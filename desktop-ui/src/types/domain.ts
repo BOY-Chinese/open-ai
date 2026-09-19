@@ -310,28 +310,6 @@ export interface SigninBundle {
 /** 空签到表（初值 / 接口不可用时使用） */
 export const EMPTY_SIGNIN: SigninBundle = { day: '', signin: {} }
 
-/* ═══════════ 定制：启动 dsh（仅 master 本机使用，不必同步发布版） ═══════════ */
-
-/** POST /v1/admin/dsh/launch 的返回体（后端 admin_api.dsh_launch） */
-export interface DshLaunchResult {
-  /** 命令是否成功执行（超时也算 ok：脚本已转后台启动） */
-  ok: boolean
-  /** DSH 是否本来就在运行（决定 toast 文案是「已启动」还是「已在运行」） */
-  alreadyRunning: boolean
-  /** wsl.exe 退出码（超时为 null） */
-  exitCode: number | null
-  /** ~/dsh-web.sh 的输出尾部（排障用） */
-  output: string
-  /** DSH Web GUI 地址 */
-  url: string
-  /**
-   * 已在运行时后端是否成功拉起了系统默认浏览器新开 DSH 页
-   * （定制需求：每次点击都新开一个页签，不判断浏览器里是否已有该页；
-   * 刚拉起的冷启动分支不开，避免端口未就绪时开出错误页。）
-   */
-  openedInBrowser: boolean
-}
-
 /* ═══════════ 外观 / 主题 ═══════════ */
 
 /**

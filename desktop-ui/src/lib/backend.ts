@@ -12,7 +12,6 @@ import type {
   Channel,
   ChannelFilter,
   DailyUsage,
-  DshLaunchResult,
   GatewayInfo,
   ModelEntry,
   SigninBundle,
@@ -854,21 +853,6 @@ export const mockBackend = {
 
   async setAutostart(_enabled: boolean): Promise<void> {
     await sleep(LATENCY)
-  },
-
-  /* ═══════════ 定制：启动 dsh（仅 master 本机使用，不必同步发布版） ═══════════ */
-
-  /** Mock 版：演示模式下模拟一次成功的启动（真实实现见 httpBackend.launchDsh） */
-  async launchDsh(): Promise<DshLaunchResult> {
-    await sleep(LATENCY)
-    return {
-      ok: true,
-      alreadyRunning: false,
-      exitCode: 0,
-      output: '已启动: http://127.0.0.1:3080',
-      url: 'http://127.0.0.1:3080',
-      openedInBrowser: false,
-    }
   },
 
   async getVersion(): Promise<{ current: string; latest?: string; repo?: string }> {

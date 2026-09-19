@@ -21,7 +21,6 @@ import type {
   Channel,
   ChannelFilter,
   DailyUsage,
-  DshLaunchResult,
   GatewayInfo,
   ModelEntry,
   SigninBundle,
@@ -518,26 +517,6 @@ export const httpBackend = {
 
   async setAutostart(enabled: boolean): Promise<void> {
     await req('/v1/admin/settings/autostart', { method: 'POST', body: { enabled } })
-  },
-
-  /* ═══════════════ 定制：启动 dsh（仅 master 本机使用，不必同步发布版） ═══════════════ */
-
-  /**
-   * 一键启动 DeepSeek Harness Web GUI（master 个人定制）。
-   *
-   * 后端经 wsl.exe 调 WSL 内的 `bash ~/dsh-web.sh start`（幂等：DSH 已在跑
-   * 时脚本直接返回「已在运行」）。同步等待最长 30s —— dsh web 冷启动几秒内
-   * 就绪，等一下能让 toast 直接报最终结果；后端超时也返回 ok（脚本已转后台）。
-   *
-   * 定制需求：DSH 已在运行时，后端会自动用系统默认浏览器**新开** DSH 页面
-   * （不判断浏览器里是否已有该页），见返回体的 openedInBrowser。
-   */
-  async launchDsh(): Promise<DshLaunchResult> {
-    return req<DshLaunchResult>('/v1/admin/dsh/launch', {
-      method: 'POST',
-      body: {},
-      timeoutMs: 40000, // 后端最多等 30s，留出网络与重试余量
-    })
   },
 
   /**

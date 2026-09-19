@@ -93,11 +93,6 @@ const MUTATIONS: Record<
     title: '设置开机自启动',
     detail: (a) => (a[0] ? '开启' : '关闭'),
   },
-  // ── 定制：启动 dsh（仅 master 本机使用，不必同步到 dev / portable 发布版）──
-  launchDsh: {
-    tag: '设置',
-    title: '一键启动 DeepSeek Harness',
-  },
   saveAutoChains: {
     tag: 'Auto路由链',
     title: '保存路由链配置',

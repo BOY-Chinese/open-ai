@@ -72,7 +72,17 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                  #       (改由后端 /v1/admin/version 下发 repo)。
                  #   由 `node node_modules/vite/bin/vite.js build` 产出(2493 模块),
                  #   同批 CSS 为 index-fW-_RaXL.css。
-                 'index-BsQeg5Rl.js']
+                 'index-BsQeg5Rl.js',
+                 # Cmfx0B8k: 2026-09-19 **移除本机定制「启动dsh」后的前端**
+                 #   (`dev` 仓) —— master 指出上一版误把仅本机使用的
+                 #   「启动dsh」按钮一并同步进了发布版。本次删除该功能:
+                 #     AccountsPage.tsx 移除按钮与 onLaunchDsh/dshBusy 及 Rocket 图标;
+                 #     httpBackend/backend 移除 launchDsh 实现(含 mock);
+                 #     oplogBackend 移除 launchDsh 埋点; domain.ts 移除 DshLaunchResult;
+                 #     后端 admin_api.py 本就不含 /dsh/launch(同步时已剔除该定制段),
+                 #     故删前端后该端点在前端已无任何引用。
+                 #   产物 830.35 kB(较 BsQeg5Rl 的 831.83 kB 略小), CSS 仍 index-fW-_RaXL.css。
+                 'index-Cmfx0B8k.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

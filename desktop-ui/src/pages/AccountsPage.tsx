@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Plus, RefreshCw, Link2, Users, Check, Rocket } from 'lucide-react'
+import { Plus, RefreshCw, Link2, Users, Check } from 'lucide-react'
 import { PageShell, PageHeader, PageToolbar, PageBody, PageFooter, ToolbarDivider } from '@/components/layout/PageShell'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -66,48 +66,6 @@ export function AccountsPage() {
 
   /** Loomy 图形化登录向导开关（点「添加 Loomy 账号」弹出，全程无命令行） */
   const [loomyDialog, setLoomyDialog] = useState(false)
-
-  /* ═══════════ 定制：启动dsh（仅 master 本机使用，不必同步到 dev / portable 发布版） ═══════════
-   *
-   * 功能：一键启动 DeepSeek Harness Web GUI（WSL 内 dsh web，地址
-   * http://127.0.0.1:3080）。后端经 wsl.exe 调 `bash ~/dsh-web.sh start`，
-   * 脚本幂等（已在运行就不重复拉），所以这里不查状态、点了就发。
-   *
-   * ★ DSH 已在运行时，后端会自动用系统默认浏览器**新开** DSH 页面
-   *   （定制需求：不判断浏览器里是否已有该页，每次点击都开一个新的）。
-   *   刚拉起的冷启动分支不开 —— 端口未就绪时会开出错误页。
-   *
-   * 按钮位置：PageHeader 的 actions 插槽 —— 标题「账号管理」右侧的空白区，
-   * 即 master 指定的「右上空白部分」。placed 在此页仅因 master 要求放这里；
-   * 后端端点是全局的，日后想挪到别处只需搬这一个 Button。
-   */
-  const [dshBusy, setDshBusy] = useState(false)
-
-  const onLaunchDsh = useCallback(async () => {
-    setDshBusy(true)
-    try {
-      const r = await backend.launchDsh()
-      if (!r.ok) {
-        toast(`启动dsh 失败：${r.output || `退出码 ${r.exitCode}`}`, 'error', 6000)
-      } else if (r.alreadyRunning) {
-        // 后端已自动用默认浏览器新开 DSH 页（r.openedInBrowser），
-        // 文案只需告知「替你打开好了」；开失败则提示手动访问
-        toast(
-          r.openedInBrowser
-            ? 'dsh 已在运行，已在浏览器打开 DSH 页面'
-            : 'dsh 已在运行，请访问 http://127.0.0.1:3080',
-          'info',
-          5000
-        )
-      } else {
-        toast('DeepSeek Harness 已启动：http://127.0.0.1:3080', 'success', 6000)
-      }
-    } catch (e) {
-      toast(`启动dsh 失败：${e instanceof Error ? e.message : String(e)}`, 'error', 6000)
-    } finally {
-      setDshBusy(false)
-    }
-  }, [toast])
 
   const { data: accounts, loading, reload, setData } = useAsync(
     () => backend.listAccounts(filter),
@@ -339,18 +297,6 @@ export function AccountsPage() {
       <PageHeader
         title="账号管理"
         description="Trae / WorkBuddy / WorkBuddy 国际 / Loomy 四通道统一视图"
-        /* 定制：右上空白区的「启动dsh」按钮（仅 master 本机使用，不必同步发布版） */
-        actions={
-          <Button
-            variant="outline"
-            onClick={() => void onLaunchDsh()}
-            loading={dshBusy}
-            title="一键启动 DeepSeek Harness (WSL dsh web)；已在运行时自动在浏览器打开 DSH 页面"
-          >
-            {!dshBusy && <Rocket />}
-            {dshBusy ? '启动中…' : '启动dsh'}
-          </Button>
-        }
       />
 
       {/* 工具栏：筛选 + 刷新当前通道 + 重连当前通道 */}

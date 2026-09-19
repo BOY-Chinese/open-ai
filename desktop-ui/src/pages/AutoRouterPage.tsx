@@ -577,13 +577,21 @@ export function AutoRouterPage() {
             </div>
           </div>
         ) : chains.length === 0 ? (
-          /* ═══════ 空态 ═══════ */
-          <TableEmpty
-            colSpan={4}
-            icon={Workflow}
-            title="还没有路由链"
-            description="点上方「添加新路由链」创建一条链（自动命名「无名N」），再右键它选「编辑」添加模型"
-          />
+          /* ═══════ 空态 ═══════
+             TableEmpty 渲染的是 <tr><td>，必须挂在真正的 <table> 里：
+             直接塞进 <div> 会让匿名表格盒收缩为内容宽度，图标与文字整体贴左，
+             不再居中。兄弟页面（模型列表/API 管理）都经由 VirtualTable 保证了
+             这层 <table>，本页手写列表，需自行补上。 */
+          <table className="w-full text-base">
+            <tbody>
+              <TableEmpty
+                colSpan={4}
+                icon={Workflow}
+                title="还没有路由链"
+                description="点上方「添加新路由链」创建一条链（自动命名「无名N」），再右键它选「编辑」添加模型"
+              />
+            </tbody>
+          </table>
         ) : (
           /* ═══════ 路由链列表 ═══════ */
           <table className="w-full text-base">

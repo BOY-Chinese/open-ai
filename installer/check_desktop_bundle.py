@@ -82,7 +82,20 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                  #     后端 admin_api.py 本就不含 /dsh/launch(同步时已剔除该定制段),
                  #     故删前端后该端点在前端已无任何引用。
                  #   产物 830.35 kB(较 BsQeg5Rl 的 831.83 kB 略小), CSS 仍 index-fW-_RaXL.css。
-                 'index-Cmfx0B8k.js']
+                 'index-Cmfx0B8k.js',
+                 # DVohGDY4: 2026-09-20 **修复 Auto路由链空态文案不居中**
+                 #   (`dev` 仓) —— master 反馈「还没有路由链…」两行字整体贴左,
+                 #   看着不居中。根因不是样式而是结构: TableEmpty 渲染的是
+                 #   <tr><td>, 本页却直接塞进 <div> 里; tr/td 脱离 table 布局后
+                 #   会生成匿名表格盒并按内容宽度收缩, w-full 失去参照 → 内容贴左。
+                 #   兄弟页(模型列表/API 管理)都经由 VirtualTable 保证了这层
+                 #   <table>, 本页列表是手写的, 故给它补上 <table><tbody> 容器。
+                 #   仅动 AutoRouterPage.tsx 该分支 15 行, mock / 演示数据一字未动。
+                 #   实测(Edge/WebView2 1180x780): 表格中心=690, 图标/标题/描述
+                 #   中心均=690, 偏差 0.0px。
+                 #   产物 830.43 kB, CSS 仍 index-fW-_RaXL.css。
+                 #   ★ 与 portable 仓同一源码产出, 两端 sha256 相同。
+                 'index-DVohGDY4.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

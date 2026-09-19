@@ -164,8 +164,19 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(admin_api.UPDATE_REPO, 'BOY-Chinese/open-ai')
 
     def test_channel_and_version(self):
-        self.assertEqual(admin_api.UPDATE_CHANNEL, 'dev')
-        self.assertTrue(admin_api._app_version())
+        """通道与版本号必须自洽（勿写死 dev，portable 渠道取值为 'portable'）。
+
+        原断言写死 `UPDATE_CHANNEL == 'dev'` —— 同一份文件在 portable 仓会让
+        「改版本号即测试失败」；此处改为按渠道自洽断言，两仓通用。
+        """
+        version = admin_api._app_version()
+        self.assertTrue(version)
+        # 通道取值只能是两个已知渠道之一
+        self.assertIn(admin_api.UPDATE_CHANNEL, ('dev', 'portable'))
+        # 版本号前缀须与通道一致（dev-v3.2 / portable-v3.2）——
+        # 「一键更新」按数字段比较，前缀用来标识渠道，二者不得漂移
+        self.assertTrue(version.startswith(admin_api.UPDATE_CHANNEL + '-'),
+                        f'版本号 {version!r} 与通道 {admin_api.UPDATE_CHANNEL!r} 不一致')
 
 
 if __name__ == '__main__':

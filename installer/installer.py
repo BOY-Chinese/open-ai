@@ -49,9 +49,12 @@ PYTHON_DOWNLOAD = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd6
 NODE_DOWNLOAD = 'https://nodejs.org/dist/v20.18.0/node-v20.18.0-x64.msi'
 
 # pip 镜像源回退链: 单一镜像故障/劫持/缓存污染时自动切换 (末位为官方源)
+# ★ 2026-09-20: 清华源对 pip 26.x (Python 3.13.14 ensurepip 自带) 的
+#   /simple/<包>/ 请求返回 403 Forbidden (curl 同 URL 却 200, 疑似 WAF 按
+#   UA/请求头过滤), 全新 venv 实测复现 —— 主源临时让位阿里云, 清华保留观察。
 PIP_INDEXES = [
-    'https://pypi.tuna.tsinghua.edu.cn/simple',      # 清华 (主)
-    'https://mirrors.aliyun.com/pypi/simple',        # 阿里云
+    'https://mirrors.aliyun.com/pypi/simple',        # 阿里云 (主)
+    'https://pypi.tuna.tsinghua.edu.cn/simple',      # 清华 (对 pip 26.x 403, 见上)
     'https://mirrors.cloud.tencent.com/pypi/simple', # 腾讯云
     'https://pypi.org/simple',                       # PyPI 官方 (兜底)
 ]
@@ -575,36 +578,45 @@ class InstallerApp:
         """用指定 Python 执行 pip 安装。
 
         - 统一 --no-cache-dir: 本地 HTTP 缓存被污染会持续报 from versions: none
-        - 多镜像源回退: 清华 -> 阿里云 -> 腾讯云 -> PyPI 官方
+        - 多镜像源回退: 阿里云 -> 清华 -> 腾讯云 -> PyPI 官方
         - 失败时完整输出写入日志文件
         """
         prefix = list(python_cmd) if isinstance(python_cmd, (list, tuple)) \
             else [python_cmd]
         last = ''
+        total = len(PIP_INDEXES)
+        log_path = os.path.join(target, 'pip-install-error.log')
         for i, index in enumerate(PIP_INDEXES):
+            # ★ 每源尝试前打一行 —— 此前 pip -q 全程静默、每源上限 15 分钟,
+            #   界面看起来就是「卡住不动」(2026-09-20 master 安装实测反馈)
+            self._log(f'→ 尝试第 {i + 1}/{total} 源: {index} '
+                      f'(依赖约 40MB, 慢网最长等 7 分钟, 失败自动换源)')
             rc, out = run_cmd([*prefix, '-m', 'pip', 'install', '-q',
                                '--no-cache-dir',
                                '-r', requirements,
                                '-i', index,
-                               '--timeout', '30'], timeout=900)
+                               '--timeout', '15',
+                               '--retries', '1'], timeout=420)
             if rc == 0:
                 if i:
                     self._log(f'✓ 第 {i + 1} 源 ({index}) 安装成功')
                 return
             last = out or ''
-            short = ' '.join(last.split())[-160:]
+            short = ' '.join(last.split())[-300:]
             self._log(f'⚠ 第 {i + 1} 源失败 ({index}): {short}')
+            # 失败输出当场落盘(追加+分隔线) —— 此前只在 4 源全败后才写,
+            # 用户中途放弃就什么都查不到 (本次 403 排查的直接教训)
+            try:
+                with open(log_path, 'a', encoding='utf-8', errors='replace') as f:
+                    f.write(f'\n==== 源 {i + 1}/{total} {index} rc={rc} ====\n'
+                            f'{last or "(无输出)"}\n')
+            except Exception:  # noqa: BLE001
+                pass
             if 'No matching distribution' not in last and \
                     'versions: none' not in last and rc == 1:
                 # 非镜像源问题 (如依赖冲突/网络中断), 换源意义不大
                 break
-        try:
-            log_path = os.path.join(target, 'pip-install-error.log')
-            with open(log_path, 'w', encoding='utf-8', errors='replace') as f:
-                f.write(last or '(无输出)')
-            hint = f'完整输出已保存: {log_path}'
-        except Exception:
-            hint = f'输出末尾: {last[-300:]}'
+        hint = f'完整输出已保存: {log_path}'
         raise RuntimeError(f'依赖安装失败 (rc={rc}); {hint}; {last[-300:]}')
 
     def _setup_playwright(self, target):

@@ -121,10 +121,17 @@ def main():
 
     # 安装器（onefile）
     log("[4/5] open-ai-installer-dev.exe")
+    # ★ 离线依赖轮子 (installer/wheels/, 与生产 venv 同版) 打进 exe ——
+    #   安装时 pip --no-index 本地装, 不受镜像限速/403 影响 (2026-09-20 事故)
+    wheels_dir = os.path.join(HERE, "wheels")
+    wheels_args = (["--add-data", "wheels;wheels"]
+                   if os.path.isdir(wheels_dir) and os.listdir(wheels_dir) else [])
+    if not wheels_args:
+        log("[WARN] installer/wheels/ 缺失 —— 安装时将完全依赖网络源")
     if not run([
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--noupx",
         "--onefile", "--windowed", "--uac-admin",
-        "--name", "open-ai-installer-dev", *icon_args,
+        "--name", "open-ai-installer-dev", *icon_args, *wheels_args,
         "--add-data", "resources.zip;.",
         "--add-data", "config.shell.json;.",
         "--add-data", "ico\\open-ai.ico;ico",

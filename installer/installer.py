@@ -39,6 +39,9 @@ def _resource_dir():
 
 RESOURCES_ZIP = os.path.join(_resource_dir(), 'resources.zip')
 SHELL_CONFIG = os.path.join(_resource_dir(), 'config.shell.json')
+# 离线依赖轮子 (打包时经 --add-data wheels;wheels 进入 _MEIPASS/wheels):
+# 与生产 venv 同版本的完整依赖闭包, 安装时 pip --no-index 本地装, 不走网络
+WHEELS_DIR = os.path.join(_resource_dir(), 'wheels')
 # 图标: 打包后位于 _MEIPASS/ico/open-ai.ico; 开发时在 installer/ico/open-ai.ico
 ICON_ICO = os.path.join(_resource_dir(), 'ico', 'open-ai.ico')
 if not os.path.exists(ICON_ICO):
@@ -586,6 +589,29 @@ class InstallerApp:
         last = ''
         total = len(PIP_INDEXES)
         log_path = os.path.join(target, 'pip-install-error.log')
+
+        # ★ 离线优先: 内置轮子与生产 venv 同版 (--no-index 本地装, 完全不碰网络)。
+        #   2026-09-20 事故根治: pip 26.x 大文件流被镜像限速掐断 (IncompleteRead
+        #   12MB/38MB @21KB/s, 而 curl 同镜像 3.8MB/s) + 清华源 403 pip 26.x,
+        #   网络装依赖在部分网络根本走不通。离线失败 (如用户 Python 版本无匹配
+        #   轮子) 再走下方多镜像网络回退链。
+        if os.path.isdir(WHEELS_DIR) and os.listdir(WHEELS_DIR):
+            self._log(f'→ 离线安装依赖 (内置 {len(os.listdir(WHEELS_DIR))} 个轮子, 不走网络)...')
+            rc, out = run_cmd([*prefix, '-m', 'pip', 'install', '-q',
+                               '--no-cache-dir', '--no-index',
+                               '--find-links', WHEELS_DIR,
+                               '-r', requirements], timeout=600)
+            if rc == 0:
+                self._log('✓ 依赖离线安装成功')
+                return
+            short = ' '.join((out or '').split())[-300:]
+            self._log(f'⚠ 离线安装失败 (轮子或与当前 Python 不匹配), 转网络源回退: {short}')
+            try:
+                with open(log_path, 'a', encoding='utf-8', errors='replace') as f:
+                    f.write(f'\n==== 离线轮子安装 rc={rc} ====\n{out or "(无输出)"}\n')
+            except Exception:  # noqa: BLE001
+                pass
+
         for i, index in enumerate(PIP_INDEXES):
             # ★ 每源尝试前打一行 —— 此前 pip -q 全程静默、每源上限 15 分钟,
             #   界面看起来就是「卡住不动」(2026-09-20 master 安装实测反馈)

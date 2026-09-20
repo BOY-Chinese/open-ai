@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  Activity,
   RefreshCw,
   Boxes,
   Copy,
@@ -43,7 +44,7 @@ import { useAsync, useSelection } from '@/hooks/useAsync'
 import { backend } from '@/lib/dataSource'
 import { filterModelView, readModelCache, writeModelCache } from '@/lib/modelCache'
 import { cn, fmtTime } from '@/lib/utils'
-import { CHANNELS, type ChannelFilter, type ModelEntry, channelMeta } from '@/types/domain'
+import { CHAIN_CHECK_META, CHANNELS, type ChannelFilter, type ModelEntry, channelMeta } from '@/types/domain'
 
 /** 基础列（多选模式会额外插入勾选列，故宽度动态计算）
  *  宽度按 1180px 默认窗口核算：内容区可用 ≈908px（非多选）/ ≈868px（多选），
@@ -175,6 +176,43 @@ export function ModelsPage() {
       }
     },
     [toast]
+  )
+
+  /** 正在检查的模型 id —— 一次只跑一个探活，避免连点右键向上游连环发请求 */
+  const [checkingId, setCheckingId] = useState<string | null>(null)
+
+  /**
+   * 右键「检查该模型」：与 Auto 路由链的「检查」**同核** —— 后端同一个
+   * auto_router.check_model，向上游发一条极短探测请求（"回复ok"）看有没有回复。
+   *
+   * 与路由链页的差异：模型列表不加「状态」列，结果只用右下角 Toast 报告
+   * （正常/繁忙/断连 + 耗时），弹完即走，列表保持纯数据视图。
+   */
+  const onCheckModel = useCallback(
+    async (m: ModelEntry) => {
+      if (checkingId) return
+      setCheckingId(m.id)
+      // 探活最长 30s（后端 CHECK_TIMEOUT_CAP）：提示若用默认 2.6s 早没了，
+      // 这里给 6s，让「我点过了」这件事在结果回来前可见
+      toast(`正在检查 ${m.routeModelId}…（向上游发送极短探测请求）`, 'info', 6000)
+      try {
+        const { results } = await backend.checkModel(m.routeModelId)
+        const r = results[0]
+        if (r) {
+          toast(
+            `${m.routeModelId}：${CHAIN_CHECK_META[r.status].label}${r.latencyMs ? `（${r.latencyMs}ms）` : ''}`,
+            r.status === 'ok' ? 'success' : r.status === 'busy' ? 'warn' : 'error'
+          )
+        } else {
+          toast('检查失败：网关返回空结果', 'error')
+        }
+      } catch (e) {
+        toast(e instanceof Error ? e.message : '检查失败', 'error')
+      } finally {
+        setCheckingId(null)
+      }
+    },
+    [checkingId, toast]
   )
 
   const onRefresh = useCallback(async () => {
@@ -346,6 +384,15 @@ export function ModelsPage() {
                 <ContextMenuTrigger asChild>{content}</ContextMenuTrigger>
                 <ContextMenuContent>
                   <ContextMenuLabel>{m.name}</ContextMenuLabel>
+                  <ContextMenuSeparator />
+                  {/* 检查该模型：向上游发极短探测请求，结果只弹右下角 Toast（不加状态列） */}
+                  <ContextMenuItem
+                    onSelect={() => void onCheckModel(m)}
+                    disabled={checkingId !== null}
+                  >
+                    <Activity />
+                    {checkingId === m.id ? '检查中…' : '检查该模型'}
+                  </ContextMenuItem>
                   <ContextMenuSeparator />
                   {/* 复制实际路由表模型名，便于直接粘进客户端配置 */}
                   <ContextMenuItem onSelect={() => void onCopyRouteId(m)}>

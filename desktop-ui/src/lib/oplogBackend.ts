@@ -111,6 +111,11 @@ const MUTATIONS: Record<
     title: '检查路由链连通性',
     detail: (a) => `链=${String(a[0])}${a[1] ? ` 模型=${String(a[1])}` : '（整条链）'}`,
   },
+  checkModel: {
+    tag: '模型',
+    title: '检查模型连通性',
+    detail: (a) => `模型=${String(a[0])}`,
+  },
   sendLoomyDesktopCode: {
     tag: '账号',
     title: '发送 Loomy 短信验证码',

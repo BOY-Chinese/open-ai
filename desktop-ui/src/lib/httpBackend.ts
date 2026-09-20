@@ -455,6 +455,21 @@ export const httpBackend = {
     })
   },
 
+  /**
+   * 「检查该模型」（模型列表右键）：对单个 routeModelId 发极短探测请求。
+   *
+   * 与 Auto 路由链的「检查」同核（后端同一个 auto_router.check_model），
+   * 只是模型来自模型列表而非路由链 —— 无需 chainId，返回恒为单元素 results。
+   * 探活上限 30s（后端 CHECK_TIMEOUT_CAP），前端超时留 60s 余量。
+   */
+  async checkModel(model: string): Promise<{ results: ChainCheckResult[] }> {
+    return req<{ results: ChainCheckResult[] }>('/v1/admin/models/check', {
+      method: 'POST',
+      body: { model },
+      timeoutMs: 60000,
+    })
+  },
+
   /* ═══════════════ Loomy 登录（图形化向导用） ═══════════════ */
 
   /**

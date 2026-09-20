@@ -1692,6 +1692,37 @@ async def refresh_models(payload: dict = Body(default={})):
     return await _in_thread(_work)
 
 
+@router.post("/models/check")
+async def check_model_probe(payload: dict = Body(default={})):
+    """「检查该模型」(模型列表右键): 向上游单个模型发一条极短探测请求。
+
+    与 Auto 路由链的「检查」**同核** —— 都走 auto_router.check_model(),
+    发"回复ok"极短请求, 只看有没有回复 (探活, 不进路由链配置)。
+    区别仅在模型来源: 这里是模型列表的 routeModelId (通道前缀 + 上游模型名),
+    无需挂在任何路由链上, 也无需链上超时配置 (用探测上限 30s)。
+
+    body: {model: "tr-..."}   (routeModelId)
+    返回: {results: [{model, status: ok|busy|down, latencyMs, detail}]}
+      ok=正常(有回复) busy=繁忙(限流/5xx/超时) down=断连(其余失败)
+      results 恒为单元素数组 —— 与 /auto-chain/check 同形状, 前端好复用。
+    """
+    import auto_router as _ar  # type: ignore
+    from providers import route_provider as _rp  # type: ignore
+
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="缺少 model 参数")
+
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"无法访问 PROVIDERS: {e}")
+
+    result = await _ar.check_model(_rp, providers, model, 0)
+    return {"results": [result], "ts": _now()}
+
+
 # ─────────────────────────── 积分 / 流水 ───────────────────────────
 
 # ─────────────────────────── Auto 路由链（多条自定义模型路由链） ───────────────────────────

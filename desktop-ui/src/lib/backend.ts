@@ -765,6 +765,23 @@ export const mockBackend = {
     }
   },
 
+  /** 「检查该模型」（模型列表右键, 演示）：与 checkAutoChain 同规则出三态 */
+  async checkModel(model: string): Promise<{ results: ChainCheckResult[] }> {
+    await sleep(LATENCY * 3)
+    const demo: ChainCheckResult['status'][] = ['ok', 'ok', 'ok', 'busy', 'down']
+    const status = demo[model.length % demo.length]
+    return {
+      results: [
+        {
+          model,
+          status,
+          latencyMs: 200 + ((model.length * 137) % 900),
+          detail: status === 'ok' ? 'ok' : status === 'busy' ? '模拟限流' : '模拟断连',
+        },
+      ],
+    }
+  },
+
   /* ── Loomy 登录（演示） ── */
 
   async sendLoomyDesktopCode(

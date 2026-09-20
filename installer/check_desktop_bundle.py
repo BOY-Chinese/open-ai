@@ -95,7 +95,21 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                  #   中心均=690, 偏差 0.0px。
                  #   产物 830.43 kB, CSS 仍 index-fW-_RaXL.css。
                  #   ★ 与 portable 仓同一源码产出, 两端 sha256 相同。
-                 'index-DVohGDY4.js']
+                                   # BTr_SDZo: 2026-09-20 **模型列表右键「检查该模型」**前端 ——
+                  #   同步自主仓 24ae537(仅本功能): ModelsPage 右键菜单首项加
+                  #   「检查该模型」(与 Auto路由链「检查」同核, 走新端点
+                  #   POST /v1/admin/models/check, 后端复用 auto_router.check_model
+                  #   向上游发极短探测请求), 结果只用右下角 Toast 报告
+                  #   (正常/繁忙/断连+耗时), 模型列表**不加「状态」列**;
+                  #   httpBackend / mock 数据源 / oplogBackend 同步补齐,
+                  #   新增 tests/test_models_check.py (三态归因 / 请求形状 /
+                  #   缺参 400 / 网关不可达 500)。
+                  #   mock / 演示数据一字未动; 已按本仓 sanitize_known_values.txt
+                  #   (39 行清单) 扫描产物: 0 命中 (唯一 sk- 命中是既有的
+                  #   DEMO-KEY-NOT-REAL 占位)。
+                  #   产物 831.37 kB, CSS 仍 index-fW-_RaXL.css。
+                  #   ★ dev / portable 两仓同一源码产出, bundle 名相同。
+                  'index-BTr_SDZo.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

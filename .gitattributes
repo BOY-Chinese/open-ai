@@ -34,3 +34,6 @@
 *.node  binary
 *.zip   binary
 *.db    binary
+
+# 离线依赖轮子: 二进制, 严禁 eol 归一化 (2026-09-21 CRLF 警告)
+installer/wheels/** -text

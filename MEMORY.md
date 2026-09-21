@@ -107,11 +107,47 @@
 **结论**：国际版与国内版（`copilot.tencent.com`）**接口路径完全相同**，只有 host 与产品标识不同，
 因此 `providers/workbuddy_intl.py` 直接继承国内版 provider，只覆写差异部分。
 
-## 国际版拿分链路（2026-09-19 **二次**修正：Cloud Agent，最新，必读）
+## 国际版拿分链路（2026-09-21 **三次**修正：建会话 + ACP 投递，最新，必读）
 
-**结论：国际版网页端拿活跃，唯一正确路径是 `POST /console/as/conversations/`
-（Cloud Agent 任务）。此前两版（`/console/chat/completions`、webchat 三步链路）
-都打在了另一套体系上，怎么调都不会出现在 master 界面里，活跃也不计入。**
+**结论：国际版网页端拿活跃，正确路径是「建 Cloud Agent 会话 + 走 ACP 通道把消息
+真正投递进去」两步。只建会话 = 空壳会话（列表有名字、点开无记录、不算活跃）。
+此前三版分别打在 `/console/chat/completions`、webchat 三步链路、只建 as 会话上，
+都不成立。**
+
+### ★★★ 三次修正：光建会话 ≠ 有会话记录（2026-09-21）
+
+master 报：「会话列表里有，点开却没有任何会话记录，当天没入账」。
+查证：只调 `POST /console/as/conversations/` 建出的是**空壳会话** ——
+列表里有名字（「你好」），点进去**一条消息都没有**，且长期卡在 `working`。
+因为 agent 从头到尾**没收到任何 prompt**。
+
+真实网页端是**两步**：
+
+```
+① POST /console/as/conversations/  {"prompt":"你好","model":"hy3"}
+   → data.session = {sessionId, sandboxId,
+                     link:"https://…/acp",      ← ACP 通道入口
+                     token:"<agentos JWT>",     ← ★ 与账号 accessToken 不是一回事
+                     cwd:"/workspace"}
+② 用 session.token 打 session.link 走 ACP（JSON-RPC over SSE）：
+     GET  <link>  Accept: text/event-stream      ← 必须先开, 这步注册连接
+     POST <link>  initialize    (Acp-Connection-Id 头)
+     POST <link>  session/new
+     POST <link>  session/prompt  {sessionId, prompt:[{type:"text",text:"你好"}]}
+```
+
+走完 ② 后 SSE 流推 `agent_message_chunk`，模型真的回
+「你好！我是 WorkBuddy，有什么可以帮你的吗？…」，任务转 `completed`
+—— **这时会话里才真的有记录**。
+
+**ACP 实测踩过的四个坑（全部已规避）**：
+
+| 坑 | 现象 | 正解 |
+| --- | --- | --- |
+| 连接未注册 | `400 Acp-Connection-Id required` / `404 connection not found` | **先 GET 开 SSE 流**，再发 JSON-RPC |
+| Accept 不完整 | `406 Client must accept both…` | 必须**同时**含 `application/json` 与 `text/event-stream` |
+| 找错应答位置 | POST 响应体是空的，以为失败 | POST 返回 **202**，应答从 **SSE 流**推回来 |
+| 用错 token | 打 link 得 401 | 用 `session.token`（agentos 签发、限定 sandbox），**不是**账号 accessToken |
 
 ### ★★ 两套独立体系（最容易踩的坑）
 
@@ -124,15 +160,17 @@ master 的界面是 **`/app/`（web_agents）**，其"会话"就是 Cloud Agent 
 判别铁证：master 09-17 的真实会话 `2100473510743687168`（name=「你好」）在
 `GET /console/as/conversations/` 里查得到，manifest 明写
 `CLIENT_INFO_PLATFORM=web_agents` / `CLIENT_INFO_IDE_TYPE=WorkBuddy_Web`；
-而 webchat 那套接口**永远看不到它** —— 这就是「网页端没有新会话」的真相。
+而 webchat 那套接口**永远看不到它**。
 
-### ★ 核心教训：循环验证
+### ★ 核心教训：循环验证 + 「列表有」不等于「有记录」
 
-前两版都在**错误体系内自洽**：建会话→对话→回写 全部 HTTP 200，
-回读也能看到自己造的会话 —— 于是"自证成功"。
-**用错误的体系验证错误的体系，永远成功。**
-→ 验收必须换**独立路径**：master 的界面 / 官方条款 / 另一个接口体系。
-  绝不能拿「我调用的接口回读我自己造的数据」当证据。
+* **循环验证**：前三版都在**错误/不完整体系内自洽** —— 建会话→对话→回写全是
+  HTTP 200，回读也能看到自己造的会话，于是"自证成功"。
+  **用不完整的链路验证自己，永远成功。**
+  → 验收必须换**独立路径**：master 的界面 / 官方条款 / 另一个接口体系。
+* **「列表里有」是假阳性**：会话**出现在列表**只证明"记录被创建了"，
+  不证明"agent 真被使用了"。必须验证**会话内有消息**（`agent_message_chunk`
+  或 completed）才算数。（此前把"列表回读得到"当成功证据，是这一版才纠正的。）
 
 ### 正确调用（实测 HTTP 200）
 
@@ -140,7 +178,8 @@ master 的界面是 **`/app/`（web_agents）**，其"会话"就是 Cloud Agent 
 POST https://www.workbuddy.ai/console/as/conversations/
      {"prompt": "你好", "model": "hy3"}
   → {"id": "2101201130699665408", "name": "你好", "status": "CREATING",
-     "session": {"sessionId": ..., "sandboxId": ..., "link": ".../acp", "cwd": "/workspace"}}
+     "session": {"sessionId": ..., "sandboxId": ..., "link": ".../acp",
+                 "token": "<agentos JWT>", "cwd": "/workspace"}}
 ```
 
 ⚠️ **路径必须带尾斜杠**：`/console/as/conversations`（不带）→ **403 access_denied**；
@@ -149,11 +188,15 @@ POST https://www.workbuddy.ai/console/as/conversations/
 配套接口：
 | 用途 | 接口 |
 | --- | --- |
-| 建任务 | `POST /console/as/conversations/` body `{prompt, model}` |
+| 建会话 | `POST /console/as/conversations/` body `{prompt, model}` |
+| **投递消息** | **ACP：`GET/POST <session.link>`（JSON-RPC over SSE）** |
 | 任务详情 | `GET /console/as/conversations/{id}` |
 | 任务列表 | `GET /console/as/conversations/`（**带尾斜杠**） |
-| 任务时间线 | `GET /console/as/conversations/{id}/timeline` |
 | Cloud Agent 配额 | `GET /v2/user/cloudagent/quota`（`agentLimit/agentUsed`） |
+
+> 消息**没有** REST 列表接口：`/{id}/messages/`、`/{id}/history/`、`/{id}/timeline`
+> 等实测一律 404/403。会话内容只能通过 **ACP 通道**读写
+> —— 这也是为什么"点开没记录"必须靠补 ACP 投递来修。
 
 ### 消耗：hy3 + 极简内容 = 免费（已实测）
 
@@ -172,13 +215,18 @@ POST https://www.workbuddy.ai/console/as/conversations/
 **但 master 实测网页端对话确实拿到过日活**（09-17 `你好` → 09-18 02:03 入账 +30）。
 以实测为准，但条款风险与「脚本刷活跃」的合规问题由 master 评估。
 
-### 历史（两版错误路径，勿重蹈）
+### 历史（三版错误路径，勿重蹈）
 
 1. **2026-09-18 首版**：只打 `/console/chat/completions` —— HTTP 200、模型真作答，
    但**无会话、无落库**，网页端看不到，活跃不计入。
 2. **2026-09-19 一版**：补成 webchat「三步链路」（建会话→对话→回写）——
    在 webchat 体系内完全自洽，但**仍是错误的体系**，master 界面依然看不到。
-3. **2026-09-19 二版（当前）**：改走 `/console/as/conversations/` ✅
+3. **2026-09-19 二版**：改走 `/console/as/conversations/` ✅ 体系对了，
+   但**只建会话、不投递消息** → 空壳会话（列表有名字、点开无记录、不算活跃）。
+4. **2026-09-21 三版（当前）**：建会话 **+ ACP 投递消息** ✅✅
+
+> 三次翻车的共同点：都拿「自己那条链路能跑通」当成功证据。
+> 真正的验收标准只有一条 —— **在 master 的 `/app/` 界面点开会话，能看到对话记录**。
 
 ### 五期实验排除过程（前四条全部判失败）
 

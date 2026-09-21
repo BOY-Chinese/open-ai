@@ -199,17 +199,20 @@ class RunOneTest(unittest.TestCase):
         self.assertIn('TimeoutError', detail)
 
     def test_run_one_creates_cloud_agent_task(self):
-        """★ 端到端: 必须走 /console/as/conversations/ (Cloud Agent)。
+        """★ 端到端: 必须走 /console/as/conversations/ (Cloud Agent) **并投递消息**。
 
         这是 master 界面 `/app/task/<id>` 对应的**唯一**体系。
         此前两版打的是 `/console/webchat/*` (webchat 旧体系), 在里面怎么调
         都不会出现在 master 界面上 —— 本测试即为该缺陷的回归门。
+
+        ★ 2026-09-21 三次修正: 只建会话只得到**空壳**(列表有名字、点开无记录),
+          必须再走 ACP 把 prompt 真正送进去 —— 本测试同时钉住这一点。
         """
         class _Resp:
             def __init__(self, body, status=200):
                 self._body, self.status = body, status
 
-            def read(self):
+            def read(self, *a):
                 return self._body
 
             def __enter__(self):
@@ -228,17 +231,23 @@ class RunOneTest(unittest.TestCase):
             if url.endswith('/console/as/conversations/') and method == 'POST':
                 return _Resp(json.dumps({'code': 0, 'data': {
                     'id': '2101202034802855936', 'name': '你好',
-                    'status': 'CREATING'}}).encode())
+                    'status': 'CREATING',
+                    'session': {'sessionId': '2101202034802855936',
+                                'sandboxId': 'deadbeef',
+                                'link': 'https://x.e2b.sandbox.cloudstudio.club/acp',
+                                'token': 'SESSIONJWT',
+                                'cwd': '/workspace'}}}).encode())
             if '/console/as/conversations/2101202034802855936' in url:
                 return _Resp(json.dumps({'code': 0, 'data': {
                     'id': '2101202034802855936', 'status': 'working'}}).encode())
             return _Resp(b'{}')
 
-        with mock.patch.object(W.urllib.request, 'urlopen', side_effect=fake_urlopen):
+        with mock.patch.object(W.urllib.request, 'urlopen', side_effect=fake_urlopen), \
+                mock.patch.object(W, 'deliver_agent_prompt',
+                                  return_value=(True, 'prompt 已送达, 模型已应答')):
             ok, detail = W.run_one(ACC, DOMAIN, PRODUCT, '你好', 'hy3', 60, quiet=True)
 
         self.assertTrue(ok, detail)
-        self.assertEqual(len(calls), 2, [c['url'] for c in calls])
 
         # 创建: 必须是 as 端点 + 带尾斜杠 (不带会 403)
         create = calls[0]
@@ -252,7 +261,39 @@ class RunOneTest(unittest.TestCase):
         self.assertEqual(create['body']['model'], 'hy3')
 
         # 回读确认 (独立路径验收)
-        self.assertIn('/console/as/conversations/2101202034802855936', calls[1]['url'])
+        self.assertTrue(any('/console/as/conversations/2101202034802855936' in c['url']
+                            for c in calls), [c['url'] for c in calls])
+
+    def test_run_one_fails_when_delivery_fails(self):
+        """★ 只建会话、消息投递失败 → 必须判失败。
+
+        否则会留下"列表里有名字、点开没有记录"的空壳会话, 活跃也不计入
+        —— 这正是 master 2026-09-21 报的现象。
+        """
+        class _Resp:
+            def __init__(self, body, status=200):
+                self._body, self.status = body, status
+
+            def read(self, *a):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, **kw):
+            return _Resp(json.dumps({'code': 0, 'data': {
+                'id': '2101202034802855936', 'status': 'CREATING',
+                'session': {'link': 'https://x/acp', 'token': 't'}}}).encode())
+
+        with mock.patch.object(W.urllib.request, 'urlopen', side_effect=fake_urlopen), \
+                mock.patch.object(W, 'deliver_agent_prompt',
+                                  return_value=(False, 'ACP 流未建立')):
+            ok, detail = W.run_one(ACC, DOMAIN, PRODUCT, '你好', 'hy3', 60, quiet=True)
+        self.assertFalse(ok, '空壳会话不能算成功')
+        self.assertIn('投递失败', detail)
 
     def test_create_failure_is_reported(self):
         """创建失败 → 判失败 (不能因 HTTP 200 就自认成功)。"""
@@ -414,6 +455,152 @@ class ConsistencyWithSigninAllTest(unittest.TestCase):
                       encoding='utf-8').read()
         self.assertNotIn("'WB国际签到'", src)
         self.assertIn("'WB国际活跃'", src)
+
+
+class AcpDeliveryTest(unittest.TestCase):
+    """★ 2026-09-21 三次修正: ACP 投递握手 —— 修「点开会话没有记录」。
+
+    master 报的现象: `/app/` 会话列表里有名字, 点开**没有任何会话记录**。
+    根因: 只调 `POST /console/as/conversations/` 建出的是**空壳会话**,
+    agent 从未收到 prompt。真实网页端还会用响应里的 `data.session`
+    (`link` + `token`) 走 ACP 通道把消息真正发进去。
+
+    本测试把这条握手链路的**协议契约**逐条钉死, 少任何一步都会坏:
+      * 连接必须先注册 (先开 SSE 流), 否则 400/404
+      * Accept 必须同时含 application/json 与 text/event-stream (否则 406)
+      * 顺序必须是 initialize → session/new → session/prompt
+      * POST 要带 Acp-Connection-Id
+    """
+
+    SESSION = {
+        'sessionId': '2101202034802855936',
+        'sandboxId': 'deadbeefdeadbeef',
+        'link': 'https://65225-deadbeef.e2b.sg2.sandbox.cloudstudio.club/acp',
+        'token': 'AGENTOS_SESSION_JWT',
+        'cwd': '/workspace',
+    }
+
+    def test_no_session_block_is_failure(self):
+        """建会话没返回 session 块 → 无法投递 → 必须判失败 (不能当成功)。"""
+        ok, detail = W.deliver_agent_prompt({}, '你好', 30, quiet=True)
+        self.assertFalse(ok)
+        self.assertIn('session 缺 link/token', detail)
+
+    def test_stream_not_established_is_failure(self):
+        """SSE 流没建起来 → 后续必 400/404 → 立即判失败, 不硬着头皮往下走。"""
+        with mock.patch.object(W, '_acp_open_stream',
+                               side_effect=lambda *a, **k: None):
+            ok, detail = W.deliver_agent_prompt(self.SESSION, '你好', 30, quiet=True)
+        self.assertFalse(ok)
+        self.assertIn('ACP 流未建立', detail)
+
+    def test_rpc_accept_header_has_both_types(self):
+        """★ Accept 必须同时含两种 —— 只给一个会被 406 挡掉 (实测)。"""
+        seen = {}
+
+        class _Resp:
+            status = 202
+
+            def read(self, *a):
+                return b''
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, **kw):
+            seen['headers'] = {k.lower(): v for k, v in req.headers.items()}
+            seen['body'] = json.loads(req.data.decode('utf-8'))
+            return _Resp()
+
+        with mock.patch.object(W.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            ok, err = W._acp_rpc(self.SESSION['link'], 'TOK', 'conn-1',
+                                 'initialize', {'protocolVersion': 1}, 1)
+        self.assertTrue(ok, err)
+        accept = seen['headers']['accept']
+        self.assertIn('application/json', accept)
+        self.assertIn('text/event-stream', accept)
+        # 必须带连接 id, 否则 400 Acp-Connection-Id required
+        self.assertEqual(seen['headers']['acp-connection-id'], 'conn-1')
+        # 必须是 JSON-RPC 2.0
+        self.assertEqual(seen['body']['jsonrpc'], '2.0')
+        self.assertEqual(seen['body']['method'], 'initialize')
+        # ★ 必须用 session.token, 不是账号 accessToken
+        self.assertEqual(seen['headers']['authorization'], 'Bearer TOK')
+
+    def test_rpc_reports_http_error(self):
+        """JSON-RPC 返回错误 → 带出状态码与正文, 便于排障。"""
+        def fake_urlopen(req, **kw):
+            raise W.urllib.error.HTTPError(
+                req.full_url, 400, 'bad', {}, io.BytesIO(b'Acp-Connection-Id required'))
+
+        with mock.patch.object(W.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            ok, err = W._acp_rpc('https://x/acp', 'T', 'c', 'initialize', {}, 1)
+        self.assertFalse(ok)
+        self.assertIn('400', err)
+
+    def test_call_order_is_initialize_new_prompt(self):
+        """★ 顺序必须是 initialize → session/new → session/prompt。"""
+        order = []
+        sink = []
+
+        class _Resp:
+            status = 202
+
+            def read(self, *a):
+                return b''
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_open_stream(link, stoken, conn_id, sink_, stop):
+            sink_.append({'__stream__': 'open'})
+            # 模拟服务端在 session/new 后推回 sessionId 与模型应答
+            sink_.append({'jsonrpc': '2.0', 'id': 2,
+                          'result': {'sessionId': '2101202034802855936'}})
+            sink_.append({'jsonrpc': '2.0', 'method': 'session/update',
+                          'params': {'update': {'sessionUpdate': 'agent_message_chunk',
+                                                'content': {'type': 'text', 'text': '你好'}}}})
+
+        def fake_rpc(link, stoken, conn_id, method, params, rpc_id, timeout=30):
+            order.append(method)
+            if method == 'session/prompt':
+                self.assertEqual(params['sessionId'], '2101202034802855936')
+                self.assertEqual(params['prompt'][0]['text'], '你好')
+            return True, ''
+
+        with mock.patch.object(W, '_acp_open_stream', side_effect=fake_open_stream), \
+                mock.patch.object(W, '_acp_rpc', side_effect=fake_rpc):
+            ok, detail = W.deliver_agent_prompt(self.SESSION, '你好', 30, quiet=True)
+
+        self.assertEqual(order, ['initialize', 'session/new', 'session/prompt'])
+        self.assertTrue(ok, detail)
+        self.assertIn('模型已应答', detail)
+
+    def test_no_events_means_failure(self):
+        """握手走完但全程无任何事件 → 判失败 (不能假设成功)。"""
+        def fake_open_stream(link, stoken, conn_id, sink_, stop):
+            sink_.append({'__stream__': 'open'})
+
+        with mock.patch.object(W, '_acp_open_stream', side_effect=fake_open_stream), \
+                mock.patch.object(W, '_acp_rpc', return_value=(True, '')), \
+                mock.patch.object(W, 'ACP_STREAM_WAIT', 1):
+            ok, detail = W.deliver_agent_prompt(self.SESSION, '你好', 30, quiet=True)
+        self.assertFalse(ok)
+        self.assertIn('未观测到模型应答', detail)
+
+    def test_create_agent_task_delivers_by_default(self):
+        """create_agent_task 默认必须投递 —— 否则又回到空壳会话。"""
+        src = io.open(os.path.join(PROJECT_ROOT, 'scripts', 'wb_web_daily.py'),
+                      encoding='utf-8').read()
+        body = src.split('def create_agent_task')[1].split('\ndef ')[0]
+        self.assertIn('deliver_agent_prompt', body,
+                      'create_agent_task 必须调用 deliver_agent_prompt')
 
 
 class MainTest(unittest.TestCase):

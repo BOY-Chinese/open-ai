@@ -58,7 +58,33 @@ WorkBuddy 国际版 · 网页端每日活跃 (+30 积分)
   * `11101` 不支持非流式      → 必须 `"stream": true`
   * `11128` 首条必须是 system → messages[0] 必须是 system 角色
   * `11102` 缺 model 字段     → 必须带 `"model": "hy3"` (免费模型, 实测 200)
-  * `403 access_denied` on /console/as/* → 那是 edge-sync 专属通道, 普通 token 不通
+  * `403 access_denied` on /console/as/* → 请求头不完整 / 路径缺尾斜杠
+
+★★★ 三次修正 (2026-09-21): 光建会话 ≠ 有会话记录
+--------------------------------------------------
+master 报「会话列表里有, 点开却没有任何会话记录」。查证结论:
+**只调 `POST /console/as/conversations/` 只会建出一个空壳会话** ——
+列表里有名字("你好"), 点进去一条消息都没有, 且长期卡在 `working`。
+因为 agent 从头到尾**没收到任何 prompt**。
+
+真实网页端的完整动作是**两步**:
+  ① `POST /console/as/conversations/` 建会话, 响应里带 `data.session`
+     (`{sessionId, sandboxId, link:"https://…/acp", token:"<agentos JWT>", cwd}`)
+  ② 用 `session.token` 打 `session.link` 走 **ACP 通道** (JSON-RPC over SSE)
+     把用户消息真正发进去:
+        先 GET 开 SSE 流(注册连接) → initialize → session/new → session/prompt
+  走完 ② 后 SSE 会推 `agent_message_chunk` (模型逐字回复), 任务转 `completed`
+  —— 这时会话里才**真的有记录**。
+
+★ `session.token` 与账号 `accessToken` 是两回事: 前者是 agentos 签发的、
+  限定该 sandbox 的短时 JWT (iss=agentos)。拿账号 token 打 link 只有 401。
+
+★ ACP 的坑 (全部实测踩过):
+  * 必须先开 SSE 流注册连接, 否则 JSON-RPC 报 400 `Acp-Connection-Id required`
+    或 404 `connection not found`
+  * Accept 必须**同时**含 `application/json` 与 `text/event-stream`, 否则 406
+  * JSON-RPC 的 POST 返回 **202**, 应答是从 SSE 流里推回来的, 不是响应体
+  * POST 需要 `Acp-Connection-Id` 头, 值与 SSE 流的一致
 
 用法
 ----
@@ -68,6 +94,7 @@ WorkBuddy 国际版 · 网页端每日活跃 (+30 积分)
   python scripts/wb_web_daily.py --text "早上好"  # 自定义对话内容
   python scripts/wb_web_daily.py --json          # 结果以 JSON 输出 (供上层调用)
   python scripts/wb_web_daily.py --force         # 忽略当日已完成状态, 强制重发
+  python scripts/wb_web_daily.py --no-deliver    # 只建会话, 不投递消息 (排障用)
 
 网络波动的补救机制 (2026-09-18 新增)
 ------------------------------------
@@ -90,6 +117,7 @@ import json
 import os
 import ssl
 import sys
+import threading
 import uuid
 import time
 import urllib.error
@@ -464,10 +492,16 @@ def json_request_retry(method, path, headers, payload=None,
 
 
 def create_agent_task(acc, domain, product, prompt, model, timeout=DEFAULT_TIMEOUT,
-                       quiet=False):
-    """创建 Cloud Agent 任务 → 返回 (ok, taskId_or_detail)。
+                       quiet=False, deliver=True):
+    """创建 Cloud Agent 任务并**把消息真正发进去** → 返回 (ok, taskId_or_detail)。
 
-    这是**唯一**能产生「网页端可见会话」的调用 (master 界面 = /app/ = web_agents)。
+    这是**唯一**能产生「网页端可见且有记录的会话」的调用
+    (master 界面 = /app/ = web_agents)。
+
+    ★ 2026-09-21 三次修正: 光建会话是不够的 —— 那样只会得到一个**空壳会话**:
+      列表里有名字("你好"), 点开**没有任何记录**, 且长期卡在 working。
+      必须接着走 ACP 通道把 prompt 真正送进去 (见 deliver_agent_prompt)。
+
     body: {prompt, model} —— 真实前端 CloudConversationOps.create 的形态
     (它还支持 projectId/cwd/expertId/locale/visibility/conversationOrigin/tags,
      本脚本只需最小集)。
@@ -484,7 +518,235 @@ def create_agent_task(acc, domain, product, prompt, model, timeout=DEFAULT_TIMEO
     tid = str(data.get('id') or data.get('conversationId') or '')
     if not tid:
         return False, f'建任务未返回 id: {str(d)[:150]}'
+
+    if not deliver:
+        return True, tid
+
+    # ★ 关键补步: 把消息真正送进会话, 否则就是空壳 (点开无记录)
+    session = data.get('session') or {}
+    if not session:
+        return False, f'建任务未返回 session 块, 无法投递: {tid}'
+    ok2, detail2 = deliver_agent_prompt(session, prompt, timeout, quiet=quiet)
+    if not ok2:
+        # 空壳会话不算成功 —— 列表里会有个点开没记录的僵尸会话
+        return False, f'会话 {tid} 消息投递失败: {detail2}'
     return True, tid
+
+
+# ============ ACP 会话握手 (2026-09-21 三次修正: 真正的"有记录") ============
+# ★★★ 这一节修的是 master 报的「会话列表点开没有会话记录」。
+#
+# 现象: 只调 `POST /console/as/conversations/` 建出来的任务,
+#       在 `/app/` 列表里**有名字**("你好"), 但点进去**一条消息都没有**,
+#       而且长期卡在 `working` —— 因为那只是建了个**空壳会话**:
+#       agent 从未收到任何 prompt, 自然也没有任何对话记录。
+#
+# 真相: 真实网页端建完会话后, 还会**再走一条 ACP 通道**把用户消息真正发进去。
+#   建会话响应里的 `data.session` 就是这套通道的入口:
+#       {"sessionId":…, "sandboxId":…, "link":"https://…/acp",
+#        "token":"<agentos JWT>", "cwd":"/workspace"}
+#   ★ 注意 `session.token` 与账号的 accessToken **不是**一个东西 ——
+#     它是 agentos 签发的、限定该 sandbox 的短时 JWT (iss=agentos)。
+#     用账号 token 打 link 只会拿到 401。
+#
+# ACP 通道 = JSON-RPC over SSE (Streamable HTTP), 三步:
+#   1. `GET <link>` 带 `Accept: text/event-stream` 开 SSE 长连接
+#      —— 这一步会**注册连接**, 必须先开, 否则后面全报 400
+#         `Acp-Connection-Id required` / 404 `connection not found`。
+#   2. 同一 `Acp-Connection-Id` 头下 POST JSON-RPC:
+#        initialize → session/new → session/prompt
+#      POST 返回 202, **真正的应答从第 1 步的 SSE 流里推回来**。
+#   3. `session/prompt` 才是"真的发了消息" —— 之后:
+#        SSE 推 `session_info_update` / `agent_message_chunk`(模型逐字回复)
+#        / `usage_update`, 任务从 working → completed。
+#
+# 实测 (2026-09-21): 走完这三步后模型真的回了
+#   「你好！我是 WorkBuddy，有什么可以帮你的吗？…」
+# 且任务状态落到 completed —— 会话里这才**有记录**。
+#
+# Accept 头必须同时含 `application/json` 与 `text/event-stream`,
+# 只给一个会被 406 挡掉。
+ACP_RPC_TIMEOUT = 30          # 单条 JSON-RPC POST 超时
+ACP_STREAM_TIMEOUT = 90       # SSE 长连接最长驻留
+ACP_STREAM_WAIT = 45          # 最多等模型回完多少秒
+
+
+def _acp_open_stream(link, session_token, conn_id, sink, stop):
+    """开 SSE 长连接并持续读事件 (后台线程)。
+
+    ★ 连接必须先建立: ACP 服务端靠这条流注册 `Acp-Connection-Id`,
+      没这条流, 后续 JSON-RPC 一律 400/404。
+    事件按行解析, 把 JSON-RPC 消息塞进 `sink` (list), 供主线程判定进度。
+    """
+    hdr = {
+        'Authorization': f'Bearer {session_token}',
+        'Accept': 'text/event-stream',
+        'Acp-Connection-Id': conn_id,
+        'User-Agent': UA_WEB_CHAT,
+    }
+    try:
+        req = urllib.request.Request(link, headers=hdr)
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=ACP_STREAM_TIMEOUT,
+                                    context=ctx) as resp:
+            sink.append({'__stream__': 'open'})
+            buf = b''
+            t0 = time.time()
+            while not stop.is_set() and time.time() - t0 < ACP_STREAM_TIMEOUT:
+                chunk = resp.read(1)
+                if not chunk:
+                    break
+                buf += chunk
+                if not buf.endswith(b'\n\n'):
+                    continue
+                block, buf = buf.decode('utf-8', 'replace').strip(), b''
+                if not block or block.startswith(': heartbeat'):
+                    continue
+                for line in block.splitlines():
+                    if not line.startswith('data:'):
+                        continue
+                    try:
+                        sink.append(json.loads(line[5:].strip()))
+                    except Exception:  # noqa: BLE001
+                        continue
+    except Exception as e:  # noqa: BLE001 — 流断开不影响主流程判定
+        sink.append({'__stream__': f'closed:{type(e).__name__}'})
+    finally:
+        sink.append({'__stream__': 'done'})
+
+
+def _acp_rpc(link, session_token, conn_id, method, params, rpc_id,
+             timeout=ACP_RPC_TIMEOUT):
+    """向 ACP 通道发一条 JSON-RPC。
+
+    ★ Accept 必须同时含两种类型 —— 只给 application/json 会被
+      406 "Client must accept both application/json and text/event-stream" 拒绝。
+    成功时 HTTP 202 (应答不在这里, 在 SSE 流里), 故 ok 判定放宽到 2xx。
+    """
+    hdr = {
+        'Authorization': f'Bearer {session_token}',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+        'Acp-Connection-Id': conn_id,
+        'User-Agent': UA_WEB_CHAT,
+    }
+    payload = {'jsonrpc': '2.0', 'id': rpc_id, 'method': method, 'params': params}
+    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(link, data=data, headers=hdr, method='POST')
+    try:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            # 202 Accepted 是正常应答; 200 也接受
+            if 200 <= resp.status < 300:
+                return True, ''
+            return False, f'HTTP {resp.status}'
+    except urllib.error.HTTPError as e:
+        return False, f'HTTP {e.code} {e.read().decode("utf-8", "replace")[:120]}'
+    except Exception as e:  # noqa: BLE001
+        return False, f'{type(e).__name__}: {e}'
+
+
+def deliver_agent_prompt(session, text, timeout=DEFAULT_TIMEOUT, quiet=False):
+    """把用户消息**真正发进** Cloud Agent 会话 (ACP 三步握手)。
+
+    入参 `session` 是建会话响应里的 `data.session` 块。
+    返回 (ok, detail):
+      * ok=True  —— 走完 initialize → session/new → session/prompt,
+                    且**看到模型回复** (agent_message_chunk) 或至少会话转为 completed
+      * ok=False —— 任一步失败 (含握手未注册 / prompt 被拒 / 全程无任何事件)
+
+    ★ 为什么必须做这一步: 只建会话不发消息 = 空壳会话, 列表里有名字、
+      点开没记录, 活跃也不计入。这才是拿分与"有记录"的充要动作。
+    """
+    link = session.get('link')
+    stoken = session.get('token')
+    if not link or not stoken:
+        return False, 'session 缺 link/token (无法进入 ACP 通道)'
+
+    conn_id = str(uuid.uuid4())
+    sink = []
+    stop = threading.Event()
+    th = threading.Thread(target=_acp_open_stream,
+                          args=(link, stoken, conn_id, sink, stop), daemon=True)
+    th.start()
+
+    # 等 SSE 注册完成 (没等到就不必往下走, 后面必 400)
+    ok_stream = False
+    for _ in range(40):                      # 最多等 4s
+        time.sleep(0.1)
+        if any(isinstance(e, dict) and e.get('__stream__') == 'open' for e in sink):
+            ok_stream = True
+            break
+    if not ok_stream:
+        stop.set()
+        return False, 'ACP 流未建立 (连接未注册)'
+
+    ok, err = _acp_rpc(link, stoken, conn_id, 'initialize', {
+        'protocolVersion': 1,
+        'capabilities': {},
+        'clientInfo': {'name': 'workbuddy-web', 'version': '1.0'},
+    }, 1)
+    if not ok:
+        stop.set()
+        return False, f'initialize 失败: {err}'
+    time.sleep(0.8)
+
+    ok, err = _acp_rpc(link, stoken, conn_id, 'session/new',
+                       {'cwd': session.get('cwd') or '/workspace',
+                        'mcpServers': []}, 2)
+    if not ok:
+        stop.set()
+        return False, f'session/new 失败: {err}'
+    time.sleep(1.5)
+
+    # 取服务端回的 sessionId (没有就退回建会话时的 id)
+    sid = ''
+    for e in sink:
+        if isinstance(e, dict) and e.get('id') == 2 and isinstance(e.get('result'), dict):
+            r = e['result']
+            sid = r.get('sessionId') or (r.get('session') or {}).get('id') or ''
+            if sid:
+                break
+    if not sid:
+        sid = str(session.get('sessionId') or '')
+
+    ok, err = _acp_rpc(link, stoken, conn_id, 'session/prompt', {
+        'sessionId': sid,
+        'prompt': [{'type': 'text', 'text': text}],
+    }, 3)
+    if not ok:
+        stop.set()
+        return False, f'session/prompt 失败: {err}'
+
+    # 等模型应答 —— 出现 agent_message_chunk 即证明消息真的被处理了。
+    # ★ 判定用"看到内容"而不是"状态变 completed": 状态是**异步**落库的
+    #   (实测 completed 可能滞后数秒到数分钟), 拿状态当唯一条件会误判失败。
+    got_chunk = False
+    got_done = False
+    deadline = time.time() + ACP_STREAM_WAIT
+    while time.time() < deadline:
+        time.sleep(0.5)
+        for e in sink:
+            if not isinstance(e, dict) or 'method' not in e:
+                continue
+            upd = (e.get('params') or {}).get('update') or {}
+            kind = upd.get('sessionUpdate')
+            if kind == 'agent_message_chunk':
+                got_chunk = True
+            meta = (upd.get('_meta') or {}).get('codebuddy.ai') or {}
+            if meta.get('status') == 'completed':
+                got_done = True
+        # 拿到模型回复即可收工 (不必等 completed 状态落库)
+        if got_chunk:
+            break
+    stop.set()
+    time.sleep(0.3)
+
+    if got_chunk:
+        return True, 'prompt 已送达, 模型已应答 (会话有记录)'
+    if got_done:
+        return True, 'prompt 已送达, 会话已 completed'
+    return False, 'prompt 已发送但未观测到模型应答'
 
 
 def get_agent_task(acc, domain, product, task_id, timeout=DEFAULT_TIMEOUT):
@@ -595,16 +857,20 @@ def post_sse_retry(url, headers, payload, timeout=DEFAULT_TIMEOUT,
     return last
 
 
-def run_one(acc, domain, product, text, model, timeout, dry_run=False, quiet=False):
-    """对一个账号创建一次 **Cloud Agent 任务** (= master 界面里的"会话")。
+def run_one(acc, domain, product, text, model, timeout, dry_run=False, quiet=False,
+            deliver=True):
+    """对一个账号创建一次 **Cloud Agent 任务**并把消息真正送进会话
+    (= master 界面 `/app/` 里那个"会话")。
 
     返回 (ok, detail)。
 
-    ★ 为什么是「创建任务」而不是「发对话」:
-      master 的界面是 `/app/` (web_agents), 它下面的"会话"就是 Cloud Agent 任务,
-      对应 `POST /console/as/conversations/`。此前的 webchat 路线
-      (`/chat/` + `/console/webchat/*` + `/console/chat/completions`) 是**另一套
-      独立体系**, 在里面怎么调都不会出现在 master 的界面上, 活跃也不计入。
+    ★ 为什么是「创建会话 + 投递消息」两步, 而不是只创建:
+      master 的界面是 `/app/` (web_agents), 它下面的"会话"就是 Cloud Agent 任务。
+      只调建会话接口会得到**空壳**: 列表里有名字, 点开没有记录, 活跃也不计入
+      (2026-09-21 master 实报)。必须再走 ACP 把手艺消息发进去
+      (`deliver_agent_prompt`), 会话才有记录。
+      而 webchat 路线 (`/chat/` + `/console/webchat/*`) 是**另一套独立体系**,
+      在里面怎么调都不会出现在 master 的界面上。
 
     ★ 消耗: 用 `model=hy3` + 极简内容, 实测 `CapacityUsedPrecise` 保持 0 —— 免费。
       任务仍会真实执行 (起 sandbox, CREATING → working → completed),
@@ -621,21 +887,21 @@ def run_one(acc, domain, product, text, model, timeout, dry_run=False, quiet=Fal
 
     if dry_run:
         log(f'账号{short} [dry-run] POST {AS_CONVERSATIONS_PATH} '
-            f'model={model} prompt={text!r}', quiet)
+            f'model={model} prompt={text!r} + ACP 投递', quiet)
         return True, 'dry-run'
 
     ok, tid = create_agent_task(acc, domain, product, text, model, timeout,
-                                quiet=quiet)
+                                quiet=quiet, deliver=deliver)
     if not ok:
-        log(f'账号{short} 创建 Agent 任务失败: {tid}', quiet)
+        log(f'账号{short} 创建/投递 Agent 会话失败: {tid}', quiet)
         return False, f'create-failed {tid}'
 
     # 回读确认任务真的落库 (而不是只拿到一个 200) —— 换独立路径验收
     ok2, task = get_agent_task(acc, domain, product, tid, timeout)
     status = (task or {}).get('status') if ok2 else '?'
     if not ok2:
-        log(f'账号{short} 任务已创建({tid}) 但回读失败: {task}', quiet)
-    log(f'账号{short} Agent 任务已创建 {tid} (status={status}) '
+        log(f'账号{short} 会话已创建({tid}) 但回读失败: {task}', quiet)
+    log(f'账号{short} Agent 会话已创建并投递 {tid} (status={status}) '
         f'— 活跃由服务端延迟结算, 隔天入账', quiet)
     return True, f'ok task={tid}'
 
@@ -652,6 +918,8 @@ def main(argv=None):
     ap.add_argument('--quiet', action='store_true', help='不打印到 stdout (仍写日志)')
     ap.add_argument('--force', action='store_true',
                     help='忽略当日已成功状态, 强制再发一次')
+    ap.add_argument('--no-deliver', dest='deliver', action='store_false',
+                    help='只建会话、不通过 ACP 投递消息 (排障用; 会留下空壳会话)')
     args = ap.parse_args(argv)
 
     quiet = args.quiet or args.json
@@ -691,7 +959,8 @@ def main(argv=None):
                             'ok': True, 'detail': 'skipped(already-done)'})
             continue
         ok, detail = run_one(acc, domain, product, args.text, args.model,
-                             args.timeout, dry_run=args.dry_run, quiet=quiet)
+                             args.timeout, dry_run=args.dry_run, quiet=quiet,
+                             deliver=args.deliver)
         if ok and not args.dry_run:
             mark_account_done(uid)
         results.append({

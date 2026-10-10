@@ -165,7 +165,10 @@ class LoomyProvider(Provider):
         self.models = dict(DEFAULT_MODELS)
         self.models.update({k: v for k, v in (cfg.get("models") or {}).items()})
         self.default_model = cfg.get("defaultModel") or "deepseek-v4-flash-0731"
-        self._client = httpx.AsyncClient(timeout=self.timeout)
+        # retries=2: 仅对「TCP 连接建立失败」自动重试 2 次 (请求未发出, 幂等安全)
+        self._client = httpx.AsyncClient(
+            timeout=self.timeout,
+            transport=httpx.AsyncHTTPTransport(retries=2))
         # 动态模型目录缓存: {上游id: 显示名}; None = 从未同步过
         self._dynamic_models: dict | None = None
         self._models_synced_at: float = 0.0

@@ -27,6 +27,7 @@ Provider 接口做了适配:
 import json
 import logging
 
+from providers.base import describe_net_exc
 from providers.workbuddy import (
     WorkBuddyProvider, _WB_CONFIG_PATH, _parse_sse_line,
     _to_upstream_body, _upstream_headers, normalize_model_name,
@@ -365,5 +366,10 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
                 obj = _parse_sse_line(line)
                 if obj:
                     yield obj
+        except Exception as e:  # noqa: BLE001
+            # 同国内版 (2026-10-04): 裸 httpx.ReadError 的 str() 为空,
+            # 客户端只能看到 {"message":""}; 包一层语义说明便于排查。
+            raise RuntimeError(
+                describe_net_exc(e, "workbuddy-intl 流式传输中断")) from e
         finally:
             await resp.aclose()

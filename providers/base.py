@@ -118,3 +118,43 @@ class Provider(ABC):
 def make_chunk_id(prefix: str = "chatcmpl") -> str:
     import uuid
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
+
+
+def describe_net_exc(e: BaseException, prefix: str = "") -> str:
+    """把异常转成「永不落空」的人类可读描述 (任何情况下都返回非空字符串)。
+
+    背景 (2026-10-04 修复): workbuddy 流式传输中途被上游/链路 RST 时, httpx
+    抛出的 ReadError/ReadTimeout **不带任何消息** (str(e) == ""), main.py 原本
+    直接 str(e)[:300] 透传, 客户端只能看到 {"message":"","type":"upstream_error"}
+    —— 完全无从排查。本函数对 httpx 网络层异常给出语义化中文描述, 其余异常
+    兜底用异常类名。
+
+    prefix: 可选上下文前缀 (如 "workbuddy 流式传输中断"), 最终形如
+            "prefix: 语义说明 [httpx.ReadError: 原始消息]"
+    """
+    detail = str(e).strip()
+    cls = f"{type(e).__module__}.{type(e).__name__}"
+    hint = ""
+    try:
+        import httpx
+        if isinstance(e, httpx.ReadTimeout):
+            hint = "上游读超时 (迟迟等不到下一个数据包)"
+        elif isinstance(e, httpx.ReadError):
+            hint = "上游连接在传输中途被重置 (网络抖动/链路 RST)"
+        elif isinstance(e, httpx.ConnectError):
+            hint = "无法建立到上游的连接"
+        elif isinstance(e, httpx.PoolTimeout):
+            hint = "连接池获取连接超时"
+        elif isinstance(e, httpx.RemoteProtocolError):
+            hint = "上游未按 HTTP 协议收尾就断开"
+        elif isinstance(e, httpx.WriteError):
+            hint = "向上游发送请求数据失败"
+    except Exception:  # noqa: BLE001 — httpx 缺席时退化为类名兜底, 不影响调用方
+        pass
+    if detail and hint:
+        body = f"{hint} [{cls}: {detail}]"
+    elif hint:
+        body = f"{hint} [{cls}]"
+    else:
+        body = detail or cls
+    return f"{prefix}: {body}" if prefix else body

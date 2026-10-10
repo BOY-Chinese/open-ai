@@ -31,6 +31,8 @@ import os
 import re
 import time
 
+from providers.base import describe_net_exc
+
 logger = logging.getLogger("openapi.auto")
 
 # 对外虚拟模型总名 (master 指定的正式名称; 旧名「Auto路由连」为笔误, 已弃用)
@@ -289,9 +291,9 @@ async def auto_chat(route_provider, providers: dict, body: dict, chain: dict) ->
             errors.append(f"{m}: 超时")
             logger.warning("[auto:%s] 模型 %s 超时, 切换下一个", chain.get("name"), m)
         except Exception as e:  # noqa: BLE001
-            errors.append(f"{m}: {str(e)[:120]}")
+            errors.append(f"{m}: {describe_net_exc(e)[:120]}")
             logger.warning("[auto:%s] 模型 %s 失败(%s), 切换下一个",
-                           chain.get("name"), m, str(e)[:120])
+                           chain.get("name"), m, describe_net_exc(e)[:120])
     raise AutoExhausted("; ".join(errors))
 
 
@@ -362,8 +364,9 @@ async def auto_stream(route_provider, providers: dict, body: dict, chain: dict):
             if produced:
                 return
         except Exception as e:  # noqa: BLE001
-            errors.append(f"{m}: {str(e)[:120]}")
-            logger.warning("[auto:%s] 流式模型 %s 失败(%s)", chain.get("name"), m, str(e)[:120])
+            errors.append(f"{m}: {describe_net_exc(e)[:120]}")
+            logger.warning("[auto:%s] 流式模型 %s 失败(%s)",
+                           chain.get("name"), m, describe_net_exc(e)[:120])
             if produced:
                 return
         finally:
@@ -436,7 +439,7 @@ async def check_model(route_provider, providers: dict, model: str, timeout: floa
                 "detail": f"{int(t)}s 内无响应"}
     except Exception as e:  # noqa: BLE001
         latency = int((time.monotonic() - started) * 1000)
-        msg = str(e)[:160]
+        msg = describe_net_exc(e)[:160]
         status = _classify_check_error(msg)
         logger.info("[auto] 检查模型 %s: %s (%s)", model, status, msg)
         return {"model": model, "status": status, "latencyMs": latency, "detail": msg}

@@ -46,6 +46,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from providers import build_providers, route_provider
+from providers.base import describe_net_exc
 from anthropic_api import (anthropic_to_openai, openai_to_anthropic,
                            openai_stream_to_anthropic, aggregate_stream)
 from auto_router import (auto_chat, auto_stream, AutoExhausted,
@@ -309,7 +310,8 @@ async def chat_completions(request: Request):
                 yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
             except Exception as e:  # noqa: BLE001
                 logger.exception("Auto 路由链流式失败")
-                err = {"error": {"message": str(e)[:300], "type": "upstream_error"}}
+                err = {"error": {"message": describe_net_exc(e)[:300],
+                                 "type": "upstream_error"}}
                 yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
             yield "data: [DONE]\n\n"
 
@@ -324,7 +326,7 @@ async def chat_completions(request: Request):
                                            "type": "upstream_error"}}, status_code=502)
         except Exception as e:  # noqa: BLE001
             logger.exception("Auto 路由链非流式失败")
-            return JSONResponse({"error": {"message": str(e)[:300],
+            return JSONResponse({"error": {"message": describe_net_exc(e)[:300],
                                            "type": "upstream_error"}}, status_code=502)
 
     provider = route_provider(model, PROVIDERS)
@@ -342,7 +344,7 @@ async def chat_completions(request: Request):
             return JSONResponse(await provider.chat(body))
         except Exception as e:
             logger.exception("provider %s 非流式失败", provider.name)
-            msg = str(e)[:300]
+            msg = describe_net_exc(e, provider.name)[:300]
             if "401" in msg or "token" in msg.lower():
                 return JSONResponse({"error": {"message": msg, "type": "auth_error"}},
                                     status_code=401)
@@ -355,7 +357,8 @@ async def chat_completions(request: Request):
                 yield "data: " + json.dumps(chunk_dict, ensure_ascii=False) + "\n\n"
         except Exception as e:
             logger.exception("provider %s 流式失败", provider.name)
-            err = {"error": {"message": str(e)[:300], "type": "upstream_error"}}
+            err = {"error": {"message": describe_net_exc(e, provider.name)[:300],
+                             "type": "upstream_error"}}
             yield "data: " + json.dumps(err, ensure_ascii=False) + "\n\n"
         yield "data: [DONE]\n\n"
 
@@ -428,7 +431,8 @@ async def anthropic_messages(request: Request):
             logger.exception("anthropic 流式失败")
             yield "event: error\ndata: " + json.dumps(
                 {"type": "error",
-                 "error": {"type": "api_error", "message": str(e)[:300]}},
+                 "error": {"type": "api_error",
+                           "message": describe_net_exc(e, provider.name)[:300]}},
                 ensure_ascii=False) + "\n\n"
 
     if stream:
@@ -445,7 +449,8 @@ async def anthropic_messages(request: Request):
         logger.exception("anthropic 非流式失败")
         return JSONResponse(
             {"type": "error",
-             "error": {"type": "api_error", "message": str(e)[:300]}},
+             "error": {"type": "api_error",
+                       "message": describe_net_exc(e, provider.name)[:300]}},
             status_code=502)
     return openai_to_anthropic(oa_resp, model)
 

@@ -24,7 +24,9 @@ import uuid
 
 import httpx
 
-from providers.base import AccountHealth, Provider, make_chunk_id
+from providers.base import (
+    AccountHealth, Provider, describe_net_exc, make_chunk_id,
+)
 
 # 每次 _pick_account 都从 config.json 实时读取启用状态
 # ★ 打包态 __file__ 指向解包临时目录, 相对路径会读错 config —— 钉死安装根。
@@ -247,7 +249,11 @@ class WorkBuddyProvider(Provider):
 
     def get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            # retries=2: 仅对「TCP 连接建立失败」自动重试 2 次 (请求未发出,
+            # 幂等安全), 缓解上游瞬时拒连; 已建连后的读写错误不在此列。
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout,
+                transport=httpx.AsyncHTTPTransport(retries=2))
         return self._client
 
     # ---------- 动态模型 (启动/每日刷新, 失败回退静态表) ----------
@@ -430,6 +436,12 @@ class WorkBuddyProvider(Provider):
                 obj = _parse_sse_line(line)
                 if obj:
                     yield obj
+        except Exception as e:  # noqa: BLE001
+            # 流式传输中途网络中断 (2026-10-04): httpx.ReadError/ReadTimeout 的
+            # str() 为空, 裸抛出去客户端只看到 {"message":""}; 包一层带上
+            # provider 与语义说明。★ 不做自动重试: 部分内容已发给客户端,
+            # 重发整段会造成重复输出/工具调用错乱, 只能把原因说清楚。
+            raise RuntimeError(describe_net_exc(e, "workbuddy 流式传输中断")) from e
         finally:
             await resp.aclose()
 

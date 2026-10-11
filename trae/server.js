@@ -102,6 +102,9 @@ function pickAccount() {
 const CREDITS_URL = 'https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage';
 const GET_TOKEN_URL = 'https://api.trae.cn/cloudide/api/v3/common/GetUserToken';
 const CHECK_INTERVAL = 3600 * 1000;
+// 启动首拉等待健康检查的兜底上限 (见文件尾 listen 回调注释): 健康检查最多
+// 逐账号验证+续期, 正常秒级; 90s 还没跑完就视为异常, 照常首拉。
+const CHECK_FIRST_HEALTH_GRACE_MS = 90 * 1000;
 const HEALTH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0';
 let healthCheckRunning = false;
 
@@ -279,15 +282,35 @@ let DYNAMIC_LAST_OK = 0;        // 上次成功拉取时间戳(ms)
 let dynamicRefreshing = false;
 let DYNAMIC_INIT = null;        // 首次拉取的 promise (供 /v1/models 等待)
 
+// ---- 首拉失败重试 (治本 2026-09-27, 修复「glm 等动态模型消失且刷新无效」) ----
+// 旧版病灶: 启动首拉若失败 (HTTP 401 / Cronet 断网), DYNAMIC_MODELS 保持空表 →
+// /v1/models 永远回落 config.json 静态别名表 (仅 15 个, 不含 glm/kimi/qwen 等
+// 约 20 个动态模型); 而 DYNAMIC_INIT 这颗**已失败的 promise 被记忆化**, 之后每个
+// /v1/models 请求都在 await 一个早已结算失败的 promise, 最多要等 24h 定时器才
+// 自愈 —— 用户看到的就是「模型凭空消失, 点刷新也不回来」。
+// 修复三层:
+//   1. 失败且缓存为空时 DYNAMIC_INIT 置 null → 下一次 /v1/models 重新发起首拉;
+//   2. 触发的重拉按指数退避限流 (10s→20s→40s→…→上限 120s), 防止客户端高频
+//      轮询把上游打挂 (成功后计数清零);
+//   3. 启动时序 (见文件尾部 listen 回调): 首拉排在首次健康检查之后 —— 健康检查
+//      会用 cookie 续期过期 token (机器睡一夜后 token 必过期, t=0 即拉必 401),
+//      旧版两者并发, 首拉永远输给续期。
+const DYNAMIC_RETRY_BASE_MS = 10 * 1000;     // 退避基数 10s
+const DYNAMIC_RETRY_MAX_MS = 120 * 1000;     // 退避上限 120s
+let dynamicRetryCount = 0;                   // 连续失败次数 (成功后清零)
+let dynamicNextRetryAt = 0;                  // 最早允许再次尝试的时刻 (ms)
+
 function hasDynamicModels() {
   return DYNAMIC_MODELS.length > 0;
 }
 
 async function fetchUpstreamModels() {
-  // 用任一账号通过 ahaNet 调 get_detail_param, 返回 config_name 数组; 失败抛错。
+  // 通过 ahaNet 调 get_detail_param, 返回 config_name 数组; 失败抛错。
+  // ★ 账号轮换 (2026-09-27): 旧版固定用 valid[0] 一个账号, 该账号 token 失效/风控
+  //   限流时整个列表就拉不到 (server.js:304 自证「缺 X-Uid 时部分账号拿不到全量
+  //   模型」)。现逐个账号尝试, 任一成功即用; 全部失败才抛最后一个错误。
   const valid = ACCOUNTS.filter(a => !a.invalid);
   if (valid.length === 0) throw new Error('TRAE 账号池为空, 无法拉取模型列表');
-  const acc = valid[0];
   const body = {
     function: CFG.function || 'chat_v3',
     config_names: null,
@@ -297,55 +320,115 @@ async function fetchUpstreamModels() {
     mode_type: null,
     agent_type: null,
   };
-  const resp = await ahaNet.fetch('https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param', {
-    method: 'POST',
-    headers: {
-      ...BASE_HDRS,
-      // 与 llm_utils_chat 同口径: 三头同 token + X-Uid (缺 X-Uid 时部分账号拿不到全量模型)
-      'authorization': `Cloud-IDE-JWT ${acc.token}`,
-      'x-cloudide-token': acc.token,
-      'x-ide-token': acc.token,
-      'x-uid': acc.uid || '',
-      'accept': 'application/json',
-      'content-type': 'application/json',
-      'referer': 'https://trae-api-cn.mchost.guru/',
-    },
-    body: JSON.stringify(body),
-  });
-  if (resp.status !== 200) {
-    throw new Error(`get_detail_param HTTP ${resp.status}`);
+  let lastErr = null;
+  for (const acc of valid) {
+    try {
+      const resp = await ahaNet.fetch('https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param', {
+        method: 'POST',
+        headers: {
+          ...BASE_HDRS,
+          // 与 llm_utils_chat 同口径: 三头同 token + X-Uid (缺 X-Uid 时部分账号拿不到全量模型)
+          'authorization': `Cloud-IDE-JWT ${acc.token}`,
+          'x-cloudide-token': acc.token,
+          'x-ide-token': acc.token,
+          'x-uid': acc.uid || '',
+          'accept': 'application/json',
+          'content-type': 'application/json',
+          'referer': 'https://trae-api-cn.mchost.guru/',
+        },
+        body: JSON.stringify(body),
+      });
+      if (resp.status !== 200) {
+        lastErr = new Error(`get_detail_param HTTP ${resp.status} (uid=${acc.uid || '?'})`);
+        continue; // 该账号被拒 → 换下一个 (token 失效等, 健康检查会另行续期)
+      }
+      const data = await resp.json().catch(() => ({}));
+      const list = (data && data.config_info_list) || [];
+      const raw = list
+        .map(c => c && c.config_name)
+        .filter(n => typeof n === 'string' && n.length > 0);
+      // 入口剔除无效模型 (custom_model_* / 内部工具名), 见 isUsableModel 注释
+      const names = raw.filter(isUsableModel);
+      const dropped = raw.filter(n => !isUsableModel(n));
+      if (dropped.length > 0) {
+        console.log(`[动态模型] 已屏蔽 ${dropped.length} 个无效模型: ${dropped.slice(0, 8).join(', ')}${dropped.length > 8 ? '...' : ''}`);
+      }
+      if (names.length === 0) {
+        lastErr = new Error(`get_detail_param 返回空模型列表 (uid=${acc.uid || '?'})`);
+        continue;
+      }
+      return names;
+    } catch (e) {
+      // 该账号网络层失败 (Cronet 断链等) → 同样换下一个, 不让单账号抖动拖垮全表
+      lastErr = e;
+    }
   }
-  const data = await resp.json().catch(() => ({}));
-  const list = (data && data.config_info_list) || [];
-  const raw = list
-    .map(c => c && c.config_name)
-    .filter(n => typeof n === 'string' && n.length > 0);
-  // 入口剔除无效模型 (custom_model_* / 内部工具名), 见 isUsableModel 注释
-  const names = raw.filter(isUsableModel);
-  const dropped = raw.filter(n => !isUsableModel(n));
-  if (dropped.length > 0) {
-    console.log(`[动态模型] 已屏蔽 ${dropped.length} 个无效模型: ${dropped.slice(0, 8).join(', ')}${dropped.length > 8 ? '...' : ''}`);
-  }
-  if (names.length === 0) throw new Error('get_detail_param 返回空模型列表');
-  return names;
+  throw (lastErr || new Error('get_detail_param 全部账号均失败'));
 }
 
-// 拉取并更新缓存; 返回是否成功。force=true 忽略每日间隔强制刷新。
+// ---- last-good 落盘 (加固 2026-09-27) ----
+// 每次成功拉到的动态模型名单写一份数据文件; 进程重启 / 启动首拉遇 401/断网时,
+// 先读它恢复完整列表 (比 15 个静态别名表好得多), 后台重试成功后再覆盖。
+// 失败静默: 落盘只是加速与兜底手段, 读写异常都不影响主流程。
+const DYNAMIC_SNAPSHOT_PATH = path.join(__dirname, '..', 'data', 'trae_models.json');
+
+function saveDynamicSnapshot(names) {
+  try {
+    fs.mkdirSync(path.dirname(DYNAMIC_SNAPSHOT_PATH), { recursive: true });
+    fs.writeFileSync(DYNAMIC_SNAPSHOT_PATH, JSON.stringify({
+      ts: Date.now(),
+      models: names,
+    }, null, 2), 'utf-8');
+  } catch (e) {
+    console.error(`[动态模型] 快照落盘失败 (忽略): ${e.message}`);
+  }
+}
+
+function loadDynamicSnapshot() {
+  try {
+    const raw = fs.readFileSync(DYNAMIC_SNAPSHOT_PATH, 'utf-8');
+    const parsed = JSON.parse(raw);
+    const names = Array.isArray(parsed && parsed.models)
+      ? parsed.models.filter(n => typeof n === 'string' && n.length > 0 && isUsableModel(n))
+      : [];
+    return names.length > 0 ? names : null;
+  } catch {
+    return null; // 无快照 / 损坏 / 被清 → 当作没有, 走静态兜底表
+  }
+}
+
+// 拉取并更新缓存; 返回是否成功。force=true 忽略每日间隔与退避窗口强制刷新。
+// 失败且缓存为空时把 DYNAMIC_INIT 置 null —— 解除「失败 promise 记忆化」,
+// 下一次 /v1/models 会重新发起首拉 (治本, 见 DYNAMIC_RETRY 注释块)。
 async function refreshModels(force) {
   if (dynamicRefreshing) return DYNAMIC_MODELS.length > 0;
   const now = Date.now();
   if (!force && DYNAMIC_LAST_OK && (now - DYNAMIC_LAST_OK) < MODEL_REFRESH_INTERVAL) {
     return DYNAMIC_MODELS.length > 0; // 未到期, 用缓存
   }
+  // 指数退避窗口: 首拉失败后 10s/20s/40s/…(上限 120s) 内不重复打上游,
+  // 防止客户端每秒轮询 /v1/models 时空转重试。force=true (手动刷新) 不受限。
+  if (!force && !DYNAMIC_MODELS.length && now < dynamicNextRetryAt) {
+    return false;
+  }
   dynamicRefreshing = true;
   try {
     const names = await fetchUpstreamModels();
     DYNAMIC_MODELS = names;
     DYNAMIC_LAST_OK = now;
+    dynamicRetryCount = 0;
+    dynamicNextRetryAt = 0;
     console.log(`[动态模型] 更新成功: ${names.length} 个 (${names.slice(0, 8).join(', ')}${names.length > 8 ? '...' : ''})`);
+    saveDynamicSnapshot(names);
     return true;
   } catch (e) {
-    console.error(`[动态模型] 拉取失败: ${e.message} (回退配置表, 保留上次缓存)`);
+    dynamicRetryCount++;
+    const waitMs = Math.min(DYNAMIC_RETRY_BASE_MS * dynamicRetryCount, DYNAMIC_RETRY_MAX_MS);
+    dynamicNextRetryAt = Date.now() + waitMs;
+    console.error(`[动态模型] 拉取失败: ${e.message} (回退配置表, 保留上次缓存; ${Math.round(waitMs / 1000)}s 后允许重试)`);
+    // 治本关键: 首拉失败且没有任何动态缓存 → 丢弃失败 promise, 让下一次
+    // /v1/models 请求重新发起首拉 (旧版把失败 promise 记忆化, 24h 才自愈)。
+    if (!DYNAMIC_MODELS.length) DYNAMIC_INIT = null;
     return DYNAMIC_MODELS.length > 0;
   } finally {
     dynamicRefreshing = false;
@@ -800,16 +883,45 @@ const server = http.createServer(async (req, res) => {
     // 优先返回动态拉取的上游模型, 失败/未拉取时回退 config.json 表
     // 关键: 首次拉取尚未完成时, 等待其结束 (否则会把 config 静态兜底表当成真实列表返回,
     //       网关同步后就只剩十几个模型, 且要等 24h 才修正 —— glm/kimi/qwen 会凭空消失)
+    //
+    // ★ refresh=1 (加固 2026-09-27): 桌面端「刷新模型列表」→ 网关
+    //   sync_models(force=True) 的 force 此前只跳过 Python 侧 24h TTL,
+    //   Node 侧无任何强制重拉入口 —— 静态兜底表 15 个会被当成「同步成功」缓存。
+    //   现网关透传 refresh=1: 丢弃动态缓存与失败 promise, 强制重拉上游
+    //   (源码态 / 独立部署两种形态都生效, 见 providers/trae.py sync_models)。
+    const wantRefresh = url.searchParams.get('refresh') === '1';
+    if (wantRefresh && !dynamicRefreshing) {
+      console.log('[动态模型] 收到强制刷新请求 (refresh=1), 丢弃缓存重拉上游');
+      DYNAMIC_MODELS = [];
+      DYNAMIC_LAST_OK = 0;
+      dynamicRetryCount = 0;
+      dynamicNextRetryAt = 0;
+      DYNAMIC_INIT = refreshModels(true).catch(() => {});
+    }
     if (!hasDynamicModels()) {
       if (!DYNAMIC_INIT) DYNAMIC_INIT = refreshModels(true).catch(() => {});
       await DYNAMIC_INIT;
     }
+    // 快照兜底 (加固 2026-09-27): 重启后首拉仍失败 (上游持续 401/断网) 且无内存
+    // 缓存时, 用上次成功落盘的名单 —— 完整 35 个好过 15 个静态别名表。
+    // 仅补内存缓存, 不改 DYNAMIC_LAST_OK (下轮重试节奏照旧), 成功后会被覆盖。
+    if (!hasDynamicModels()) {
+      const snap = loadDynamicSnapshot();
+      if (snap) {
+        DYNAMIC_MODELS = snap;
+        console.log(`[动态模型] 上游暂不可用, 已从上次快照恢复 ${snap.length} 个模型 (data/trae_models.json)`);
+      }
+    }
     const makeEntry = (id) => ({ id, object: 'model', created: 0, owned_by: 'trae-proxy' });
     let data;
+    // source 标注: 动态=上游真实目录; fallback-static=config 静态别名表。
+    // 网关 (providers/trae.py) 据此识别兜底态, 不再把 15 个假成功缓存 24h。
+    let source = 'dynamic';
     if (hasDynamicModels()) {
       // 出口二次屏蔽: 缓存可能是旧版代码拉取时留下的, 或进程内被外部改写
       data = DYNAMIC_MODELS.filter(isUsableModel).map(makeEntry);
     } else {
+      source = 'fallback-static';
       const fromCfg = Object.entries(CFG.models || {})
         .filter(([id]) => isUsableModel(id)).map(([id]) => makeEntry(id));
       // 补上 default_model 与反向别名, 确保 /v1/models 完整
@@ -823,7 +935,7 @@ const server = http.createServer(async (req, res) => {
       data = fromCfg;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ object: 'list', data }));
+    res.end(JSON.stringify({ object: 'list', source, data }));
     return;
   }
 
@@ -837,6 +949,10 @@ const server = http.createServer(async (req, res) => {
 
       const model = resolveModel(body.model);
       const stream = body.stream !== false;
+      // 是否补发用量尾块: 按 OpenAI 规范, 仅当客户端显式要求
+      // (stream_options.include_usage) 时才发 —— 与 Python 侧各 provider 同一口径,
+      // 避免给不认识该尾块的旧客户端多发一个 choices:[] 事件。
+      const wantUsage = !!(body.stream_options && body.stream_options.include_usage);
       const id = 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 24);
       const created = Math.floor(Date.now() / 1000);
       const send = (chunk) => res.write('data: ' + chunk + '\n\n');
@@ -855,10 +971,24 @@ const server = http.createServer(async (req, res) => {
 
         const merger = new ToolCallStreamMerger();
         let finished = false;
+        // 用量缓存: 上游 token_usage 事件在流尾到达, 收尾时补发 (2026-10-10 修复)。
+        // 旧版此处 onUsage 是空函数, 用量被直接丢弃 —— 客户端
+        // (deepseek-harness / pi-ai) 读不到 prompt_tokens, 无法计算上下文占用。
+        // 非流式分支本来就带 usage, 只有流式分支漏了。
+        let usage = null;
         const endStream = (fr) => {
           if (finished) return;
           finished = true;
           send(openaiChunk(model, id, created, {}, fr || 'stop'));
+          // 用量尾块: choices 为空、只带 usage, 排在 finish_reason 块之后
+          // (OpenAI 规范 + pi-ai 的解析顺序), 且必须在 [DONE] 之前。
+          if (wantUsage) {
+            send(JSON.stringify({
+              id, object: 'chat.completion.chunk', created, model,
+              choices: [],
+              usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            }));
+          }
           res.write('data: [DONE]\n\n');
           res.end();
         };
@@ -930,7 +1060,15 @@ const server = http.createServer(async (req, res) => {
               if (response) send(openaiChunk(model, id, created, { content: response }, null));
               if (reasoning_content) send(openaiChunk(model, id, created, { reasoning_content }, null));
             },
-            onUsage: () => {},
+            onUsage: (u) => {
+              // 上游 token_usage → 归一化三段式, 供 endStream 补发用量尾块
+              usage = {
+                prompt_tokens: u.prompt_tokens || 0,
+                completion_tokens: u.completion_tokens || 0,
+                total_tokens: u.total_tokens ||
+                  ((u.prompt_tokens || 0) + (u.completion_tokens || 0)),
+              };
+            },
             onQueue: onQueueHint,
             onDone: (fr) => endStream(fr),
             onError: (msg) => endStreamError(msg),
@@ -1110,10 +1248,21 @@ server.listen(PORT, HOST, () => {
   }
   setTimeout(() => healthCheck('启动检查'), 1000);
   setInterval(() => healthCheck('每小时定时检查'), CHECK_INTERVAL);
-  // 动态模型: 启动时强制拉取一次, 之后每 MODEL_REFRESH_INTERVAL(默认1天) 刷新
-  if (!DYNAMIC_INIT) DYNAMIC_INIT = refreshModels(true).catch(() => {});
+  // 动态模型: 之后每 MODEL_REFRESH_INTERVAL(默认1天) 刷新一次。
+  // ★ 首拉时序 (治本 2026-09-27): 旧版在 t=0 立即首拉, 与 t≈1s 的启动健康检查
+  //   (cookie 续期过期 token) 并发 —— 机器睡醒后 token 已失效, 首拉必吃 401,
+  //   失败 promise 又被记忆化 → 动态模型缺席 24h。现改为等首次健康检查
+  //   完成后再拉: token 已续新鲜, 首拉即成功。若健康检查意外失败, 90s 兜底
+  //   超时照拉 (结合 refreshModels 内部的退避重试, 不会再有「永不重试」)。
   setInterval(() => { refreshModels(false).catch(() => {}); }, MODEL_REFRESH_INTERVAL);
-  console.log(`[动态模型] 每日自动刷新已启用 (每 ${MODEL_REFRESH_INTERVAL / 1000 / 3600} 小时)`);
+  let dynamicBootPulled = false;
+  const bootPull = () => {
+    if (dynamicBootPulled) return;
+    dynamicBootPulled = true;
+    if (!DYNAMIC_INIT) DYNAMIC_INIT = refreshModels(true).catch(() => {});
+  };
+  setTimeout(bootPull, 1000 + CHECK_FIRST_HEALTH_GRACE_MS);
+  console.log(`[动态模型] 首拉将随启动健康检查之后进行 (兜底 ${CHECK_FIRST_HEALTH_GRACE_MS / 1000}s), 之后每 ${MODEL_REFRESH_INTERVAL / 1000 / 3600} 小时刷新`);
   // ---- Broker 托管 ----
   if (process.env.OPEN_AI_FROM_BROKER === '1') {
     setInterval(() => {

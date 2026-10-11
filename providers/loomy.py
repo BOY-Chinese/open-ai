@@ -27,7 +27,10 @@ import time
 
 import httpx
 
-from .base import AccountHealth, Provider, make_chunk_id
+from .base import (
+    AccountHealth, Provider, make_chunk_id,
+    make_usage_chunk, normalize_usage, wants_usage_in_stream,
+)
 
 logger = logging.getLogger("openapi.providers.loomy")
 
@@ -496,7 +499,13 @@ class LoomyProvider(Provider):
             }
 
         yielded_content = False
+        usage = None
         async for obj in self._chat_events(body):
+            # 用量事件 (上游流尾补发, 见 _to_upstream_body 的 include_usage 说明):
+            # 无 choices 只带 usage, 必须单独接住, 否则会被下面的 choices
+            # 遍历逻辑整段丢掉 —— 客户端就永远读不到 token 用量。
+            if obj.get("usage"):
+                usage = normalize_usage(obj["usage"])
             for choice in obj.get("choices", []):
                 delta = choice.get("delta") or {}
                 out = {}
@@ -513,3 +522,9 @@ class LoomyProvider(Provider):
                     yield chunk({}, finish=choice["finish_reason"])
         if not yielded_content:
             yield chunk({}, finish="stop")
+        # 用量尾块排在 finish_reason 之后 (OpenAI 规范 + pi-ai 解析顺序),
+        # 供客户端计算上下文占用。
+        if wants_usage_in_stream(body):
+            yield make_usage_chunk(
+                cid, created, model,
+                usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})

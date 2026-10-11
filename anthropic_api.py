@@ -39,12 +39,103 @@ def strip_problematic_headers(text: str) -> str:
     return "\n".join(cleaned).strip("\n")
 
 
+def sanitize_openai_messages(msgs: list) -> list:
+    """规范化 OpenAI 消息序列, 保证 tool_calls 与 tool 结果严格配对。
+
+    背景 (2026-10-11): 上游腾讯 copilot 对 tool 配对校验极严, 一旦
+    「tool_calls 与 tool 结果对不上」即返回 HTTP 400 / code 11148
+    "tool calls and tool results do not match, please start a new conversation"。
+
+    而 Claude Code 在流式异常 (见 openai_stream_to_anthropic 的索引修复) 时,
+    会把错误提示作为 **assistant 文本消息** 写回会话历史, 且恰好插在
+    tool_use 与 tool_result 之间; 该脏历史每轮都被原样转发, 导致请求
+    **永久性失败** —— 用户只能不断新建会话, 但新会话很快又被同样污染。
+
+    本函数把五类畸形形态抹平为合法序列:
+      ① assistant 带 tool_calls 却收到悬空(无结果) → 补占位 tool 结果
+      ② 悬空 tool_call 之后又来了别的消息 → 先补占位再继续
+      ③ tool 结果找不到对应 tool_call (孤儿) → 降级为普通文本, 不破坏序列
+      ④ tool_call id 为空 → 就地补合成 id (不丢弃, 保住内容)
+      ⑤ 相邻同角色 user 消息 → 合并
+    """
+    out: list = []
+    pending: list = []          # 已发出但还没收到结果的 tool_call_id
+
+    for m in msgs:
+        role = m.get("role")
+
+        if role == "assistant":
+            # ① 上一批 tool_call 没收到结果 → 补占位, 保证配对
+            for cid in pending:
+                out.append({"role": "tool", "tool_call_id": cid,
+                            "content": "[interrupted: no result returned]"})
+            pending = []
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                # ④ 空 id 就地补合成 id (丢弃会让其 tool 结果变孤儿)
+                fixed = []
+                for i, t in enumerate(tcs):
+                    t = dict(t)
+                    if not t.get("id"):
+                        t["id"] = f"call_synth_{len(out)}_{i}"
+                    fixed.append(t)
+                m = dict(m, tool_calls=fixed)
+                pending = [t["id"] for t in fixed]
+            out.append(m)
+            continue
+
+        if role == "tool":
+            cid = m.get("tool_call_id")
+            if not cid and pending:
+                # ④ 空 id 的结果: 按顺序认领第一个待配对 id
+                cid = pending.pop(0)
+                out.append({"role": "tool", "tool_call_id": cid,
+                            "content": m.get("content") or ""})
+            elif cid and cid in pending:
+                pending.remove(cid)
+                out.append(m)
+            else:
+                # ③ 孤儿结果: 降级为文本, 避免破坏序列
+                out.append({"role": "user",
+                            "content": f"[orphan tool_result dropped: {cid or 'empty'}]"})
+            continue
+
+        # ② 其它角色插在 tool_call 与结果之间 → 先补齐工具结果, 再放本条
+        if pending:
+            for cid in pending:
+                out.append({"role": "tool", "tool_call_id": cid,
+                            "content": "[interrupted: no result returned]"})
+            pending = []
+        out.append(m)
+
+    # 收尾: 补最后一个悬空 tool_call
+    for cid in pending:
+        out.append({"role": "tool", "tool_call_id": cid,
+                    "content": "[interrupted: no result returned]"})
+
+    # ⑤ 合并相邻同角色 user 消息 (纯文本才合并, 保持结构简单)
+    merged: list = []
+    for m in out:
+        if (merged and merged[-1].get("role") == "user" and m.get("role") == "user"
+                and isinstance(merged[-1].get("content"), str)
+                and isinstance(m.get("content"), str)):
+            merged[-1]["content"] += "\n" + m["content"]
+        else:
+            merged.append(m)
+    return merged
+
+
 def anthropic_to_openai(body: dict) -> dict:
     oa: dict = {
         "model": body.get("model") or "",
         "messages": [],
         "stream": bool(body.get("stream")),
     }
+    # Anthropic 协议要求 message_delta 必带 usage (input/output_tokens 是必填字段),
+    # 而网关在这里扮演「provider 的客户端」—— 必须显式索要用量尾块,
+    # 否则 provider.stream() 不会补发 usage, 只能退回按内容块计数的粗估
+    # (2026-10-10)。非流式路径不受影响 (provider.chat 恒带 usage)。
+    oa["stream_options"] = {"include_usage": True}
     if body.get("max_tokens"):
         oa["max_tokens"] = body["max_tokens"]
     for k in ("temperature", "top_p"):
@@ -77,7 +168,12 @@ def anthropic_to_openai(body: dict) -> dict:
         if role == "assistant":
             text = _text_from_blocks(blocks)
             tool_uses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
-            oa_msg: dict = {"role": "assistant", "content": text}
+            # ★ 有 tool_calls 时不再附带空 content (2026-10-11):
+            #   上游把「content:"" + tool_calls」判为 tool calls/results 失配
+            #   (workbuddy 错误码 11148)。仅在没有 tool_calls 且无文本时补 ""。
+            oa_msg: dict = {"role": "assistant"}
+            if text:
+                oa_msg["content"] = text
             if tool_uses:
                 oa_msg["tool_calls"] = [
                     {
@@ -90,12 +186,16 @@ def anthropic_to_openai(body: dict) -> dict:
                     }
                     for i, b in enumerate(tool_uses)
                 ]
+            elif not text:
+                oa_msg["content"] = ""
             msgs.append(oa_msg)
         elif role == "user":
             text = _text_from_blocks(blocks)
             tool_results = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_result"]
-            if text:
-                msgs.append({"role": "user", "content": text})
+            # ★ tool 结果必须先于同一 user 消息里的文本发出 (2026-10-11):
+            #   OpenAI 协议要求 role=tool 紧跟在带 tool_calls 的 assistant 之后。
+            #   原实现先发文本再发 tool 结果, 会在两者之间插入一条 user 消息,
+            #   上游即判「tool calls and tool results do not match」(11148)。
             for b in tool_results:
                 tcontent = b.get("content")
                 if isinstance(tcontent, list):
@@ -105,9 +205,11 @@ def anthropic_to_openai(body: dict) -> dict:
                     "tool_call_id": b.get("tool_use_id") or "",
                     "content": tcontent or "",
                 })
+            if text:
+                msgs.append({"role": "user", "content": text})
         else:
             msgs.append({"role": role, "content": content})
-    oa["messages"] = msgs
+    oa["messages"] = sanitize_openai_messages(msgs)
 
     # tools
     tools = body.get("tools")
@@ -212,7 +314,9 @@ async def openai_stream_to_anthropic(gen, model: str):
     text_block_started = False
     tool_states: dict = {}
     tool_started: dict = {}
+    tool_offset: int | None = None   # 工具块索引偏移 (文本块占了 0 则为 1), 见下方说明
     output_tokens = 0
+    usage: dict | None = None
     stop_reason = "end_turn"
 
     async for chunk in gen:
@@ -231,6 +335,11 @@ async def openai_stream_to_anthropic(gen, model: str):
                 },
             })
             first = False
+
+        # 用量尾块 (choices 为空, 只带 usage): 上游真实用量在流尾才到,
+        # 记下来交给收尾的 message_delta 上报 (2026-10-10)。
+        if chunk.get("usage"):
+            usage = chunk["usage"]
 
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta") or {}
@@ -251,10 +360,21 @@ async def openai_stream_to_anthropic(gen, model: str):
             output_tokens += 1
 
         for tc in delta.get("tool_calls") or []:
-            idx = tc.get("index", 0)
+            raw_idx = tc.get("index", 0)
+            # ★ 索引偏移 (2026-10-11): 上游 tool_calls[].index 独立从 0 开始,
+            #   与文本块无关; 而文本块固定占用 index 0。若模型「先说一句再调
+            #   工具」(Claude Code 系统提示鼓励如此, 故几乎每次都命中), 两者
+            #   就会共用 index 0 → 发出两条 index=0 的 content_block_stop →
+            #   Claude Code 抛 StreamMalformedEventError("Content block already
+            #   closed"), 对外显示 "The response stream was malformed";
+            #   同时 input_json_delta 被挂到文本块上, 导致工具参数丢失/串位。
+            #   故: 文本块已占用 index 0 时, 工具块整体后移一位。
+            if tool_offset is None:
+                tool_offset = 1 if text_block_started else 0
+            idx = raw_idx + tool_offset
             _merge_tool_calls(tool_states, tc)
-            st = tool_states[idx]
-            if not tool_started.get(idx):
+            st = tool_states[raw_idx]
+            if not tool_started.get(raw_idx):
                 yield _anthropic_sse("content_block_start", {
                     "type": "content_block_start",
                     "index": idx,
@@ -265,7 +385,7 @@ async def openai_stream_to_anthropic(gen, model: str):
                         "input": {},
                     },
                 })
-                tool_started[idx] = True
+                tool_started[raw_idx] = True
             fn = tc.get("function") or {}
             if fn.get("arguments"):
                 yield _anthropic_sse("content_block_delta", {
@@ -284,12 +404,19 @@ async def openai_stream_to_anthropic(gen, model: str):
 
     if text_block_started:
         yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-    for idx in sorted(tool_started):
-        yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+    for raw_idx in sorted(tool_started):
+        yield _anthropic_sse("content_block_stop", {
+            "type": "content_block_stop",
+            "index": raw_idx + (tool_offset or 0)})
     yield _anthropic_sse("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
+        # 优先用上游真实用量; 拿不到时才退回「按内容块计数」的粗估
+        # (旧行为, 每个 content delta 记 1 —— 与真实 token 数差距很大)。
+        "usage": {
+            "input_tokens": int((usage or {}).get("prompt_tokens") or 0),
+            "output_tokens": int((usage or {}).get("completion_tokens") or output_tokens),
+        },
     })
     yield _anthropic_sse("message_stop", {"type": "message_stop"})
 

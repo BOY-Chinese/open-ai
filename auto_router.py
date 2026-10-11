@@ -298,7 +298,12 @@ async def auto_chat(route_provider, providers: dict, body: dict, chain: dict) ->
 
 
 def _chunk_has_payload(chunk: dict) -> bool:
-    """判断一个流式 chunk 是否携带真实内容 (content / reasoning / tool_calls)。"""
+    """判断一个流式 chunk 是否携带真实内容 (content / reasoning / tool_calls)。
+
+    用量尾块 (choices 为空、只带 usage) 不算真实内容 —— 这是刻意的:
+    它到达时该模型往往已产出过内容 (produced 已为 True), 走的是直接透传路径;
+    而若某模型只回用量不回内容, 也确实应当判为「无输出」并切换下一个。
+    """
     for choice in (chunk.get("choices") or []):
         delta = choice.get("delta") or {}
         if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):

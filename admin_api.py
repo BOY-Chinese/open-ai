@@ -32,6 +32,7 @@ import time
 import urllib.request
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Body, HTTPException
 
 logger = logging.getLogger("openapi.admin")
@@ -643,13 +644,21 @@ def _loomy_group_credits(lc, g: dict) -> tuple[float | None, str]:
 
 
 def _run_blocking(coro):
-    """在线程里安全地执行一个协程（线程池线程内没有事件循环）。
+    """【已废弃 · Bug2 修复 2026-09-27】禁止在线程里另起事件循环跑协程。
 
-    用途：`_in_thread` 的 worker 里复用另一个 async 端点 —— 直接 await 不行
-    （worker 是同步函数），`asyncio.run` 在已有 loop 的线程里会报错，
-    线程池线程恰好没有 loop，用 asyncio.run 最干净。
+    旧版 ``asyncio.run(coro)`` 会在 worker 线程里**新建并随后关闭**一个事件
+    循环；协程一旦触碰了任何**长寿命** async 资源（provider 的
+    ``httpx.AsyncClient`` 连接池等，绑定主循环），之后主循环复用该连接就会抛
+    ``RuntimeError: Event loop is closed``（gateway_err.log 实锤：
+    loomy/workbuddy-intl 多次中招，错误经 SSE 透传给 DSH 显示为
+    PI_AI_ERROR「本轮运行失败」）。
+
+    现保留此函数仅为让潜在残留调用**尽快暴露**（fail-fast），
+    全部调用点已改为在 async 端点里直接 ``await``（见 refresh_account_signin）。
     """
-    return asyncio.run(coro)
+    raise RuntimeError(
+        "_run_blocking 已废弃 (2026-09-27): 线程内 asyncio.run 会污染长寿命 "
+        "httpx 连接池, 引发 'Event loop is closed'。请在 async 端点里直接 await。")
 
 
 # ─────────────────── 签到补签（供 POST /accounts/signin/refresh 使用） ───────
@@ -838,6 +847,101 @@ async def accounts_credits(channel: str | None = None):
             "cached": bool(_CREDIT_CACHE), "refreshedAt": _CREDIT_CACHE_TS}
 
 
+def _accounts_signin_read(channel: str | None) -> dict:
+    """GET /accounts/signin 的同步读取体（sqlite + 本地 JSON，零联网）。
+
+    2026-09-27 从端点内嵌 ``_work`` 提取成独立函数：POST /accounts/signin/refresh
+    也要读同一张表，旧版经 ``_run_blocking(asyncio.run)`` 在线程里起循环复用
+    async 端点 —— 纯读本地却付出「污染事件循环」的代价（Bug2 根因之一，
+    见 _run_blocking docstring）。现在两端点都直接 ``to_thread`` 调本函数，
+    全程不创建任何 asyncio 循环。
+    """
+    _, ca = _history_accounts()
+    day = ca.day_str(time.time()) if ca is not None else time.strftime("%Y-%m-%d")
+    by_platform = ca.gains_accounts(day) if ca is not None else {}
+    out: dict[str, dict] = {}
+    # Loomy gain 表的 uid（桌面 userid / web:<phone>）要映射到合并行 id ——
+    # 否则同一个人的凭证会以两个 key 出现，界面长出第二行
+    loomy_rid_by_uid: dict[str, str] = {}
+    if not channel or channel == "all" or channel == "Loomy":
+        try:
+            accs = ((_read_config().get("providers") or {})
+                    .get("loomy") or {}).get("accounts") or []
+            for phone, g in _loomy_groups(accs).items():
+                d, w = g.get("desktop"), g.get("web")
+                rid = _account_id("Loomy", (d or w)[1], (d or w)[0])
+                for half in (d, w):
+                    if half:
+                        loomy_rid_by_uid[str(half[1].get("userid") or "")] = rid
+        except Exception as e:  # noqa: BLE001
+            logger.warning("loomy 合并行映射失败: %s", e)
+    for ch, platform in CHANNEL_TO_PLATFORM.items():
+        if channel and channel != "all" and ch != channel:
+            continue
+        for uid, info in (by_platform.get(platform) or {}).items():
+            # Loomy 的映射目标已是完整合并行 id（`Loomy:<userid>`），
+            # 不能再套一层 `{ch}:` 前缀（会得到 Loomy:Loomy:...）
+            if ch == "Loomy" and str(uid) in loomy_rid_by_uid:
+                key = loomy_rid_by_uid[str(uid)]
+            else:
+                key = f"{ch}:{uid}"
+            out[key] = {
+                "checkedIn": True,
+                "amount": info["amount"],
+                "kinds": info["kinds"],
+                "ts": info["ts"],
+            }
+
+    # Loomy: 读按天状态缓存（loomy_client 写、这里只读，保持本端点零联网）。
+    # 缓存按 userid 记（web:<phone> / 桌面 userid），但界面是合并行 ——
+    # 把同手机号两条记录的凭证都挂到合并行的 id 上（master 指定：
+    # 签到/积分走 Web 通道），Web 缺席时用桌面自己的凭证兜底。
+    if not channel or channel == "all" or channel == "Loomy":
+        try:
+            lc = _loomy_client()
+            state = lc.load_daily_state(day) or {}
+            cfg = _read_config()
+            accs = ((cfg.get("providers") or {}).get("loomy") or {}) \
+                .get("accounts") or []
+            for phone, g in _loomy_groups(accs).items():
+                d, w = g.get("desktop"), g.get("web")
+                rid = _account_id("Loomy", (d or w)[1], (d or w)[0])
+                # Web 凭证优先；同组桌面自己的记录作为兜底
+                entries = []
+                for half in (w, d):
+                    if not half:
+                        continue
+                    uid = str(half[1].get("userid") or "")
+                    st = state.get(uid)
+                    if isinstance(st, dict) and st.get("claimed"):
+                        entries.append(st)
+                if not entries:
+                    continue  # 该行今天没有任何领取凭证 → 前端按「未签到」
+                best = entries[0]
+                amount = 0.0
+                for k in ("dailyBalance", "currentBalance"):
+                    try:
+                        v = best.get(k)
+                        if v is not None:
+                            amount = max(amount, float(v))
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                kinds = ["daily-login"]
+                if best.get("alreadyProcessed"):
+                    kinds = ["daily-login(已领过)"]
+                out[rid] = {
+                    "checkedIn": True,
+                    "amount": amount,
+                    "kinds": kinds,
+                    "ts": int(best.get("ts") or 0),
+                }
+        except Exception as e:  # noqa: BLE001
+            logger.warning("loomy 签到状态缓存读取失败: %s", e)
+
+    return {"signin": out, "day": day, "updatedAt": _now()}
+
+
 @router.get("/accounts/signin")
 async def accounts_signin(channel: str | None = None):
     """今日签到结果（**只读本地流水库，不联网**，毫秒级）。
@@ -864,93 +968,7 @@ async def accounts_signin(channel: str | None = None):
     返回 {signin: {<accountId>: {checkedIn, amount, kinds, ts}}, day, updatedAt}
     —— key 与 GET /accounts 的 account id 同构（`通道:uid`），前端可直接对表。
     """
-    def _work() -> dict:
-        _, ca = _history_accounts()
-        day = ca.day_str(time.time()) if ca is not None else time.strftime("%Y-%m-%d")
-        by_platform = ca.gains_accounts(day) if ca is not None else {}
-        out: dict[str, dict] = {}
-        # Loomy gain 表的 uid（桌面 userid / web:<phone>）要映射到合并行 id ——
-        # 否则同一个人的凭证会以两个 key 出现，界面长出第二行
-        loomy_rid_by_uid: dict[str, str] = {}
-        if not channel or channel == "all" or channel == "Loomy":
-            try:
-                accs = ((_read_config().get("providers") or {})
-                        .get("loomy") or {}).get("accounts") or []
-                for phone, g in _loomy_groups(accs).items():
-                    d, w = g.get("desktop"), g.get("web")
-                    rid = _account_id("Loomy", (d or w)[1], (d or w)[0])
-                    for half in (d, w):
-                        if half:
-                            loomy_rid_by_uid[str(half[1].get("userid") or "")] = rid
-            except Exception as e:  # noqa: BLE001
-                logger.warning("loomy 合并行映射失败: %s", e)
-        for ch, platform in CHANNEL_TO_PLATFORM.items():
-            if channel and channel != "all" and ch != channel:
-                continue
-            for uid, info in (by_platform.get(platform) or {}).items():
-                # Loomy 的映射目标已是完整合并行 id（`Loomy:<userid>`），
-                # 不能再套一层 `{ch}:` 前缀（会得到 Loomy:Loomy:...）
-                if ch == "Loomy" and str(uid) in loomy_rid_by_uid:
-                    key = loomy_rid_by_uid[str(uid)]
-                else:
-                    key = f"{ch}:{uid}"
-                out[key] = {
-                    "checkedIn": True,
-                    "amount": info["amount"],
-                    "kinds": info["kinds"],
-                    "ts": info["ts"],
-                }
-
-        # Loomy: 读按天状态缓存（loomy_client 写、这里只读，保持本端点零联网）。
-        # 缓存按 userid 记（web:<phone> / 桌面 userid），但界面是合并行 ——
-        # 把同手机号两条记录的凭证都挂到合并行的 id 上（master 指定：
-        # 签到/积分走 Web 通道），Web 缺席时用桌面自己的凭证兜底。
-        if not channel or channel == "all" or channel == "Loomy":
-            try:
-                lc = _loomy_client()
-                state = lc.load_daily_state(day) or {}
-                cfg = _read_config()
-                accs = ((cfg.get("providers") or {}).get("loomy") or {}) \
-                    .get("accounts") or []
-                for phone, g in _loomy_groups(accs).items():
-                    d, w = g.get("desktop"), g.get("web")
-                    rid = _account_id("Loomy", (d or w)[1], (d or w)[0])
-                    # Web 凭证优先；同组桌面自己的记录作为兜底
-                    entries = []
-                    for half in (w, d):
-                        if not half:
-                            continue
-                        uid = str(half[1].get("userid") or "")
-                        st = state.get(uid)
-                        if isinstance(st, dict) and st.get("claimed"):
-                            entries.append(st)
-                    if not entries:
-                        continue  # 该行今天没有任何领取凭证 → 前端按「未签到」
-                    best = entries[0]
-                    amount = 0.0
-                    for k in ("dailyBalance", "currentBalance"):
-                        try:
-                            v = best.get(k)
-                            if v is not None:
-                                amount = max(amount, float(v))
-                                break
-                        except (TypeError, ValueError):
-                            continue
-                    kinds = ["daily-login"]
-                    if best.get("alreadyProcessed"):
-                        kinds = ["daily-login(已领过)"]
-                    out[rid] = {
-                        "checkedIn": True,
-                        "amount": amount,
-                        "kinds": kinds,
-                        "ts": int(best.get("ts") or 0),
-                    }
-            except Exception as e:  # noqa: BLE001
-                logger.warning("loomy 签到状态缓存读取失败: %s", e)
-
-        return {"signin": out, "day": day, "updatedAt": _now()}
-
-    return await _in_thread(_work)
+    return await _in_thread(_accounts_signin_read, channel)
 
 
 @router.post("/accounts/signin/refresh")
@@ -993,38 +1011,43 @@ async def refresh_account_signin(payload: dict = Body(default={})):
     else:
         ch_norm = None
 
-    def _work() -> dict:
-        signin = (_run_blocking(accounts_signin(channel)) or {}).get("signin") or {}
-        targets = _signin_targets(ch_norm, signin)
+    def _signin_table_sync() -> dict:
+        # GET /accounts/signin 的读取体 (同步: sqlite + 本地 JSON 缓存, 零联网)。
+        # 旧版经 _run_blocking(asyncio.run) 在线程里起循环执行 async 端点 ——
+        # 这正是「Event loop is closed」的制造机之一 (见 _run_blocking docstring);
+        # 现在按其本相调用: 纯同步读取, 直接 to_thread, 全程不碰 asyncio 循环。
+        return _accounts_signin_read(channel)
 
-        ran: list[str] = []
-        # force：无条件重跑本通道的签到（用户显式要求），忽略 pending 判定
-        if force or targets["wb"]:
-            ran.append("--wb-only")
-        if force or targets["trae"]:
-            ran.append("--trae-only")
+    signin = (await _in_thread(_signin_table_sync) or {}).get("signin") or {}
+    targets = _signin_targets(ch_norm, signin)
 
-        errors: list[str] = []
-        for flag in ran:
-            rc, err = _run_signin_script([flag])
-            if rc != 0:
-                errors.append(f"signin_all.py {flag} 退出码 {rc}{('：' + err) if err else ''}")
+    ran: list[str] = []
+    # force：无条件重跑本通道的签到（用户显式要求），忽略 pending 判定
+    if force or targets["wb"]:
+        ran.append("--wb-only")
+    if force or targets["trae"]:
+        ran.append("--trae-only")
 
-        # 重新读一次：签到结果落在流水库 / loomy 状态缓存里，必须回读才有意义
-        after = (_run_blocking(accounts_signin(channel)) or {})
-        return {
-            "ok": True,
-            "channel": channel or "all",
-            "force": force,
-            "ran": ran,
-            "pending": targets["pending"],
-            "errors": errors[:10],
-            "signin": after.get("signin") or {},
-            "day": after.get("day") or "",
-            "updatedAt": _now(),
-        }
+    errors: list[str] = []
+    for flag in ran:
+        # 子进程调用 (纯同步 subprocess) → 线程池执行, 不阻塞主循环
+        rc, err = await _in_thread(_run_signin_script, [flag])
+        if rc != 0:
+            errors.append(f"signin_all.py {flag} 退出码 {rc}{('：' + err) if err else ''}")
 
-    return await _in_thread(_work)
+    # 重新读一次：签到结果落在流水库 / loomy 状态缓存里，必须回读才有意义
+    after = await _in_thread(_signin_table_sync) or {}
+    return {
+        "ok": True,
+        "channel": channel or "all",
+        "force": force,
+        "ran": ran,
+        "pending": targets["pending"],
+        "errors": errors[:10],
+        "signin": after.get("signin") or {},
+        "day": after.get("day") or "",
+        "updatedAt": _now(),
+    }
 
 
 @router.post("/accounts/credits/refresh")
@@ -1125,18 +1148,23 @@ async def toggle_account(payload: dict = Body(...)):
         if channel == "Loomy":
             for phone, g in _loomy_groups(accs).items():
                 d, w = g.get("desktop"), g.get("web")
-                if _account_id(channel, (d or w)[1], (d or w)[0]) != acc_id:
+                # 合并行必定至少有一半 (分组时按 phone 建组, 空组不会存在);
+                # 仍显式判空, 免得以后 _loomy_groups 改语义时在这里炸 IndexError
+                anchor = d or w
+                if anchor is None:
                     continue
-                new_enabled = None
-                for half in (d, w):
-                    if not half:
-                        continue
-                    idx, acc = half
-                    if new_enabled is None:
-                        # 以「行当前状态」取反：任一半边启用即视为启用
-                        new_enabled = not any(
-                            a.get("enabled", True) is not False
-                            for _i, a in (d, w) if a)
+                if _account_id(channel, anchor[1], anchor[0]) != acc_id:
+                    continue
+                # 以「行当前状态」取反: 任一半边启用即视为启用。
+                # ★ 必须先用 halves 过滤掉缺失的半边再解包 ——
+                #   旧版写成 `for _i, a in (d, w) if a`, 而生成器里
+                #   **解包先于 if 过滤执行**, 半边为 None 时直接
+                #   TypeError: cannot unpack non-iterable NoneType object
+                #   → 接口 500, 账号「关了再也开不回来」(2026-10-11 修复)。
+                halves = [h for h in (d, w) if h]
+                new_enabled = not any(
+                    a.get("enabled", True) is not False for _i, a in halves)
+                for _idx, acc in halves:
                     acc["enabled"] = new_enabled
                 _write_config(cfg)
                 return {"ok": True, "id": acc_id, "enabled": bool(new_enabled)}
@@ -1656,40 +1684,72 @@ async def list_models(channel: str | None = None):
 
 @router.post("/models/refresh")
 async def refresh_models(payload: dict = Body(default={})):
-    """强制各 provider 重新拉取上游模型目录（联网，可能耗时数十秒）。"""
-    def _work() -> dict:
+    """强制各 provider 重新拉取上游模型目录（联网，可能耗时数十秒）。
+
+    ★ 实现变更（2026-09-27，两个 bug 一起修）：
+
+    Bug2（「Event loop is closed / PI_AI_ERROR」的源头之一）：
+      旧版把 ``_refresh_all`` 丢进线程池用 ``asyncio.run`` 跑 —— 线程里新建的
+      事件循环在 ``asyncio.run`` 返回时被关闭，而 workbuddy-intl / loomy 的
+      provider 持有**长寿命** ``httpx.AsyncClient``，连接被绑死在那个循环上。
+      此后任何复用该连接的请求（或连接池清理时的 ``aclose``）都会撞上
+      ``RuntimeError: Event loop is closed``，错误顺着 SSE 错误块透传给 DSH，
+      被归类成 PI_AI_ERROR 展示成「本轮运行失败」。日志实锤：
+      2026-09-27 12:38:31 刷新序列里 loomy 报 loop-closed（同轮 trae 正常）。
+      修复：本端点本来就是 async —— 直接在**主事件循环**上 ``await``，
+      不再新建/销毁循环（await 点都是网络 IO，不会阻塞 FastAPI 循环）。
+
+    Bug1（trae 模型列表缺失且「刷新」无效）：
+      旧版的 force 只跳过了 Python 侧 24h TTL；trae provider 转发的 Node 后端
+      在拉取失败后一直用静态兜底表（15 个）应付，列表永远缺 glm 等 ~20 个模型。
+      修复：force 时给 Node 透传 ``?refresh=1``（server.js 已支持：丢弃缓存
+      强制重拉上游）；可选 ``clear=true``（彻底刷新）先打 Node 的
+      ``/v1/admin/reconnect`` 让健康检查用 cookie 续期 token —— 首拉 401 的
+      根因就是过期 token，续期后重拉必成功。
+    """
+    def _providers() -> dict:
+        import main as gateway  # type: ignore
+        return getattr(gateway, "PROVIDERS", {}) or {}
+
+    try:
+        providers = await _in_thread(_providers)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"无法访问 PROVIDERS: {e}")
+
+    if bool(payload.get("clear")):
+        # 彻底刷新：先让 trae Node 健康检查续期 token（HTTP 转发，安全），
+        # 失败不阻断 —— 后续重拉靠 refresh=1 与退避重试兜底。
+        trae_prov = providers.get("trae")
+        if trae_prov is not None and getattr(trae_prov, "base_url", None):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    await client.post(f"{trae_prov.base_url.rstrip('/')}/admin/reconnect")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("trae reconnect 预热失败 (继续刷新): %s", e)
+
+    reloaded, errors = [], []
+
+    # 各 provider 的「重新拉取上游模型目录」方法名不统一：
+    #   workbuddy / workbuddy-intl → refresh_models
+    #   trae                       → sync_models（转发 Node 后端, force 带 refresh=1）
+    # 原先只找 refresh_models，导致 Trae 被静默跳过，「刷新模型列表」按钮对 Trae 无效。
+    async def _refresh_one(pkey: str, prov) -> None:
+        fn = (getattr(prov, "refresh_models", None)
+              or getattr(prov, "sync_models", None))
+        if fn is None:
+            return
         try:
-            import main as gateway  # type: ignore
-            providers = getattr(gateway, "PROVIDERS", {}) or {}
+            await fn(force=True)
+            reloaded.append(pkey)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=f"无法访问 PROVIDERS: {e}")
+            errors.append(f"{pkey}: {e!r}")
 
-        import asyncio as _aio
-        reloaded, errors = [], []
+    # 串行 await 在主循环上执行 —— 绝不再进线程/新事件循环（Bug2 根因）
+    for pkey, prov in providers.items():
+        await _refresh_one(pkey, prov)
 
-        async def _refresh_all():
-            for pkey, prov in providers.items():
-                # 各 provider 的「重新拉取上游模型目录」方法名不统一：
-                #   workbuddy / workbuddy-intl → refresh_models
-                #   trae                       → sync_models（转发 Node 后端）
-                # 原先只找 refresh_models，导致 Trae 被静默跳过，
-                # 「刷新模型列表」按钮对 Trae 无效。
-                fn = (getattr(prov, "refresh_models", None)
-                      or getattr(prov, "sync_models", None))
-                if fn is None:
-                    continue
-                try:
-                    await fn(force=True)
-                    reloaded.append(pkey)
-                except Exception as e:  # noqa: BLE001
-                    errors.append(f"{pkey}: {e!r}")
-
-        # 端点本身已在工作线程中，这里为该协程单独跑一个事件循环
-        _aio.run(_refresh_all())
-        return {"ok": True, "reloaded": reloaded, "errors": errors[:10],
-                "total": len(_models_from_providers())}
-
-    return await _in_thread(_work)
+    return {"ok": True, "reloaded": reloaded, "errors": errors[:10],
+            "total": len(_models_from_providers())}
 
 
 @router.post("/models/check")

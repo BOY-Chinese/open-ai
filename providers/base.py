@@ -120,6 +120,70 @@ def make_chunk_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
 
+def normalize_usage(usage) -> dict | None:
+    """把上游 usage 归一化成 OpenAI 三段式, 保留全部附加字段。
+
+    背景 (2026-10-10): 各上游 usage 形状不一 —— 腾讯系带一大票
+    prompt_tokens_details/completion_tokens_details, loomy 额外带
+    points_consumed, 个别通道可能缺 total_tokens。这里只保证
+    prompt_tokens / completion_tokens / total_tokens 三个整数一定存在
+    (缺失补 0 / 用两者之和), **其余字段原样保留** ——
+    客户端 (pi-ai) 还要读 prompt_tokens_details.cached_tokens 算缓存命中,
+    不能在这里裁剪。
+
+    入参为空/非法时返回 None, 调用方据此决定是否发用量尾块。
+    """
+    if not isinstance(usage, dict) or not usage:
+        return None
+    out = dict(usage)
+
+    def _int(v) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    p = _int(out.get("prompt_tokens"))
+    c = _int(out.get("completion_tokens"))
+    out["prompt_tokens"] = p
+    out["completion_tokens"] = c
+    if out.get("total_tokens") in (None, ""):
+        out["total_tokens"] = p + c
+    else:
+        out["total_tokens"] = _int(out.get("total_tokens"))
+    return out
+
+
+def wants_usage_in_stream(body: dict) -> bool:
+    """客户端是否要求流式响应附带用量尾块 (OpenAI 的 stream_options)。
+
+    按 OpenAI 规范, 只有 `stream_options.include_usage = true` 时才补发尾块。
+    实测 pi-ai (deepseek-harness 的 LLM 适配层) 恒发该字段
+    (`supportsUsageInStreaming` 默认 true), 因此这条判断不会挡住 DSH。
+    """
+    return bool((body.get("stream_options") or {}).get("include_usage"))
+
+
+def make_usage_chunk(cid: str, created: int, model: str, usage: dict) -> dict:
+    """构造流式响应末尾的「用量尾块」: choices 为空, 只带 usage。
+
+    背景 (2026-10-10 修复): 各 provider 的 stream() 只转发 content /
+    reasoning_content / tool_calls 增量, 上游在流尾补发的 usage 事件被整段
+    丢弃 —— 客户端 (deepseek-harness / pi-ai) 因此永远读不到 prompt_tokens,
+    无法计算上下文占用。本函数统一各通道的用量尾块形状。
+
+    OpenAI 规范里 stream_options.include_usage 要求的正是
+    「choices: [] + usage」的独立尾块 (排在带 finish_reason 的块之后),
+    pi-ai 也按「先读 chunk.usage, 再取 choices[0]」的顺序解析, 因此
+    空 choices 不会影响其内容聚合。
+    """
+    return {
+        "id": cid, "object": "chat.completion.chunk",
+        "created": created, "model": model,
+        "choices": [], "usage": usage,
+    }
+
+
 def describe_net_exc(e: BaseException, prefix: str = "") -> str:
     """把异常转成「永不落空」的人类可读描述 (任何情况下都返回非空字符串)。
 

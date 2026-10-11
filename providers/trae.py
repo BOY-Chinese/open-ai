@@ -83,6 +83,7 @@ class TraeProvider(Provider):
         # ---- 动态模型: 转发 Node 后端 /v1/models (Node 侧每日拉上游), 失败回退静态 ----
         self._node_models: list[str] = []   # 最近一次从 Node 后端同步到的上游模型
         self._node_synced_at: float = 0.0
+        self._last_sync_ok: bool = False    # 上轮同步是否真拿到了动态目录 (非兜底表)
         self._node_sync_lock = asyncio.Lock()
 
     def has_usable_account(self) -> bool:
@@ -95,28 +96,57 @@ class TraeProvider(Provider):
                    for a in self.accounts)
 
     # ---------------- 动态模型 (转发 Node 后端, 每日自动同步) ----------------
+    # 同步结果来源标注 (server.js /v1/models 的 source 字段, 2026-09-27 加固):
+    #   dynamic          —— Node 从上游 get_detail_param 实拉的真实目录 (全量, 含 glm 等)
+    #   fallback-static  —— Node 拉取失败, 回落 config.json 静态别名表 (仅 15 个,
+    #                       不含 glm/kimi/qwen 等动态模型, 是「假成功」)
+    #   (缺失/旧版 server.js 无此字段) —— 视作 dynamic 兼容旧版
+    #
+    # ★ 加固动机: 旧版对 Node 返回的 15 个静态兜底表同样记「同步成功」并缓存 24h,
+    #   桌面端「刷新」按钮看到的永远是不完整的假列表。现:
+    #   1) fallback-static 且本地没有更全的动态缓存 → 应急展示但**不记成功时间戳**,
+    #      让 TTL 内的下一次调用 (桌面端刷新 / 定时器) 继续重试;
+    #   2) 无动态缓存时的重试间隔从 24h 缩短为 120s (STATIC_FALLBACK_RETRY_INTERVAL)
+    #      —— 与 server.js 的退避上限对齐, 首拉失败后最多 2 分钟自愈, 而不是 24 小时。
+    STATIC_FALLBACK_RETRY_INTERVAL = 120.0
+
     async def sync_models(self, force: bool = False) -> bool:
         """从 Node 后端 /v1/models 同步上游模型列表到本地缓存。
 
         Node 后端(server.js)持有 Trae 网络栈, 已实现每日自动拉取 get_detail_param,
-        这里只需转发其结果。force=True 忽略每日间隔强制同步。
+        这里只需转发其结果。force=True 忽略同步间隔强制同步。
         同步失败时保留上次缓存(或静态表), 不抛异常。
         """
         async with self._node_sync_lock:
             now = time.time()
-            if not force and now - self._node_synced_at < 86400:
+            # 节奏控制（按状态分流）：
+            #   1. 成功同步过动态目录 (_last_sync_ok) → 维持每日节奏 (24h);
+            #   2. 处于「应急兜底表」态 (有缓存但上轮不是真同步) → 短 TTL (120s),
+            #      到期即重试上游 (实际重打上游的节奏由 server.js 指数退避限流);
+            #   3. 完全没缓存 → 同短 TTL, 尽快补上列表。
+            if self._last_sync_ok:
+                interval = 86400.0
+            else:
+                interval = self.STATIC_FALLBACK_RETRY_INTERVAL
+            if not force and now - self._node_synced_at < interval:
                 return bool(self._node_models)
-            # 首次同步: Node 后端可能仍在启动/拉取上游, 重试直到拿到真实列表
-            # (否则一次失败就要等 24h, 期间 /v1/models 缺 glm/kimi/qwen 等绝大多数模型)
-            attempts = 10 if not self._node_models else 1
+            # 无缓存时多试几次 (Node 后端可能正在重启); 已有缓存时单次即可
+            attempts = 3 if not self._node_models else 1
             for i in range(attempts):
                 try:
+                    # refresh=1: 让 Node 丢弃动态缓存与失败 promise, 强制重拉上游。
+                    # 桌面端「刷新模型列表」→ force=True 时必带, 否则 Node 端拉取
+                    # 失败后会一直用静态兜底表应付 (旧版「刷新无效」的残留路径)。
+                    url = f"{self.base_url}/models"
+                    if force:
+                        url += "?refresh=1"
                     async with httpx.AsyncClient(timeout=20.0) as client:
-                        resp = await client.get(f"{self.base_url}/models")
+                        resp = await client.get(url)
                         if resp.status_code == 200:
                             data = resp.json()
                             models = [m.get("id") for m in (data.get("data") or [])
                                       if m.get("id")]
+                            source = str(data.get("source") or "dynamic").strip()
                             # 入口就屏蔽无效模型 (custom_model_* / 内部工具名):
                             # 缓存里一旦混进这些名字, 后面每个出口都得再过滤一遍,
                             # 在唯一的入口处拦掉最省心 (见 is_usable_model 注释)。
@@ -125,11 +155,26 @@ class TraeProvider(Provider):
                             if dropped:
                                 logger.info("trae 已屏蔽 %d 个无效模型: %s",
                                             len(dropped), ", ".join(sorted(dropped)[:8]))
-                            if models:
+                            if models and source == "dynamic":
                                 self._node_models = models
                                 self._node_synced_at = time.time()
+                                self._last_sync_ok = True
                                 logger.info("trae 动态模型同步成功: %d 个", len(models))
                                 return True
+                            if models and source == "fallback-static":
+                                # Node 拉取失败, 给的是静态兜底表 —— 只在本地没有任何
+                                # 更全的动态缓存时拿它应急 (保证列表不为空),
+                                # **不记成功时间戳**: 短 TTL 一到就重试上游;
+                                # 返回 False 让调用方知道这轮没真同步上。
+                                logger.warning(
+                                    "trae Node 后端返回静态兜底表 (%d 个, 上游拉取失败), "
+                                    "暂作应急展示, %ds 内可重试",
+                                    len(models), int(self.STATIC_FALLBACK_RETRY_INTERVAL))
+                                if not self._node_models:
+                                    self._node_models = models
+                                self._last_sync_ok = False
+                                # synced_at 不更新 → 短 TTL 到期即重试
+                                return False
                             logger.warning("trae Node 后端 /v1/models 返回空 (%d/%d), 重试",
                                            i + 1, attempts)
                         else:
@@ -139,8 +184,9 @@ class TraeProvider(Provider):
                     logger.warning("trae 动态模型同步失败 (%d/%d): %s, 重试",
                                    i + 1, attempts, e)
                 if i < attempts - 1:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(5)
             logger.warning("trae 动态模型同步仍未成功, 回退静态表格")
+            self._last_sync_ok = False
             return bool(self._node_models)
 
     # ---------------- 基础接口 ----------------

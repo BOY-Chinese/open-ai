@@ -26,6 +26,7 @@ import httpx
 
 from providers.base import (
     AccountHealth, Provider, describe_net_exc, make_chunk_id,
+    make_usage_chunk, normalize_usage, wants_usage_in_stream,
 )
 
 # 每次 _pick_account 都从 config.json 实时读取启用状态
@@ -524,7 +525,13 @@ class WorkBuddyProvider(Provider):
             }
 
         yielded_content = False
+        usage = None
         async for obj in self._chat_events(body, account):
+            # 用量事件 (上游流尾补发, 由 _to_upstream_body 的 include_usage 触发):
+            # 无 choices, 只带 usage —— 必须单独接住, 否则会被下面的
+            # 「choices 为空 → 什么都不发」逻辑整段丢掉。
+            if obj.get("usage"):
+                usage = normalize_usage(obj["usage"])
             for choice in obj.get("choices", []):
                 delta = choice.get("delta") or {}
                 out = {}
@@ -541,3 +548,9 @@ class WorkBuddyProvider(Provider):
                     yield chunk({}, finish=choice["finish_reason"])
         if not yielded_content:
             yield chunk({"content": ""}, finish="stop")
+        # 用量尾块必须排在 finish_reason 块之后 (OpenAI 规范 + pi-ai 解析顺序):
+        # 客户端据此计算上下文占用。缺失时按规范补 0 值, 保证「有请求就有尾块」。
+        if wants_usage_in_stream(body):
+            yield make_usage_chunk(
+                cid, created, model,
+                usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})

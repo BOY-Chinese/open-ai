@@ -467,6 +467,15 @@ function resolveModel(model) {
 }
 
 // ======================= 消息转换 (OpenAI -> Trae) =======================
+// ★ 视觉通道 (2026-10, 见《Trae视觉通道实现文档》§5.1/§5.2):
+//   1) content 数组里的 image_url / image 块必须【原样保留】。
+//      旧写法把所有块拍平成 {type, text} → 图片数据被丢成空串 → 上游回
+//      "the param is invalid", 极易被误判成「Trae 不支持图片」。
+//      上游认的就是 OpenAI 那一套 {"type":"image_url","image_url":{"url":"data:..."}},
+//      块完整送到即可用视觉。
+//   2) OpenAI 新版 developer 角色 Trae 上游不认 (只认 system/assistant/user/
+//      tool/function), 报 "developer is not one of [...]" → 语义等同于 system,
+//      直接映射。
 function convertMessages(messages) {
   return (messages || []).map(m => {
     let content = m.content;
@@ -475,9 +484,15 @@ function convertMessages(messages) {
     } else if (Array.isArray(content)) {
       content = content
         .filter(c => c && typeof c === 'object')
-        .map(c => ({ type: c.type || 'text', text: c.text || '' }));
+        .map(c => {
+          // 图片块原样透传 (image_url / image / 带 image_url 字段的块)
+          if (c.type === 'image_url' || c.type === 'image' || c.image_url) return c;
+          return { type: c.type || 'text', text: c.text || '' };
+        });
     }
-    const msg = { role: m.role || 'user', content };
+    let role = m.role || 'user';
+    if (role === 'developer') role = 'system';
+    const msg = { role, content };
     if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
       msg.tool_calls = m.tool_calls.map((tc, i) => {
         const fn = tc.function || {};

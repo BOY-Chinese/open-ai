@@ -51,6 +51,7 @@ from anthropic_api import (anthropic_to_openai, openai_to_anthropic,
                            openai_stream_to_anthropic, aggregate_stream)
 from auto_router import (auto_chat, auto_stream, AutoExhausted,
                          resolve_auto_chain, load_auto_chains)
+from image_util import normalize_request, upgrade_text_image_paths
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -94,6 +95,30 @@ app = FastAPI(title="Open-API 聚合网关", version="1.0.0")
 # 模型每日自动刷新: 启动时强制拉取一次上游 /v3/config, 之后每 24h 拉一次。
 # 拉取失败自动回退上次结果/静态表, 不影响网关启动与既有请求。
 MODEL_REFRESH_INTERVAL = 86400  # 秒
+
+
+def _normalize_body(body: dict) -> None:
+    """请求体归一化 (阻塞, 调用方用 asyncio.to_thread 包住)。
+
+    1) developer → system (所有 provider 生效)
+    2) 图片引用 (本地路径 / http(s) URL / 残缺 data URI) → base64 data URI
+    3) 文本里内嵌的本地图片路径 → 升级为真实图片块 (可选增强, 失败静默)
+
+    全程 try/except: 归一化是「增强」, 绝不能因为它把正常请求打死 ——
+    转不了的图片保持原样交下游, 由下游按自己的语义处理/报错。
+    """
+    try:
+        normalize_request(body)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("请求归一化失败 (已跳过, 不影响转发): %s", e)
+    try:
+        msgs = body.get("messages") if isinstance(body, dict) else None
+        if isinstance(msgs, list):
+            n = upgrade_text_image_paths(msgs)
+            if n:
+                logger.info("文本内嵌图片路径升级: %d 张", n)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("文本图片路径升级失败 (已跳过): %s", e)
 
 
 async def _refresh_workbuddy_models(force: bool = False):
@@ -287,6 +312,12 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON",
                                        "type": "invalid_request_error"}}, status_code=400)
 
+    # ★ 视觉通道 + 角色归一化 (见《Trae视觉通道实现文档》§5.2/§5.3):
+    #   developer→system 对所有 provider 生效 (Trae 上游只认 system, 原样传会报
+    #   "the param is invalid"); 图片引用统一转 base64 data URI (Trae 只认这种形式)。
+    #   含阻塞 IO (读盘/下载) → 必须丢线程, 否则冻结事件循环 → 前端误报「后端未启动」。
+    await asyncio.to_thread(_normalize_body, body)
+
     model = body.get("model", "")
 
     # Auto 路由链: 多条自定义模型路由链 (总名 / 链名均可命中, 与平台内置 auto 无关)
@@ -421,6 +452,9 @@ async def anthropic_messages(request: Request):
             status_code=503)
 
     oa_body = anthropic_to_openai(body)
+    # Anthropic 图片是 source.base64/base64 形态, 转成 OpenAI image_url 后同样过一遍
+    # 归一化 (补 media_type / 处理 url 形态), 与 /v1/chat/completions 行为一致。
+    await asyncio.to_thread(_normalize_body, oa_body)
     stream = bool(body.get("stream"))
 
     async def run_anthropic_stream():

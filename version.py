@@ -5,6 +5,14 @@
 GUI「设置」页显示该版本号, 「一键更新」据此与 GitHub 最新 release 比较决定是否更新。
 """
 
+# v3.3 (2026-10) 追加: Trae 视觉(图片输入)通道 —— 见《Trae视觉通道实现文档》
+#   * trae/server.js convertMessages(): image_url / image 块原样保留 (原先被拍平成
+#     {type,text} 丢掉图片数据, 上游回 "the param is invalid", 被误判成
+#     「Trae 不支持图片」); developer 角色 → system
+#   * image_util.py (新增): 本地路径 / http(s) URL / 残缺 data URI → base64
+#     data URI + 魔数校验 (上游只认 data:<mime>;base64,<b64>)
+#   * main.py: 请求入口 _normalize_body() 统一归一化 (developer→system 对所有
+#     provider 生效, 含 /v1/messages); 阻塞 IO 走 asyncio.to_thread 不冻结事件循环
 APP_VERSION = 'dev-v3.3'
 
 # 更新通道标识 (UPDATE_CHANNEL): 当前构建版本的更新通道, 决定「一键更新」在

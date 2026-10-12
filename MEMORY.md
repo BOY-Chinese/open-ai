@@ -962,3 +962,51 @@ master 需求：名称更正 + 单链 → 多链 + GUI 重做。全部落地，�
    等待上限 30s；429/5xx/超时→busy，401/403/连接失败等→down。
 5. **测试**：`tests/test_auto_router.py`（9 项，`python3 tests/test_auto_router.py` 可独立运行）。
 6. ⚠️ **生效条件**：后端改动需**重启网关**；桌面端改动需重打包（`desktop-ui` 的 dist 已用 WSL node + `vite build` 重新生成，Tauri exe 仍需 Windows 侧 `npm run tauri:build` 才带上新 GUI）。
+
+## v3.3 Release 覆盖重发（2026-10-12）
+
+master 指示: 把两个安装包推到 GitHub release, **覆盖掉有问题的 v3.3**,
+并更新说明（新增 Trae 视觉修复 + 便携版开机自启失灵修复）。
+当时无人下载, 故可以直接覆盖 —— 这是授权前提, 下次覆盖 release 必须先确认。
+
+### 发布坐标
+
+* 仓库: `BOY-Chinese/open-ai`  ·  release: **tag `v3.3` (id=409517397)**
+* 资产: `open-ai-installer-dev.exe` (34,702,005B) /
+  `open-ai-installer-portable.exe` (431,437,220B)
+
+### 本次做法（可复用）
+
+1. **代码先推**: `open-ai-github-dev` 有 3 个未推提交 → `git push origin main`。
+   （注意 `open-ai-github-portable` 是**纯本地仓, 没配 remote** —— 它的产物通过
+   dev 仓的 release 发布, 别去给它找 remote。）
+2. **tag 跟着代码走**: 原 `v3.3` tag 停在旧提交 `e127365`。既然 release 要覆盖,
+   tag 也必须指向新 HEAD, 否则「下载的包」与「tag 上的源码」对不上:
+   `git tag -f -a v3.3 -m "..." HEAD` → `git push --force origin refs/tags/v3.3`
+   （annotated tag 推上去后是 tag 对象 sha; 用 `git/tags/<sha>` 解析出真正的 commit 核对）
+3. **删旧资产再传新的**: asset id 可以从 release JSON 里读到;
+   `DELETE /releases/assets/<id>` 得 204; 上传走
+   `POST https://uploads.github.com/repos/<owner>/<repo>/releases/<rid>/assets?name=<name>`
+   （注意是 **uploads.github.com**, 不是 api.github.com）。
+4. **改标题与说明**: `PATCH /releases/<id>` 带 `{"name":..,"body":..}`。
+   大 body 用 Python urllib 发, 别在 shell 里拼 JSON（转义地狱）。
+5. **核验**: 资产 `digest` 字段(GitHub 算的 sha256) 必须与本地 `sha256sum` **逐字节一致**;
+   再用**无鉴权** `GET /releases/latest` + `curl -sIL` 确认公开可下、
+   `content-length` 与本地一致（「一键更新」走的正是无鉴权 API）。
+
+### token 取法（别从 .git-credentials 里 sed 抠）
+
+`git-credentials` 是 `https://user:token@github.com` 格式, 直接 sed 容易切错。
+用 git 自己的接口最稳:
+
+```bash
+TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill 2>/dev/null \
+        | grep '^password=' | cut -d= -f2-)
+```
+
+### 说明文档写法
+
+沿用 release 既有结构（按「问题现象 → 根因 → 修复 → 效果」逐条), 本次把两项
+新修复放在**开头的「一、本次新增修复」**并编号 `0-A / 0-B`, 原六项降为第二节。
+便携版自启那条特别写明「**已装旧版的无需重装**, 拨动开关即自动清理遗留文件」——
+这是用户最关心的点。结尾附 SHA256 与升级建议。

@@ -23,6 +23,8 @@ INCLUDE = [
     'main.py', 'daemon.py', 'app_runtime.py', 'ipc.py', 'jobmgmt.py',
     'procname.py', 'bootstrap.py', 'watchdog_boot.py',
     'anthropic_api.py', 'admin_api.py', 'app_paths.py', 'auto_router.py',
+    'image_util.py',   # ★ v3.3 视觉通道: main.py 顶层 import 它,
+                       #   漏打 = 装出来的应用启动即 ImportError
     'version.py',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',

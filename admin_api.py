@@ -2417,6 +2417,47 @@ def _autostart_target() -> str | None:
     return os.path.join(sd, "open-ai-autostart.vbs") if sd else None
 
 
+# ── 遗留文件名: open-ai-autostart.bat ──────────────────────────────────────
+# ★ v3.3 修「不管开不开都会开机自启」的根因（2026-10-12, portable 版实测）:
+#   同一个「开机自启」功能历史上被**两套机制**各写一个文件到启动文件夹 ——
+#     安装器 installer.py::_setup_autostart → open-ai-autostart.bat
+#     网关/GUI admin_api.py::_autostart_target → open-ai-autostart.vbs
+#   而 GUI 开关只读写 .vbs。于是用户在界面里关掉自启 → 只删掉了 .vbs,
+#   安装器写的 .bat **原样留在启动文件夹里继续生效** → 表现为
+#   「开关关掉了，但开机还是自启」，且界面显示「已关闭」(读的也是 .vbs)，
+#   两侧状态各说各话、完全看不出问题。
+#   卸载器同病: 只删 .bat → 卸载后 .vbs 还在自启。
+#
+#   修法: 以 .vbs 为**唯一**落地点(网关是唯一 owner, 内容也更完整 —— 先拉
+#   后端再起托盘), 凡开关动作一律**连带清扫遗留 .bat**, 让老装机自愈。
+AUTOSTART_LEGACY_NAMES = ("open-ai-autostart.bat",)
+
+
+def _autostart_legacy_paths() -> list[str]:
+    """启动文件夹里遗留的旧自启文件（开关/卸载都必须一并清掉）。"""
+    sd = _startup_dir()
+    if not sd:
+        return []
+    return [os.path.join(sd, n) for n in AUTOSTART_LEGACY_NAMES]
+
+
+def _purge_legacy_autostart() -> list[str]:
+    """删除遗留自启文件, 返回实际删掉的文件名列表。
+
+    静默容错: 清理失败不能连带让「关闭自启」这个动作失败 ——
+    否则用户会遇到「点了关闭但报错」, 反而更糟。
+    """
+    removed = []
+    for p in _autostart_legacy_paths():
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed.append(os.path.basename(p))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("清理遗留自启文件失败 %s: %s", p, e)
+    return removed
+
+
 def setup_cors(app, extra_origins: list[str] | None = None) -> None:
     """为管理面开启 CORS。
 
@@ -2458,6 +2499,11 @@ def setup_cors(app, extra_origins: list[str] | None = None) -> None:
 async def get_autostart():
     def _work() -> dict:
         dst = _autostart_target()
+        # 遗留 .bat 若在, 说明这是「开关关不掉」的老装机 ——
+        # 只要 .vbs 不在(即界面显示已关闭), 就把遗留文件一并清掉, 让状态自愈。
+        # .vbs 在(用户开着自启)时不动遗留文件, 避免误删正在生效的那份。
+        if dst and not os.path.isfile(dst):
+            _purge_legacy_autostart()
         return {"enabled": bool(dst) and os.path.isfile(dst),
                 "path": dst or ""}
 
@@ -2466,7 +2512,11 @@ async def get_autostart():
 
 @router.post("/settings/autostart")
 async def set_autostart(payload: dict = Body(...)):
-    """写入/移除开机自启（与 GUI 同一份 VBS 逻辑，保持两侧语义一致）。"""
+    """写入/移除开机自启（与 GUI 同一份 VBS 逻辑，保持两侧语义一致）。
+
+    ★ 关闭时**连带清扫**历史遗留的 open-ai-autostart.bat（见常量上方说明）:
+      否则「关掉开关但开机仍自启」的老 bug 在老装机上永远修不好。
+    """
     enable = bool(payload.get("enabled"))
 
     def _work() -> dict:
@@ -2480,10 +2530,15 @@ async def set_autostart(payload: dict = Body(...)):
                 # 启动文件夹路径可能含中文 → 用 GBK 写入，WScript 才能正确读取
                 with open(dst, "w", encoding="gbk", newline="") as f:
                     f.write(vbs)
-                return {"ok": True, "enabled": True, "path": dst}
+                # 写了新机制就把旧机制清掉, 否则两份同时生效 = 开机起两次
+                removed = _purge_legacy_autostart()
+                return {"ok": True, "enabled": True, "path": dst,
+                        "purged": removed}
             if os.path.isfile(dst):
                 os.remove(dst)
-            return {"ok": True, "enabled": False, "path": dst}
+            removed = _purge_legacy_autostart()
+            return {"ok": True, "enabled": False, "path": dst,
+                    "purged": removed}
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"设置失败: {e}")
 

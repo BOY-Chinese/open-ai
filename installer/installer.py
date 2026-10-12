@@ -824,6 +824,17 @@ class InstallerApp:
                 self._log('✓ 已配置开机自启')
             except Exception as e:
                 self._log(f'⚠ 开机自启配置失败: {e}')
+            # 清掉历史遗留的 .bat —— 老装机(早期版本装过)会留着它,
+            # 与新写的 .vbs 同时生效 = 开机起两次; 且 GUI 开关只认 .vbs,
+            # 用户关掉开关后遗留 .bat 仍会自启 (portable 版就是这个 bug,
+            # 见 master 2026-10-12 反馈「不管开不开都开机自启」)。
+            legacy = os.path.join(startup, 'open-ai-autostart.bat')
+            try:
+                if os.path.isfile(legacy):
+                    os.remove(legacy)
+                    self._log('✓ 已清理历史自启文件 open-ai-autostart.bat')
+            except Exception as e:  # noqa: BLE001
+                self._log(f'⚠ 清理历史自启文件失败: {e}')
         else:
             self._log('⚠ 开机自启配置失败 (启动文件夹不可用)')
 

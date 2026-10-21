@@ -52,6 +52,7 @@ from anthropic_api import (anthropic_to_openai, openai_to_anthropic,
 from auto_router import (auto_chat, auto_stream, AutoExhausted,
                          resolve_auto_chain, load_auto_chains)
 from image_util import normalize_request, upgrade_text_image_paths
+from prompt_sanitizer import sanitize_body
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -103,6 +104,8 @@ def _normalize_body(body: dict) -> None:
     1) developer → system (所有 provider 生效)
     2) 图片引用 (本地路径 / http(s) URL / 残缺 data URI) → base64 data URI
     3) 文本里内嵌的本地图片路径 → 升级为真实图片块 (可选增强, 失败静默)
+    4) 提示词净化: 抹掉会触发上游渠道校验的竞品 harness 身份指纹
+       (2026-10-20 事故: workbuddy 通道 400 code=11128)
 
     全程 try/except: 归一化是「增强」, 绝不能因为它把正常请求打死 ——
     转不了的图片保持原样交下游, 由下游按自己的语义处理/报错。
@@ -119,6 +122,10 @@ def _normalize_body(body: dict) -> None:
                 logger.info("文本内嵌图片路径升级: %d 张", n)
     except Exception as e:  # noqa: BLE001
         logger.warning("文本图片路径升级失败 (已跳过): %s", e)
+    try:
+        sanitize_body(body)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("提示词净化失败 (已跳过, 不影响转发): %s", e)
 
 
 async def _refresh_workbuddy_models(force: bool = False):

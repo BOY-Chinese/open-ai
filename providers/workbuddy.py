@@ -28,6 +28,7 @@ from providers.base import (
     AccountHealth, Provider, describe_net_exc, make_chunk_id,
     make_usage_chunk, normalize_usage, wants_usage_in_stream,
 )
+from prompt_sanitizer import sanitize_messages
 
 # 每次 _pick_account 都从 config.json 实时读取启用状态
 # ★ 打包态 __file__ 指向解包临时目录, 相对路径会读错 config —— 钉死安装根。
@@ -155,7 +156,12 @@ def _upstream_headers(account: dict, domain: str, product: str,
 
 def _to_upstream_body(body: dict, default_model: str,
                       aliases: dict | None = None) -> dict:
-    """把 OpenAI 请求体标准化为上游能识别的格式。"""
+    """把 OpenAI 请求体标准化为上游能识别的格式。
+
+    ★ 2026-10-20 事故修复: 上游对 system/assistant 开头做「渠道校验」,
+    命中竞品 harness 身份指纹即整单 400 code=11128 (详见 prompt_sanitizer
+    模块文档)。此处统一净化一次 —— 国内版与国际版共用本函数, 一处生效两处。
+    """
     model = body.get("model", default_model) or default_model
     out = dict(body)
     out["model"] = normalize_model_name(model, default_model, aliases)
@@ -164,6 +170,12 @@ def _to_upstream_body(body: dict, default_model: str,
     out["stream_options"] = {"include_usage": True}
     for k in ("user", "n", "seed", "response_format"):
         out.pop(k, None)
+    # 提示词净化: 先浅拷贝 messages/条目, 保证不改动调用方 body
+    # (Auto 路由链会用同一个 body 依次试多个模型, 不能留下副作用)。
+    if isinstance(out.get("messages"), list):
+        out["messages"] = [dict(m) if isinstance(m, dict) else m
+                           for m in out["messages"]]
+        sanitize_messages(out["messages"])
     return out
 
 

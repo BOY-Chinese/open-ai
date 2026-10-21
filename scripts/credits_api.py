@@ -18,6 +18,9 @@ data/usage_history.db**。表结构与平台枚举都在这里收口, 以后新�
 * 时区: 统一用本机本地时区 (与采集器一致)。
 * 本模块**只读**, 写入由 `scripts/usage_collector.py` 每 5 分钟完成。
 * 库不存在 / 表为空时返回空结果而不是抛异常, 前端不用做存在性判断。
+* **但「库存在却读不到」必须抛 `CreditsReadError`, 绝不能也返回空** ——
+  空结果是「今天真没数据」的合法语义, 拿它表示读失败会让前端把故障渲染成
+  「零消耗 / 全员未签到」(2026-10-19 事故)。要一次性探活用 `probe()`。
 
 快速上手
 --------
@@ -42,12 +45,33 @@ import os
 import sqlite3
 import sys
 import time
-
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 except Exception:
     pass
+
+# ---- 只读连接的忙等待重试参数 (见 _connect 的说明) ----
+_CONNECT_TRIES = 4      # 采集器已改短事务; 这里只兜住仍在写库的瞬间
+_CONNECT_BACKOFF = 0.25  # 秒; 递增退让 0.25/0.5/0.75, 总等待 < 2 秒
+
+
+def _log_warn(msg):
+    """把告警写进网关日志 (打包态); 源码态无 logger 时退回 stderr。
+
+    ★ 为什么要显式记一笔: 旧版 _connect/_rows 失败时**完全静默** —— 库被锁
+      导致读失败, 前端却收到「零消耗 / 全员未签到」这种合法形状的空结果,
+      排查时日志里一个字都没有。现在读失败必须留下痕迹。
+    """
+    try:
+        import logging
+        logging.getLogger('openapi.credits_api').warning(msg)
+    except Exception:
+        pass
+    try:
+        sys.stderr.write(msg + '\n')
+    except Exception:
+        pass
 
 # ★ 路径必须钉死在安装根: 打包态 (PyInstaller onefile) 里 __file__ 是相对路径,
 #   abspath() 会跟着进程 CWD 走 —— VM 实测踩过: 网关 CWD 在 %TEMP% 时, data/ 被
@@ -116,23 +140,63 @@ def _default_range(days=7):
     return day_str(end - (days - 1) * 86400), day_str(end)
 
 
+class CreditsReadError(RuntimeError):
+    """流水库**存在但读不到** (被写事务锁住 / IO 故障)。
+
+    与「库不存在」「表为空」严格区分:
+      * 库不存在 / 无记录 → 返回空结果, 这是**合法业务语义** (今天真没数据);
+      * 库在、但读失败 → 抛本异常, 由 admin_api 转成前端可见的错误态。
+    2026-10-19 修「看板看不到消耗 / 除 Loomy 外全显示未签到」时引入 ——
+    旧版把两者都表示成空列表, 前端于是把「读失败」渲染成了
+    「今天零消耗」「所有账号都没签到」这种看起来完全正常的错误结论。
+    """
+
+
 def _connect():
-    """打开只读连接; 库不存在返回 None (调用方按空结果处理)。"""
+    """打开只读连接。
+
+    库文件不存在 → 返回 None (调用方按空结果处理)。
+    库文件存在但连不上 (被锁) → 抛 CreditsReadError。
+    """
     if not os.path.isfile(DB_PATH):
         return None
-    try:
-        conn = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True, timeout=5)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except Exception:
-        return None
+    last = None
+    for attempt in range(_CONNECT_TRIES):
+        conn = None
+        try:
+            conn = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True, timeout=5)
+            conn.row_factory = sqlite3.Row
+            # 立刻做一次真实读, 把「连上了但库被锁」这种延迟报错提前暴露出来
+            # (sqlite3.connect 本身不碰文件, 不探测的话错误会推迟到第一条 SQL)
+            conn.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone()
+            return conn
+        except sqlite3.Error as e:
+            last = e
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            if attempt < _CONNECT_TRIES - 1:
+                time.sleep(_CONNECT_BACKOFF * (attempt + 1))
+    _log_warn(f'credits_api: 只读连接失败 (重试 {_CONNECT_TRIES} 次): {last}')
+    raise CreditsReadError(f'流水库读取失败: {last}')
 
 
 def _rows(conn, sql, args=()):
+    """执行查询返回行列表; 出错时**记日志并抛出** (不再静默吞成空列表)。
+
+    ★ 旧版这里是 `except sqlite3.Error: return []` —— 正是「除 Loomy 外全部
+      显示未签到」的放大器: gain 表读失败 → 返回空 → 调用方认为「今天没有
+      任何签到凭证」→ 前端把所有非 Loomy 账号渲染成「未签到」。
+      空列表是**合法业务语义**(真的没签到), 不能拿来表示「读失败」。
+      现在把错误交给上层: 由 admin_api 转成明确的错误态, 前端渲染「—」。
+    """
     try:
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as e:
+        _log_warn(f'credits_api: 查询失败 ({type(e).__name__}: {e}) sql={sql[:120]}')
+        raise
 
 
 # ==================== 元信息 ====================
@@ -140,6 +204,24 @@ def _rows(conn, sql, args=()):
 def platforms():
     """平台枚举 (前端渲染下拉/图例用)。返回 [{key,label,short,provider,color}]。"""
     return [dict(p) for p in PLATFORMS]
+
+
+def probe():
+    """探活: 返回 (ok, error_msg)。
+
+    给 admin_api 在返回聚合结果**之前**调一次 —— 库里读不到时, 宁可让端点
+    明确报错, 也不要交出一份「全 0 / 全员未签到」的假数据 (2026-10-19 修)。
+    """
+    try:
+        conn = _connect()
+    except CreditsReadError as e:
+        return False, str(e)
+    if conn is None:
+        return False, '流水库不存在'
+    try:
+        return True, None
+    finally:
+        conn.close()
 
 
 def has_data():

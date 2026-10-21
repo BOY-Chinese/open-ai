@@ -65,6 +65,40 @@ class AccountHealth:
             if old is not None and old != token:
                 self._invalid[uid] = False
 
+    def clear_invalid(self, uid=None) -> int:
+        """主动解除失效标记（「重新登录 / 重新连接」后的复位入口）。
+
+        背景（2026-10-14 假断连事故）：失效标记活在**网关进程内存**里，而
+        重新登录只写 config.json —— 两者之间原先没有任何通路。于是
+        `observe_token` 的自动复位（凭据变了就撤牌）要等**下一发该通道的
+        请求**跑过请求路径才生效；在那之前账号管理页一直挂着旧红牌，
+        表现为「刚重新添加过，又显示断连」。
+
+        本方法是与 trae `/v1/admin/reconnect`（healthCheck 里 `acc.invalid=false`）
+        对等的、**通道无关**的主动清牌入口，供 admin_api 在以下时机调用：
+          - 账号登录成功（loomy 短信登录 / 窗口登录脚本拉起后）
+          - 用户点「重新连接账号」
+          - 「刷新账号状态」
+
+        uid 为 None 时清空全部（整通道复位）；returns 实际清掉的条数。
+
+        ★ 语义边界: 这里只复位**标记**，不验证凭据。真正的有效性仍由下一次
+        请求（或 trae 的健康检查）判定 —— 若凭据确实已死，请求路径会立刻
+        重新 mark_invalid，页面再次标红。因此「主动清牌」不会掩盖真实故障，
+        只会消除「凭据已换新但仍背旧红牌」的假红窗口。
+        """
+        with self._lock:
+            if uid is None:
+                n = sum(1 for v in self._invalid.values() if v)
+                self._invalid.clear()
+                return n
+            key = str(uid or "")
+            if not key:
+                return 0
+            was = bool(self._invalid.get(key))
+            self._invalid[key] = False
+            return 1 if was else 0
+
     def state(self) -> dict[str, bool]:
         with self._lock:
             return dict(self._invalid)
@@ -92,6 +126,21 @@ class Provider(ABC):
         """
         health = getattr(self, "_health", None)
         return health.state() if health is not None else {}
+
+    def clear_account_runtime(self, uid=None) -> int:
+        """复位运行时失效标记（「重新登录 / 重新连接 / 刷新」时调用）。
+
+        与 runtime_account_state 互为逆操作，供 admin_api 在凭据更新后立即
+        清掉旧红牌，消除「刚重新登录却仍显示断连」的假红窗口。
+
+        uid=None 清空本通道全部标记；returns 实际清掉的条数。
+        默认实现走 provider 的 `_health`（loomy / workbuddy* 均适用）；
+        无健康跟踪的 provider 返回 0（安全空操作）。
+        """
+        health = getattr(self, "_health", None)
+        if health is None:
+            return 0
+        return health.clear_invalid(uid)
 
     @abstractmethod
     def list_models(self) -> list[dict]:

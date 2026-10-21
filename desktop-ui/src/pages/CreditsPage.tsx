@@ -16,6 +16,7 @@ import {
   Coins,
   RefreshCw,
   Receipt,
+  AlertTriangle,
 } from 'lucide-react'
 import {
   PageShell,
@@ -212,6 +213,30 @@ export function CreditsPage() {
   /** 按钮 loading：刷新中或当前视图首屏加载中 */
   const refreshing = busy || today.loading || week.loading
 
+  /*
+   * 当前视图的读取错误态。
+   *
+   * ★ 为什么必须单独接住（2026-10-19 修）：
+   *   后端在「流水库被采集器写事务锁住」时，旧版会返回一份**形状合法的全 0**
+   *   （stats.used=0、rows=[]），于是看板把故障画成了「今天零消耗」——
+   *   一个看起来完全正常的错误结论。后端现在改成读不到就报 503；
+   *   前端必须把它渲染成明确的「暂时读不到」，绝不能拿 0 冒充真实数据。
+   */
+  const viewError = view === 'today' ? today.error : week.error
+
+  /** 读取失败时的统一提示条（数值区改渲染它，而不是渲染 0） */
+  const errorBanner = viewError ? (
+    <div className="mb-4 flex items-start gap-3 rounded-lg border border-danger/30 bg-danger/12 px-4 py-3">
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-danger" />
+      <div className="flex flex-col gap-0.5">
+        <span className="text-base font-medium text-fg">积分数据暂时读不到</span>
+        <span className="text-sm text-fg-muted">
+          {viewError}；后台采集正在写库，稍后重试即可（数字未丢失，只是这次没读出来）
+        </span>
+      </div>
+    </div>
+  ) : null
+
   return (
     <PageShell>
       <PageHeader
@@ -276,22 +301,39 @@ export function CreditsPage() {
 
       {view === 'today' ? (
         <>
-          {/* 今日：获取 / 消耗 双卡片 */}
+          {errorBanner}
+          {/* 今日：获取 / 消耗 双卡片。读取失败时不渲染 0，改显示占位「—」 */}
           <div className="mb-4 flex gap-4">
             <StatCard
               label="今日获取积分"
-              value={today.loading ? '0' : fmtCredit(today.data?.stats.gained ?? 0)}
+              value={
+                today.loading || today.error
+                  ? today.error
+                    ? '—'
+                    : '0'
+                  : fmtCredit(today.data?.stats.gained ?? 0)
+              }
               tone="gain"
               icon={TrendingUp}
               loading={today.loading}
             />
             <StatCard
               label="今日消耗积分"
-              value={today.loading ? '0' : fmtCredit(today.data?.stats.used ?? 0)}
+              value={
+                today.loading || today.error
+                  ? today.error
+                    ? '—'
+                    : '0'
+                  : fmtCredit(today.data?.stats.used ?? 0)
+              }
               tone="cost"
               icon={TrendingDown}
               loading={today.loading}
-              hint={`统计范围：${channel === 'all' ? '全部通道' : channelMeta(channel).label}`}
+              hint={
+                today.error
+                  ? '本次读取失败，未取到数据'
+                  : `统计范围：${channel === 'all' ? '全部通道' : channelMeta(channel).label}`
+              }
             />
           </div>
 
@@ -299,6 +341,14 @@ export function CreditsPage() {
           <PageBody>
             {today.loading ? (
               <TableSkeleton rows={8} cols={5} />
+            ) : today.error ? (
+              /* 读失败 ≠ 今天没消耗：明确渲染错误态，避免空表被误读成「零消耗」 */
+              <TableEmpty
+                colSpan={USAGE_COLUMNS.length}
+                icon={AlertTriangle}
+                title="积分流水暂时读不到"
+                description={`${today.error}；后台采集正在写库，稍后点刷新重试`}
+              />
             ) : (
               <VirtualTable
                 rows={today.data?.rows ?? []}
@@ -357,25 +407,40 @@ export function CreditsPage() {
         </>
       ) : (
         <>
-          {/* 本周：获取 / 消耗 双卡片 */}
+          {errorBanner}
+          {/* 本周：获取 / 消耗 双卡片。读取失败时不渲染 0，改显示占位「—」 */}
           <div className="mb-4 flex gap-4">
             <StatCard
               label="本周获取积分"
-              value={week.loading ? '0' : fmtCredit(week.data?.stats.gained ?? 0)}
+              value={
+                week.loading || week.error
+                  ? week.error
+                    ? '—'
+                    : '0'
+                  : fmtCredit(week.data?.stats.gained ?? 0)
+              }
               tone="gain"
               icon={TrendingUp}
               loading={week.loading}
             />
             <StatCard
               label="本周消耗积分"
-              value={week.loading ? '0' : fmtCredit(week.data?.stats.used ?? 0)}
+              value={
+                week.loading || week.error
+                  ? week.error
+                    ? '—'
+                    : '0'
+                  : fmtCredit(week.data?.stats.used ?? 0)
+              }
               tone="cost"
               icon={TrendingDown}
               loading={week.loading}
               hint={
-                week.data
-                  ? `${shortDay(week.data.startDay)} — ${shortDay(week.data.endDay)}`
-                  : undefined
+                week.error
+                  ? '本次读取失败，未取到数据'
+                  : week.data
+                    ? `${shortDay(week.data.startDay)} — ${shortDay(week.data.endDay)}`
+                    : undefined
               }
             />
           </div>

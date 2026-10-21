@@ -167,7 +167,22 @@ def db_init(conn):
 
 
 def db_upsert(conn, rows):
-    """批量写入 (重复 entry_id 覆盖更新). 返回 新增条数, 总条数"""
+    """批量写入 (重复 entry_id 覆盖更新). 返回 新增条数, 总条数
+
+    ★ 写完立即 commit (2026-10-19 修「看板看不到消耗 / 除 Loomy 外全显示未签到」)。
+
+    为什么必须在这里 commit, 而不是留给 collect_all() 最后一次性提交:
+      本函数的调用方 (collect_trae / collect_workbuddy / collect_loomy) 都是
+      「**先联网抓取, 抓完就写库**」的循环, 而整轮采集的联网部分要跑 3~5 分钟
+      (实测 20 轮平均 218 秒, 最长 274 秒)。旧版只在整个 collect_all() 结束时
+      commit 一次, 于是从第一次写库起, 写事务就一直挂着不提交, SQLite 对
+      并发读连接持续返回 SQLITE_BUSY; 前端那条只读连接 (credits_api._connect,
+      timeout=5s) 于是整整 3~5 分钟读不到数据 —— 表现为积分看板「今日消耗」
+      恒为 0、账号页除 Loomy 外全渲染成「未签到」(Loomy 凭证走本地 JSON,
+      不碰 SQLite, 所以唯独它正常)。
+      现在改成「抓完一个账号就提交一批」: 写事务只覆盖 executemany 那一瞬,
+      联网期间不持任何写锁, 前端随时能读。
+    """
     if not rows:
         return 0, 0
     before = conn.execute('SELECT COUNT(*) FROM usage').fetchone()[0]
@@ -180,6 +195,7 @@ def db_upsert(conn, rows):
             input_tok=excluded.input_tok, output_tok=excluded.output_tok, cache_tok=excluded.cache_tok,
             source=excluded.source, preview=excluded.preview, extra=excluded.extra,
             collected_at=excluded.collected_at''', rows)
+    conn.commit()
     after = conn.execute('SELECT COUNT(*) FROM usage').fetchone()[0]
     return after - before, after
 
@@ -188,6 +204,9 @@ def db_prune(conn, keep_days=RETENTION_DAYS):
     cutoff = now_ts() - keep_days * 86400
     conn.execute('DELETE FROM usage WHERE ts < ?', (cutoff,))
     conn.execute('DELETE FROM gain WHERE updated_at < ?', (cutoff,))
+    # 清理同样立即提交: 保留期外的大批量 DELETE 会写出最大的一份 journal,
+    # 若挂在长事务里, 正是把读连接挡在外面最久的那一段。
+    conn.commit()
 
 
 # ============ 获取积分 (签到等) 采集 ============
@@ -337,6 +356,7 @@ def collect_gains(conn, cfg):
             VALUES (?,?,?,?,?,?)
             ON CONFLICT(platform, uid, day, kind) DO UPDATE SET
                 amount = MAX(amount, excluded.amount), updated_at = excluded.updated_at''', rows)
+        conn.commit()   # 同上: 签到凭证立即落库, 别让账号页的签到列白等一轮采集
     return len(rows)
 
 
@@ -630,6 +650,7 @@ def loomy_gains(conn, cfg):
                         amount=excluded.amount, updated_at=excluded.updated_at''',
                              ('loomy', uid, day, _f(it.get('pointsActual')),
                               str(it.get('description') or 'credit'), now_ts()))
+                conn.commit()   # 逐条提交: 台账分页要联网, 不把写锁带进下一轮请求
                 n += 1
     except Exception as e:  # noqa: BLE001
         log(f'gain loomy: 台账读取异常 ({e})')
@@ -669,6 +690,7 @@ def loomy_gains(conn, cfg):
                 ON CONFLICT(platform, uid, day, kind) DO UPDATE SET
                     amount=excluded.amount, updated_at=excluded.updated_at''',
                          ('loomy', g['uid'], day, amount, 'daily-login', now_ts()))
+            conn.commit()
             n += 1
     except Exception as e:  # noqa: BLE001
         log(f'gain loomy: 状态缓存读取失败 ({e})')
@@ -679,7 +701,15 @@ def loomy_gains(conn, cfg):
 
 def collect_all(window_days=WINDOW_DAYS):
     """采集一轮 (TRAE + WorkBuddy 国内 + WorkBuddy 国际 消耗流水 + 获取积分) 并入库。
-    返回汇总消息字符串。"""
+    返回汇总消息字符串。
+
+    ★ 事务边界 (2026-10-19 修): 本函数**不再**负责「攒到最后一次提交」——
+    各写入点 (db_upsert / collect_gains / loomy_gains / db_prune) 各自写各提交。
+    旧版整轮只有一个连接、只在末尾 commit 一次, 而这中间夹着 3~5 分钟的联网
+    抓取, 写事务全程挂起 → 前端只读连接被 SQLITE_BUSY 挡住 → 积分看板恒 0、
+    账号页除 Loomy 外全显示「未签到」(详见 db_upsert 的注释)。
+    末尾这次 commit 只是兜底 (防御性收尾), 不承担主要职责。
+    """
     collected_at = now_ts()
     try:
         with open(OPENAI_CFG, encoding='utf-8') as f:
@@ -687,7 +717,7 @@ def collect_all(window_days=WINDOW_DAYS):
     except Exception as e:
         return f'config 读取失败: {e}'
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
         db_init(conn)
         msgs = [collect_trae(conn, cfg, collected_at, window_days)]
@@ -697,7 +727,7 @@ def collect_all(window_days=WINDOW_DAYS):
         n_gain += loomy_gains(conn, cfg)
         msgs.append(f'获取积分记录 {n_gain} 条')
         db_prune(conn)
-        conn.commit()
+        conn.commit()   # 兜底收尾 (各写入点已自行提交)
     finally:
         conn.close()
     return f'[采集] {collected_at}: ' + ' | '.join(msgs)

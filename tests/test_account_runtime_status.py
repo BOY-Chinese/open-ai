@@ -269,6 +269,165 @@ class LoomyRuntimeTest(unittest.TestCase):
         self.assertEqual(self.prov.runtime_account_state(), {'26092': True})
 
 
+# ═════════ 2026-10-14 假断连回归: 主动清牌入口 ═════════
+#
+# 事故现象：Loomy 通道 13489836080 这个账号「刚重新添加过，又显示断连」。
+# 根因：失效标记活在**网关进程内存**里，而重新登录只写 config.json ——
+# 两者之间原先没有任何通路；`observe_token` 的自动复位要等下一发该通道的
+# 请求跑过请求路径才生效。trae 侧早有对等能力（/v1/admin/reconnect →
+# healthCheck 里 acc.invalid=false），但 loomy / workbuddy* 三个进程内通道
+# **都没有**主动清牌入口。
+
+class ClearInvalidTest(unittest.TestCase):
+    """AccountHealth.clear_invalid —— 单账号 / 全清 / 幂等。"""
+
+    def test_clear_single_account(self):
+        h = AccountHealth()
+        h.mark_invalid('u1')
+        h.mark_invalid('u2')
+        self.assertEqual(h.clear_invalid('u1'), 1)
+        self.assertFalse(h.is_invalid('u1'))
+        self.assertTrue(h.is_invalid('u2'), '不能误伤其它账号')
+
+    def test_clear_all(self):
+        h = AccountHealth()
+        for u in ('u1', 'u2', 'u3'):
+            h.mark_invalid(u)
+        self.assertEqual(h.clear_invalid(), 3)
+        self.assertEqual([u for u in h.state() if h.is_invalid(u)], [])
+
+    def test_clear_returns_zero_when_not_invalid(self):
+        """幂等: 对本来就没红的账号清牌, 返回 0 且不报错。"""
+        h = AccountHealth()
+        self.assertEqual(h.clear_invalid('u1'), 0)
+        h.mark_ok('u1')
+        self.assertEqual(h.clear_invalid('u1'), 0)
+
+    def test_clear_empty_uid_is_noop(self):
+        h = AccountHealth()
+        self.assertEqual(h.clear_invalid(''), 0)
+        self.assertEqual(h.clear_invalid(None), 0)
+
+
+class ProviderClearHookTest(unittest.TestCase):
+    """Provider.clear_account_runtime —— 默认实现走 _health, 无 health 时空操作。"""
+
+    def test_loomy_clear_hook(self):
+        cfg = {'loomy': {'accounts': [
+            {'userid': '26091', 'session': 's1', 'phone': '13489836080'}]}}
+        with tempfile.TemporaryDirectory() as d:
+            self._patch_config(d, cfg)
+            prov = LoomyProvider({})
+            prov._health.mark_invalid('26091')
+            self.assertTrue(prov.runtime_account_state().get('26091'))
+            self.assertEqual(prov.clear_account_runtime('26091'), 1)
+            self.assertFalse(prov.runtime_account_state().get('26091'))
+
+    def test_provider_without_health_is_safe_noop(self):
+        """没有 _health 的 provider 调清牌应是安全空操作（返回 0, 不抛）。"""
+        class _Bare(Provider):
+            name = 'bare'
+
+            def list_models(self): return []
+            def normalize_model(self, m): return m
+            async def chat(self, body): return {}
+            async def stream(self, body): yield {}
+
+        self.assertEqual(_Bare().clear_account_runtime('u1'), 0)
+
+    def _patch_config(self, d, cfg):
+        p = os.path.join(d, 'config.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        import providers.loomy as L
+        orig = L.CONFIG_PATH
+        L.CONFIG_PATH = p
+        self.addCleanup(lambda: setattr(L, 'CONFIG_PATH', orig))
+
+
+class AdminClearWiringTest(unittest.TestCase):
+    """admin_api._clear_channel_runtime —— 通道名映射与未注册通道的容错。"""
+
+    def setUp(self):
+        self.orig = A._clear_channel_runtime
+        self.addCleanup(lambda: setattr(A, '_clear_channel_runtime', self.orig))
+
+    def test_returns_false_when_provider_not_registered(self):
+        """provider 未注册 → False, 绝不抛异常打断管理接口。
+
+        注意: 单测进程里 `import main` 是成功的（main 可导入且 PROVIDERS 已
+        被注册），所以这里显式把该通道从 PROVIDERS 摘掉来模拟「未加载」，
+        而不是依赖 import 失败。
+        """
+        import main as gateway  # noqa: E402
+        orig_providers = getattr(gateway, 'PROVIDERS', None)
+        gateway.PROVIDERS = dict(orig_providers or {})
+        gateway.PROVIDERS.pop('loomy', None)
+        self.addCleanup(lambda: setattr(gateway, 'PROVIDERS', orig_providers or {}))
+        self.assertFalse(A._clear_channel_runtime('loomy'))
+
+    def test_calls_provider_clear_with_uid(self):
+        seen = []
+
+        class _FakeProv:
+            def clear_account_runtime(self, uid=None):
+                seen.append(uid)
+                return 1
+
+        import main as gateway  # noqa: E402
+        orig_providers = getattr(gateway, 'PROVIDERS', None)
+        gateway.PROVIDERS = {'loomy': _FakeProv()}
+        self.addCleanup(lambda: setattr(gateway, 'PROVIDERS', orig_providers or {}))
+        self.assertTrue(A._clear_channel_runtime('loomy', '26092'))
+        self.assertEqual(seen, ['26092'])
+
+
+class RefreshClearsRuntimeTest(unittest.TestCase):
+    """★ 端到端复现原事故: 账号被标红 → 点「刷新」→ 列表应立刻转绿。
+
+    这是用户报的那句「我明明刚重新添加过，又显示断连」的最小复现场景。
+    """
+
+    def setUp(self):
+        self.cfg = _cfg()
+        self.orig_cfg = A._read_config
+        self.orig_trae = A._trae_runtime_state
+        self.orig_prov = A._provider_runtime_state
+        self.orig_clear = A._clear_channel_runtime
+        A._read_config = lambda: self.cfg
+        A._trae_runtime_state = lambda cfg: {}
+        # 内存态: loomy 的 26091 被标红（模拟旧 session 被判死后的残留红牌）
+        self.rt = {'loomy': {'26091': True}}
+        A._provider_runtime_state = lambda pkey: self.rt.get(pkey, {})
+        self.addCleanup(lambda: setattr(A, '_read_config', self.orig_cfg))
+        self.addCleanup(lambda: setattr(A, '_trae_runtime_state', self.orig_trae))
+        self.addCleanup(lambda: setattr(A, '_provider_runtime_state', self.orig_prov))
+        self.addCleanup(lambda: setattr(A, '_clear_channel_runtime', self.orig_clear))
+
+    def test_refresh_clears_stale_flag_and_turns_green(self):
+        # 清牌入口接到同一个内存态上（模拟真实 provider._health.clear_invalid）
+        def fake_clear(pkey, uid=None):
+            d = self.rt.setdefault(pkey, {})
+            if uid is None:
+                d.clear()
+            else:
+                d[uid] = False
+            return True
+
+        A._clear_channel_runtime = fake_clear
+        rows = {r['id']: r for r in A._load_accounts_raw()}
+        self.assertEqual(rows['Loomy:26091']['status'], 'disconnected',
+                         '前置: 有残留红牌时应显示断连')
+
+        # 用户点「刷新」→ 应复位标记后重读 → 转绿
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            A.refresh_accounts({'channel': 'Loomy'}))
+        rows = {r['id']: r for r in A._load_accounts_raw()}
+        self.assertEqual(rows['Loomy:26091']['status'], 'enabled',
+                         '清牌后应立刻转绿, 不该还挂着旧红牌')
+        self.assertEqual(rows['Loomy:26091']['detail'], '')
+
+
 # ═══════════════════════ admin_api 接线 ═══════════════════════
 
 def _cfg():

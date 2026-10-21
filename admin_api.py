@@ -482,6 +482,37 @@ def _provider_runtime_state(pkey: str) -> "dict[str, bool] | None":
         return None
 
 
+def _clear_channel_runtime(pkey: str, uid=None) -> bool:
+    """清掉通道的运行时失效标记（与 trae /v1/admin/reconnect 对等）。
+
+    背景（2026-10-14 假断连事故）：失效标记只活在网关进程内存里，而重新
+    登录只写 config.json —— 两者原先没有任何通路。结果「重新添加账号」
+    后页面**继续显示断连**，直到恰好有一发该通道的请求落地才自愈；用户
+    看到的就是「我明明刚重新添加过，又显示断连」。
+
+    trae 侧早有对等能力（POST /v1/admin/reconnect → healthCheck 里
+    `acc.invalid=false`），但 loomy / workbuddy* 三个进程内通道**都没有**
+    主动清牌入口 —— 本函数把它们补齐。
+
+    返回 True 表示清牌动作已执行（通道已注册）；False = 通道未加载/异常。
+    清牌本身不验证凭据：若凭据确实已死，下一发请求会立刻重新标红。
+    """
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+    except Exception:  # noqa: BLE001  非网关进程(如单测)里 main 不可导入
+        return False
+    prov = providers.get(_PROVIDER_INSTANCE_KEYS.get(pkey, pkey))
+    if prov is None:
+        return False
+    try:
+        prov.clear_account_runtime(uid)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("清通道 %s 运行态失败: %s", pkey, e)
+        return False
+
+
 def _channel_runtime(cfg: dict, pkey: str, cache: dict) -> "dict[str, bool] | None":
     """取通道运行态（懒探测, 每次账号列表调用对每通道只探一次）。
 
@@ -858,6 +889,19 @@ def _accounts_signin_read(channel: str | None) -> dict:
     """
     _, ca = _history_accounts()
     day = ca.day_str(time.time()) if ca is not None else time.strftime("%Y-%m-%d")
+    # ★ 读不到签到凭证时必须报错, 不能返回空表 (2026-10-19 修):
+    #   前端把「表里没有这个账号」渲染成「未签到」, 而空表既可能是「今天真没
+    #   签到」也可能是「库被锁住读不到」—— 旧版两者同形, 于是采集器写事务挂起
+    #   的 3~5 分钟里, 除 Loomy (走本地 JSON) 外所有通道都被渲染成「未签到」。
+    #   这里先探活: 读不到 → 抛错 → 前端明确渲染「—」(读取失败), 绝不谎报未签到。
+    if ca is not None:
+        ok, why = ca.probe()
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail={"message": f"签到凭证库暂时读不到：{why}",
+                        "type": "signin_unavailable"},
+            )
     by_platform = ca.gains_accounts(day) if ca is not None else {}
     out: dict[str, dict] = {}
     # Loomy gain 表的 uid（桌面 userid / web:<phone>）要映射到合并行 id ——
@@ -1327,6 +1371,29 @@ async def login_log(channel: str, offset: int = 0, maxBytes: int = 131072):
         running = proc is not None and proc.poll() is None
         exit_code = None if (proc is None or running) else proc.returncode
 
+        # ★ 2026-10-14 假断连修复: 窗口登录脚本（Trae/WorkBuddy/WorkBuddy_IE）
+        #   结束且**退出码为 0** 时，说明它已把新凭据写回 config.json ——
+        #   此刻顺手复位该通道的运行态标记，否则页面会拿着旧红牌继续显示
+        #   「断连」，直到下一发请求落地才自愈（loomy 侧的同一个坑）。
+        #   只在每轮「运行中 → 已结束」翻转时清一次，避免前端轮询期间反复清牌。
+        if proc is not None and not running:
+            if _LOGIN_PROCS.pop(channel, None) is not None and exit_code == 0:
+                pkey = {"Trae": "trae", "WorkBuddy": "workbuddy",
+                        "WorkBuddy_IE": "workbuddy_intl"}.get(channel)
+                if pkey == "trae":
+                    # trae 的 invalid 在 node 进程里，走它的重连端点清牌
+                    try:
+                        req = urllib.request.Request(
+                            _trae_base_url(_read_config()) + "/v1/admin/reconnect",
+                            data=b"{}", method="POST",
+                            headers={"Content-Type": "application/json",
+                                     "Accept": "application/json"})
+                        urllib.request.urlopen(req, timeout=30).close()
+                    except Exception:  # noqa: BLE001
+                        pass  # 清牌失败不阻断日志跟随
+                elif pkey:
+                    _clear_channel_runtime(pkey)
+
         if not os.path.exists(path):
             return {"text": "", "offset": 0, "size": 0, "running": running,
                     "exists": False, "exitCode": exit_code}
@@ -1356,8 +1423,24 @@ async def login_log(channel: str, offset: int = 0, maxBytes: int = 131072):
 
 @router.post("/accounts/refresh")
 async def refresh_accounts(payload: dict = Body(default={})):
-    """刷新账号状态（重读配置；联网拉积分走 /accounts/credits/refresh）。"""
-    data = await list_accounts(payload.get("channel"))
+    """刷新账号状态（重读配置；联网拉积分走 /accounts/credits/refresh）。
+
+    ★ 2026-10-14：本端点现在会**先复位运行态标记再读列表**。原先它只重读
+      config.json，而失效标记活在网关进程内存里 —— 用户「重新添加账号」后
+      点刷新，看到的仍是被旧标记染红的「断连」，这正是「明明刚重新添加过，
+      又显示断连」的直接来源。清牌后重新读列表即得到干净的真状态；若凭据
+      确实不可用，下一发请求会立刻重新标红，不会把真故障洗成绿的。
+    """
+    channel = payload.get("channel")
+    # 复位范围: 指定通道则只清该通道, 否则清全部进程内通道
+    targets = {
+        "Loomy": ["loomy"],
+        "WorkBuddy": ["workbuddy"],
+        "WorkBuddy_IE": ["workbuddy_intl"],
+    }.get(channel or "", ["loomy", "workbuddy", "workbuddy_intl"])
+    for _pkey in targets:
+        _clear_channel_runtime(_pkey)
+    data = await list_accounts(channel)
     return {**data, "refreshed": True}
 
 
@@ -1406,8 +1489,17 @@ async def reconnect_accounts(payload: dict = Body(default={})):
         except Exception as e:  # noqa: BLE001
             trae_runtime = {"ok": False, "error": str(e)[:120]}
 
+        # ★ 进程内通道运行态联动（2026-10-14 假断连修复）：loomy / workbuddy*
+        #   的失效标记活在**本网关进程**内存里，signin_all 续期后写回 config
+        #   同样认领不到（与上面 trae 的问题同源，只是这三条通道原先完全
+        #   没有清牌入口）。这里一并复位，让「重新连接账号」对四条通道
+        #   行为一致。
+        inproc_cleared: dict = {}
+        for _pkey in ("loomy", "workbuddy", "workbuddy_intl"):
+            inproc_cleared[_pkey] = _clear_channel_runtime(_pkey)
+
         return {"ok": True, "started": True, "pid": proc.pid,
-                "traeRuntime": trae_runtime}
+                "traeRuntime": trae_runtime, "runtimeCleared": inproc_cleared}
 
     return await _in_thread(_work)
 
@@ -1903,7 +1995,13 @@ async def credits_today(channel: str | None = None, limit: int = 500):
     """今日积分概况 + 逐笔流水（本地库聚合，不联网）。
 
     数据来源：credits_api.usage_rows() 取明细、overview() 取汇总。
-    库为空时返回零值而非报错（前端按空态渲染）。
+
+    ★ 读失败必须报错, 不能返回零值 (2026-10-19 修):
+      旧版把整个聚合包在 try/except 里, 撞上「库被采集器写事务锁住」时只记一行
+      warning, 然后照常返回 `stats:{gained:0, used:0}, rows:[]` —— HTTP 仍是 200,
+      前端拿到的是一份**形状合法的「今日零消耗」**, 于是看板把故障画成了 0。
+      现在先 probe() 探活: 库存在却读不到 → 返回 503 + 明确错误, 前端渲染错误态;
+      「库里就是没数据」才返回零值 (那才是真实业务语义)。
     """
     def _work() -> dict:
         import datetime as _dt
@@ -1914,6 +2012,15 @@ async def credits_today(channel: str | None = None, limit: int = 500):
 
         plat = _platform_of(channel)
         today = _dt.date.today().isoformat()
+
+        # 探活: 库存在但读不到 → 直接报错, 绝不交出一份假的全 0
+        ok, why = credits_api.probe()
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail={"message": f"积分流水库暂时读不到：{why}",
+                        "type": "credits_unavailable"},
+            )
 
         rows: list[dict] = []
         stats = {"gained": 0.0, "used": 0.0}
@@ -1935,8 +2042,16 @@ async def credits_today(channel: str | None = None, limit: int = 500):
             net = ov.get("net") or {}
             stats["gained"] = float(net.get("gained") or 0)
             stats["used"] = float(net.get("spent") or 0)
+        except HTTPException:
+            raise
         except Exception as e:  # noqa: BLE001
+            # 聚合中途失败同样不能返回假零值 —— 交给前端当错误态渲染
             logger.warning("today 聚合失败: %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail={"message": f"积分聚合失败：{e}",
+                        "type": "credits_unavailable"},
+            )
 
         return {"stats": stats, "rows": rows, "updatedAt": _now()}
 
@@ -2021,6 +2136,14 @@ async def credits_week(offset: int = 0, channel: str | None = None):
                           "WorkBuddy_IE": 0.0, "Loomy": 0.0}
 
         stats = {"gained": 0.0, "used": 0.0}
+        # 探活: 同 /credits/today —— 读不到就报错, 不交出一份「全周零消耗」的假数据
+        ok, why = credits_api.probe()
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail={"message": f"积分流水库暂时读不到：{why}",
+                        "type": "credits_unavailable"},
+            )
         try:
             for r in credits_api.usage_daily(start=s, end=e, platform=plat):
                 day = r.get("day")
@@ -2032,8 +2155,15 @@ async def credits_week(offset: int = 0, channel: str | None = None):
             net = ov.get("net") or {}
             stats["gained"] = float(net.get("gained") or 0)
             stats["used"] = float(net.get("spent") or 0)
+        except HTTPException:
+            raise
         except Exception as e2:  # noqa: BLE001
             logger.warning("week 聚合失败: %s", e2)
+            raise HTTPException(
+                status_code=503,
+                detail={"message": f"积分聚合失败：{e2}",
+                        "type": "credits_unavailable"},
+            )
 
         return {
             "stats": stats,
@@ -2110,8 +2240,13 @@ async def loomy_desktop_login(payload: dict = Body(...)):
         if not ok:
             return {"ok": False, "error": str(r)[:200]}
         acct = lc.save_session(r.get("userid", ""), r.get("session", ""), phone)
+        # ★ 2026-10-14 假断连修复: 登录只写 config.json, 而失效标记活在网关
+        #   进程内存里 —— 不在这里清牌, 页面就会「刚重新添加又显示断连」,
+        #   直到恰好有一发 loomy 请求落地才自愈（用户看到的正是这个）。
+        #   清牌后若新 session 仍无效, 下一发请求会立刻重新标红, 不掩盖真故障。
+        cleared = _clear_channel_runtime("loomy", acct.get("userid", ""))
         return {"ok": True, "userid": acct.get("userid", ""),
-                "name": acct.get("name", "")}
+                "name": acct.get("name", ""), "runtimeCleared": cleared}
 
     return await _in_thread(_work)
 

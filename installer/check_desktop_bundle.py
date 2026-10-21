@@ -109,7 +109,19 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                   #   DEMO-KEY-NOT-REAL 占位)。
                   #   产物 831.37 kB, CSS 仍 index-fW-_RaXL.css。
                   #   ★ dev / portable 两仓同一源码产出, bundle 名相同。
-                  'index-BTr_SDZo.js']
+                  'index-BTr_SDZo.js',
+                  # DRRRdT-l: 2026-10-21 **v3.4 三项修复 (A/B/C) 的前端** ——
+                  #   本端同步 v3.4 的唯一前端改动是 B 项的 CreditsPage.tsx:
+                  #   读取失败渲染明确错误态(「积分数据暂时读不到」/「积分流水暂时
+                  #   读不到」/「本次读取失败」+ AlertTriangle 图标), 不再拿 0
+                  #   冒充数据。后端 admin_api 在库读不到时改返回 503,
+                  #   前端对应进 error 分支 (statistics 显示「—」而非 0)。
+                  #   A/C 两项前端零改动。
+                  #   产物 832.08 kB(较 BTr_SDZo 的 831.37 kB 增大, 概因错误态
+                  #   分支) ; CSS 仍 index-pWqO-GDi.css (与来源端同名 —— CSS 侧
+                  #   改动一致)。
+                  #   ★ dev / portable 两仓同一源码产出, bundle 名相同。
+                  'index-DRRRdT-l.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

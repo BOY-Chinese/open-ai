@@ -25,6 +25,11 @@ INCLUDE = [
     'anthropic_api.py', 'admin_api.py', 'app_paths.py', 'auto_router.py',
     'image_util.py',   # ★ v3.3 视觉通道: main.py 顶层 import 它,
                        #   漏打 = 装出来的应用启动即 ImportError
+    'prompt_sanitizer.py',   # ★ v3.4 C 项: main.py / providers/workbuddy.py
+                             #   顶层 import 它 (提示词净化过滤器, 修 workbuddy
+                             #   400 code=11128 渠道校验拦截), 漏打 = 装出来
+                             #   启动即 ImportError。本项目第 4 次「打包清单与
+                             #   代码引用脱节」, 规律: 新增顶层 .py 必须进白名单。
     'version.py',
     'requirements.txt', 'README.md', 'MEMORY.md', '.gitignore',
     'start.bat', 'start_hidden.ps1', 'open-ai-autostart.bat',

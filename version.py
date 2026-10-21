@@ -13,7 +13,25 @@ GUI「设置」页显示该版本号, 「一键更新」据此与 GitHub 最新 
 #     data URI + 魔数校验 (上游只认 data:<mime>;base64,<b64>)
 #   * main.py: 请求入口 _normalize_body() 统一归一化 (developer→system 对所有
 #     provider 生效, 含 /v1/messages); 阻塞 IO 走 asyncio.to_thread 不冻结事件循环
-APP_VERSION = 'dev-v3.3'
+#
+# v3.4 (2026-10) 三端同步自本机端 local-v3.4, 共三项:
+#   * A (来源端 git 0a6dad9): 账号运行态「假断连」—— 重新登录 / 点刷新后页面仍
+#     显示断连。新增 AccountHealth.clear_invalid + Provider.clear_account_runtime,
+#     admin_api 增加 _clear_channel_runtime 并在 4 个时机接线 (登录成功 / 点刷新 /
+#     重新连接 / 登录脚本成功退出)。
+#   * B (来源端 git f13aef8 + ad7f288): 采集器长事务锁库 —— 积分看板「今日消耗」
+#     恒为 0、账号页「每日签到」除 Loomy 外全显示「未签到」(实际全部签到成功)。
+#     治本: usage_collector 各写入点改为写即提交, 联网期间不持写锁;
+#     治标: credits_api 增加忙等待重试与 CreditsReadError / probe(), 不再静默吞错;
+#     兜底: admin_api 三端点读不到时返回 503 (不再交出假零值);
+#     前端: CreditsPage 读取失败渲染错误态 (不再拿 0 冒充数据)。
+#   * C (来源端 git 26de3b5): 新增 prompt_sanitizer.py 提示词净化过滤器 ——
+#     上游扫描 system/assistant 开头的竞品 harness 身份指纹, 命中即 400
+#     code=11128「unapproved channel」。改写 system/assistant 里的指纹字面
+#     (保住语义), user 内容一字不动; 接入 main.py::_normalize_body 与
+#     providers/workbuddy.py::_to_upstream_body 两处 (幂等)。
+#     ★ 本端 installer/build_resources.py 的 INCLUDE 已同步加入该新模块。
+APP_VERSION = 'dev-v3.4'
 
 # 更新通道标识 (UPDATE_CHANNEL): 当前构建版本的更新通道, 决定「一键更新」在
 # GitHub Release Assets 中精确匹配文件名含该关键词的安装包。dev 通道匹配

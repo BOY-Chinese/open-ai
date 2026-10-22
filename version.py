@@ -31,7 +31,25 @@ GUI「设置」页显示该版本号, 「一键更新」据此与 GitHub 最新 
 #     (保住语义), user 内容一字不动; 接入 main.py::_normalize_body 与
 #     providers/workbuddy.py::_to_upstream_body 两处 (幂等)。
 #     ★ 本端 installer/build_resources.py 的 INCLUDE 已同步加入该新模块。
-APP_VERSION = 'dev-v3.4'
+#
+# v3.4.1 (2026-10) 同步 C·补充 —— 过滤器从「改写句式」改为「屏蔽产品名」:
+#   (来源端 git 3d3aefc + 58a4d6f + 0c615d5)
+#   * 原因: 原 C 属**逐个句式打补丁**, 上游一挥措辞规则就整条失配(实测同一句
+#     时 200 时 400, 每条改动都要重新抓包)。实测决定性证据: 原句 400, 而
+#     **只屏蔽掉产品名的任意一半**即 200 —— 说明上游做的是产品名匹配。
+#   * 改法: prompt_sanitizer.py 整体重写 —— `_REWRITES`(15 条句式改写) →
+#     `_MASKS`(23 条产品名屏蔽), 一律替换为占位符 `MASK`。
+#     排序敏感: 计费头「整行删除」规则必须排在对应产品名规则之前, 否则行名
+#     先被改成半残形式、整行删除再也匹配不到(有回归测试守住)。
+#     通用词(agent/assistant/code/cli/branch)一律不屏蔽, 以免毁掉正常技术文档。
+#   * 扫描角色 system / assistant / **tool** —— 新增 tool(来源端 3d3aefc):
+#     真实案例是一条 579 消息 / 623 KB 的请求被拦, 触发词全在 tool 消息里
+#     (抓来的 issue 全文 / 同步文档里逐字列出的指纹 / grep 源码打印的官方句)。
+#     表现为「干净工作区能用、排查过 11128 的工作区必挂」。user 仍绝不篡改。
+#   * 本次只动 prompt_sanitizer.py + 其测试 2 个文件; main.py / workbuddy.py
+#     的接入点零改动(原 C 已装好, 两版兼容)。
+#   * install、白名单无需再改: 文件名未变, 只是内容变了。
+APP_VERSION = 'dev-v3.4.1'
 
 # 更新通道标识 (UPDATE_CHANNEL): 当前构建版本的更新通道, 决定「一键更新」在
 # GitHub Release Assets 中精确匹配文件名含该关键词的安装包。dev 通道匹配

@@ -1219,3 +1219,44 @@ Claude Code / Codex 等 harness 接进来同理 —— 这是**所有 agent harn
 - 日志文案随之变化：命中时打印
   `提示词净化: 屏蔽 N 条消息里的产品名 [...]`
   （**不再是**原 C 的「改写 … 命中规则」—— 排查时别按旧文案去找）。
+## v3.4.1 发布（2026-10-22）—— 提示词净化升级为「屏蔽产品名」
+
+### 发布坐标
+
+* 仓库 `BOY-Chinese/open-ai` · release **tag `v3.4.1`（id=420401287）**
+  · 发布时刻 `2026-10-22T07:05:09Z` · https://github.com/BOY-Chinese/open-ai/releases/tag/v3.4.1
+* 资产（★ 上传后 GitHub 的 `digest` 与本地 `sha256sum` **逐字节核对一致**）：
+
+  | 文件 | 大小 | sha256 | asset id | 产物来源 |
+  |---|---|---|---|---|
+  | `open-ai-installer-dev.exe` | 34,721,361 B | `b7a04f64cf388caa78ba3b804e59fc0f24f7d712ad90dddbc58ed89074a57661` | 664993984 | `open-ai-github-dev\installer\dist\` |
+  | `open-ai-installer-portable.exe` | 431,673,158 B | `40a411ce99f6b5f8f438a6d9895eec32cdb958f83f1c477e2c491880bf5d9862` | — | `open-ai-github-portable\installer\dist\` |
+
+* **tag 落点 = 提交 `fc88315`**（= dev 仓 HEAD = `origin/main`）
+  ⇒ 「下载的包」与「tag 上的源码」对得上（这条每次都要核）。
+* `/releases/latest` 已指向 `v3.4.1` ⇒ 面板「一键更新」按 `UPDATE_CHANNEL` 能查到对应包。
+* 免鉴权复核：`curl -sIL <browser_download_url>` → 302 → **200**，`content-length` 与本地一致。
+
+### ★ 本次是「新增小版本」，不是覆盖
+
+master 明确指示：**推出 v3.4.1 小版本**。上一版 **v3.4 的资产原样保留**（未删未覆盖）。
+（对比 v3.3 那次是「覆盖重发」，两者前提不同 —— 覆盖必须先确认无人下载。）
+
+### 复用流程（发下一版照做）
+
+1. **代码先 push**，且 **tag 必须跟着代码走**（`target_commitish=main` 即可）；
+2. 建 release：`POST /repos/<owner>/<repo>/releases`；
+3. **资产上传走 `uploads.github.com`**（**不是** `api.github.com`）：
+   `POST https://uploads.github.com/repos/<owner>/<repo>/releases/<id>/assets?name=<name>`
+   —— 实测速率约 **2.1 MB/s**：dev 34.7 MB 用 14.6 s、portable 431 MB 用 **201 s**
+   （大包务必放后台跑，别卡在交互里）；
+4. **核验三件套**：① 线上 `digest` == 本地 `sha256sum`；② 无鉴权 `curl -sIL` 公开可下且
+   `content-length` 一致；③ `/releases/latest` 指向新 tag。
+5. **说明写好**（用户视角：现象 → 根因 → 修复 → 效果 → 校验 → 升级建议），
+   结构照 v3.4 / v3.4.1 既有 release body。
+
+### 本版要点（一句话）
+
+过滤器从「**改写句式**」（只在上游原句一字不差时生效）换成
+「**屏蔽产品名**」（23 条规则，命中替换为占位符）—— 上游改措辞也不再失效。
+接入点（`main.py` / `providers/workbuddy.py`）零改动，**界面零改动、无需重打包桌面端**。

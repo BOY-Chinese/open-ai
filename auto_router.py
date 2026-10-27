@@ -387,8 +387,17 @@ async def auto_stream(route_provider, providers: dict, body: dict, chain: dict):
 def _classify_check_error(msg: str) -> str:
     """把检查失败的原因归为 'busy'(繁忙) / 'down'(断连) 两类。
 
-    繁忙: 限流 (429)、上游 5xx、超时 —— 通道活着, 只是暂时挤不进去;
-    断连: 其余 (401/403/404、连接失败、协议错误等) —— 通道当前不可用。
+    繁忙 = **通道是活的，只是此刻这个模型挤不进去 / 暂不可用**；
+    断连 = 认证失败、连接不上、协议错误等「通道当前不可用」。
+
+    ★ 2026-10-22 补充三类「看起来像错误、其实是繁忙」的形态（实测踩到，
+      它们曾被一律判成断连，于是模型列表上一片红，误导排查方向）：
+      1) Qoder 上游排队：HTTP **403** + `isQueued` / `10605` + retryAfterSeconds。
+         403 单看像鉴权失败，实际是「已排队，请等 N 秒」。
+      2) 并发会话上限：CodeArts `TM.00001041 并发会话数已达上限(3)`。
+      3) 福利模型未领取：`InferHub.4004.200 benefit not found` ——
+         该模型是免费福利模型但当前账号没领到（上游领取网关已失效），
+         换别的模型立刻可用，显然不是「通道断连」。
     """
     low = (msg or "").lower()
     if "429" in low or "rate limit" in low or "繁忙" in msg or "busy" in low:
@@ -396,6 +405,25 @@ def _classify_check_error(msg: str) -> str:
     if "超时" in msg or "timeout" in low or "timed out" in low:
         return "busy"
     if re.search(r"\b5\d{2}\b", msg or ""):
+        return "busy"
+    # 1) 排队
+    if "isqueued" in low or "10605" in low or "排队" in msg or "队列" in msg:
+        return "busy"
+    # 2) 并发上限
+    if "tm.00001041" in low or "并发" in msg or "concurrent" in low:
+        return "busy"
+    # 3) 福利模型未领取（模型级限制，通道本身可用）
+    if "benefit not found" in low or "4004.200" in low or "福利" in msg:
+        return "busy"
+    # 4) 资源受限 RESOURCE_LIMIT（2026-10-24 补）
+    #    上游用 {isQueued:true, queueCount:0, serviceAvailable:false,
+    #    subCode:"RESOURCE_LIMIT"} 表达「这个模型此刻没有服务」。
+    #    它是**模型级**限制（通道活着、别的模型照常用），必须判 busy 而不是 down，
+    #    否则账号页会把整条通道标红「断连」。
+    #    ★ 单独列一条是因为异常消息里未必带 isQueued 原文（provider 会重写成
+    #      「模型 X 当前无可用资源（上游 RESOURCE_LIMIT）」），只靠上面的
+    #      isqueued/10605 判定会漏掉 —— 实测漏判过。
+    if "resource_limit" in low or "resource limited" in low or "无可用资源" in msg:
         return "busy"
     return "down"
 
@@ -425,21 +453,45 @@ async def check_model(route_provider, providers: dict, model: str, timeout: floa
 
     sub = {"model": model,
            "messages": [{"role": "user", "content": CHECK_PROMPT}]}
+    provider = route_provider(model, providers)
+    if provider is None:
+        return {"model": model, "status": "down", "latencyMs": 0,
+                "detail": "无法路由: 没有匹配的通道"}
+
+    # 通道自带探活闸门时（CodeArts：上游有滚动窗口的并发会话上限），
+    # 先查缓存、再排队补间隔 —— 间隔在计时开始前完成，不占用探测超时。
+    gate = getattr(provider, "probe_gate", None)
+    gate_held = False
+    if gate is not None:
+        cached = gate.cached(model)
+        if cached is not None:
+            return cached
+        # 有闸门的通道通常要「排队 + 可能等一轮限流」：放宽单次探测超时，
+        # 否则排队本身会被记成超时繁忙（CodeArts 实测过）。
+        hint = float(getattr(provider, "probe_timeout", 0) or 0)
+        if hint > t:
+            t = hint
+        await gate.acquire()
+        gate_held = True
+
     started = time.monotonic()
     try:
-        provider = route_provider(model, providers)
-        if provider is None:
-            return {"model": model, "status": "down", "latencyMs": 0,
-                    "detail": "无法路由: 没有匹配的通道"}
         result = await asyncio.wait_for(provider.chat(sub), timeout=t)
         latency = int((time.monotonic() - started) * 1000)
         snippet = _reply_snippet(result)
         logger.info("[auto] 检查模型 %s: 正常 (%s)", model, snippet or "有回复")
-        return {"model": model, "status": "ok", "latencyMs": latency,
-                "detail": snippet or "有回复"}
+        out = {"model": model, "status": "ok", "latencyMs": latency,
+               "detail": snippet or "有回复"}
+        if gate_held:
+            gate.release(model, out)
+            gate_held = False
+        return out
     except asyncio.TimeoutError:
         latency = int((time.monotonic() - started) * 1000)
         logger.info("[auto] 检查模型 %s: 繁忙 (%.0fs 无响应)", model, t)
+        if gate_held:
+            gate.release()
+            gate_held = False
         return {"model": model, "status": "busy", "latencyMs": latency,
                 "detail": f"{int(t)}s 内无响应"}
     except Exception as e:  # noqa: BLE001
@@ -447,4 +499,7 @@ async def check_model(route_provider, providers: dict, model: str, timeout: floa
         msg = describe_net_exc(e)[:160]
         status = _classify_check_error(msg)
         logger.info("[auto] 检查模型 %s: %s (%s)", model, status, msg)
+        if gate_held:
+            gate.release()
+            gate_held = False
         return {"model": model, "status": status, "latencyMs": latency, "detail": msg}

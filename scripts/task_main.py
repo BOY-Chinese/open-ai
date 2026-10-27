@@ -71,6 +71,19 @@ def _route(script, rest):
     # 国际版无签到渠道, 改发一条 /console/chat/completions 对话拿每日 +30。
     # 平时由 signin_all 内部直接 import 调用; 这里保留独立入口, 便于
     # 排查 / 手工补发一条 (打包态同样按文件名路由)。
+    # 2026-10 新增三通道登录助手（Qoder 走设备授权 / CodeArts 走华为云 OAuth2）。
+    # 两个脚本都是「打开浏览器 → 用户授权 → 写回 config.json」的形态，
+    # 与既有 login_* 一致；打包态同样按文件名路由（安装包不含 scripts/*.py）。
+    if name in ('login_qoder.py', 'login-qoder'):
+        sys.path.insert(0, root)
+        import login_qoder
+        return login_qoder.main()
+
+    if name in ('login_codearts.py', 'login-codearts'):
+        sys.path.insert(0, root)
+        import login_codearts
+        return login_codearts.main()
+
     if name in ('wb_web_daily.py', 'wb-web-daily', 'wbweb'):
         sys.argv = ['wb_web_daily.py'] + rest
         import wb_web_daily
@@ -85,7 +98,8 @@ def main():
         sys.stderr.write(
             '用法: open-ai-task.exe <脚本名|子命令> [参数...]\n'
             '  脚本名: signin_all.py / usage_collector.py / login_trae.py /\n'
-            '          login_workbuddy.py / login_workbuddy_intl.py / wb_web_daily.py\n'
+            '          login_workbuddy.py / login_workbuddy_intl.py / wb_web_daily.py /\n'
+            '          login_qoder.py / login_codearts.py\n'
             '  子命令: signin / collect / login-trae / login-workbuddy / login-workbuddy-intl\n')
         return 2
 

@@ -18,6 +18,7 @@ import {
 import { VirtualTable } from '@/components/data/VirtualTable'
 import { useToast } from '@/components/feedback/Toast'
 import { LoomyLoginDialog } from '@/components/accounts/LoomyLoginDialog'
+import { AddAccountDialog } from '@/components/accounts/AddAccountDialog'
 import { useAsync } from '@/hooks/useAsync'
 import { onAccountsChanged } from '@/lib/accountEvents'
 import { backend } from '@/lib/dataSource'
@@ -42,12 +43,15 @@ const COLUMNS = [
   { key: 'status', label: '账号状态', width: 100 },
 ]
 
-const FILTER_LABEL: Record<ChannelFilter, string> = {
-  all: '全部通道',
-  Trae: 'Trae',
-  WorkBuddy: 'WorkBuddy',
-  WorkBuddy_IE: 'WorkBuddy 国际',
-  Loomy: 'Loomy',
+/**
+ * 筛选/提示文案。
+ *
+ * ★ 不再手写 Record<ChannelFilter, string>：通道从四个长到七个之后，
+ *   手写表每加一个通道就要改一处，漏一处就渲染出裸通道名。
+ *   这里统一从 channelMeta 派生 —— 通道元信息的唯一来源仍是 types/domain.ts。
+ */
+function filterLabel(f: ChannelFilter): string {
+  return f === 'all' ? '全部通道' : channelMeta(f).label
 }
 
 export function AccountsPage() {
@@ -64,8 +68,17 @@ export function AccountsPage() {
    */
   const [loginBusy, setLoginBusy] = useState<Partial<Record<Channel, boolean>>>({})
 
-  /** Loomy 图形化登录向导开关（点「添加 Loomy 账号」弹出，全程无命令行） */
+  /** Loomy 图形化登录向导开关（手机号短信验证码，全程无命令行） */
   const [loomyDialog, setLoomyDialog] = useState(false)
+
+  /** 「添加账号」通道选择弹窗开关（2026-10：替代原先的四个并排按钮） */
+  const [addDialog, setAddDialog] = useState(false)
+
+  /** 是否有任一通道正在登录（用于底部提示文案） */
+  const anyLoginBusy = useMemo(
+    () => Object.values(loginBusy).some(Boolean),
+    [loginBusy]
+  )
 
   const { data: accounts, loading, reload, setData } = useAsync(
     () => backend.listAccounts(filter),
@@ -95,16 +108,15 @@ export function AccountsPage() {
   } = useAsync(() => backend.listSignin(filter), [filter], EMPTY_SIGNIN)
 
   /* 从全量数据推导筛选下拉的计数，让"全部"也能显示总数 */
+  /* 从全量数据推导筛选下拉的计数（按 CHANNELS 生成，新增通道无需改这里） */
   const counts = useMemo(() => {
-    const map: Record<ChannelFilter, number> = {
-      all: accounts.length,
-      Trae: 0,
-      WorkBuddy: 0,
-      WorkBuddy_IE: 0,
-      Loomy: 0,
-    }
+    const map = { all: accounts.length } as Record<ChannelFilter, number>
+    CHANNELS.forEach((ch) => {
+      map[ch] = 0
+    })
     accounts.forEach((a) => {
-      map[a.channel] += 1
+      // 后端可能返回未知通道（别名未收敛时）—— 不判存在会算出 NaN
+      if (a.channel in map) map[a.channel] += 1
     })
     return map
   }, [accounts])
@@ -156,7 +168,7 @@ export function AccountsPage() {
       const next = await backend.refreshAccounts(filter)
       setData(next)
       await reloadSignin()
-      toast(`已刷新 ${FILTER_LABEL[filter]} 账号积分${signinNote}`, 'success', 5000)
+      toast(`已刷新 ${filterLabel(filter)} 账号积分${signinNote}`, 'success', 5000)
     } catch (e) {
       toast(e instanceof Error ? e.message : '刷新失败', 'error')
     } finally {
@@ -170,7 +182,7 @@ export function AccountsPage() {
     try {
       const next = await backend.reconnectAccounts(filter)
       setData(next)
-      toast(`已重新连接 ${FILTER_LABEL[filter]} 账号`, 'success')
+      toast(`已重新连接 ${filterLabel(filter)} 账号`, 'success')
     } catch (e) {
       toast(e instanceof Error ? e.message : '重连失败', 'error')
     } finally {
@@ -262,11 +274,19 @@ export function AccountsPage() {
     [launchLogin]
   )
 
+  /**
+   * 添加账号（由 AddAccountDialog 选中通道后回调）。
+   *
+   * 两条路径：
+   *   Loomy      → 手机号短信验证码登录（讯飞账号服务，桌面通道），
+   *                弹图形化向导，用户只填手机号和验证码，全程无命令行。
+   *                走桌面通道是因为只有它的 session 能鉴权对话、积分记在本账号。
+   *   其余通道   → 拉起对应登录脚本（浏览器授权），脚本自己把凭据写回 config.json。
+   */
   const onAdd = useCallback(
     (channel: Channel) => {
-      // Loomy 是手机号短信验证码登录（讯飞账号服务，桌面通道），不是浏览器
-      // 交互 —— 弹出图形化向导，用户只填手机号和验证码，全程无命令行。
-      // 走桌面通道是因为只有它的 session 能鉴权对话、积分记在本账号。
+      // 选中即关弹窗：登录助手在浏览器里进行，弹窗留着只会挡住后面的表格
+      setAddDialog(false)
       if (channel === 'Loomy') {
         setLoomyDialog(true)
         return
@@ -296,7 +316,7 @@ export function AccountsPage() {
     <PageShell>
       <PageHeader
         title="账号管理"
-        description="Trae / WorkBuddy / WorkBuddy 国际 / Loomy 四通道统一视图"
+        description="Qoder 国内 / Qoder 国际 / CodeArts / WorkBuddy 系 / Loomy / 七通道统一视图"
       />
 
       {/* 工具栏：筛选 + 刷新当前通道 + 重连当前通道 */}
@@ -321,7 +341,7 @@ export function AccountsPage() {
           variant="outline"
           onClick={onRefresh}
           loading={busy === 'refresh'}
-          title={`刷新 ${FILTER_LABEL[filter]} 账号状态`}
+          title={`刷新 ${filterLabel(filter)} 账号状态`}
         >
           <RefreshCw />
           刷新账号
@@ -330,7 +350,7 @@ export function AccountsPage() {
           variant="outline"
           onClick={onReconnect}
           loading={busy === 'reconnect'}
-          title={`重连 ${FILTER_LABEL[filter]} 账号`}
+          title={`重连 ${filterLabel(filter)} 账号`}
         >
           <Link2 />
           重新连接
@@ -359,7 +379,7 @@ export function AccountsPage() {
                 colSpan={COLUMNS.length}
                 icon={Users}
                 title="暂无账号"
-                description={`${FILTER_LABEL[filter]} 通道下还没有添加账号，可从下方添加`}
+                description={`${filterLabel(filter)} 通道下还没有添加账号，可从下方添加`}
               />
             }
             /* 右键菜单：重新添加 / 启用-关闭 / 删除 */
@@ -470,18 +490,36 @@ export function AccountsPage() {
                     )}
                   </td>
 
-                  {/* 当前积分：通用 + Work 明细 */}
+                  {/*
+                    当前积分：通用 + Work 明细。
+
+                    ★ credits === null = **未知**（该通道没有余额接口，如 CodeArts）。
+                      此时显示「—」并给出原因，绝不显示 0 —— 「0 积分」与「查不到」
+                      是两件事，把后者渲染成前者就是在编数据（与「每日签到」列同口径）。
+                  */}
                   <td className="h-9 px-3">
-                    <span className="flex items-baseline gap-2 tabular">
-                      <span className="text-base font-medium text-fg">
-                        {fmtCredit(a.credits + a.workCredits)}
-                      </span>
-                      {a.workCredits > 0 && (
-                        <span className="text-sm text-fg-subtle">
-                          (通用 {fmtCredit(a.credits)} + Work {fmtCredit(a.workCredits)})
+                    {a.credits === null ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="text-base text-fg-faint">—</span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {channelMeta(a.channel).label} 未提供余额接口，无法获取积分；
+                          签到与活动积分见「每日签到」列
+                        </TooltipContent>
+                      </Tooltip>
+                    ) : (
+                      <span className="flex items-baseline gap-2 tabular">
+                        <span className="text-base font-medium text-fg">
+                          {fmtCredit(a.credits + a.workCredits)}
                         </span>
-                      )}
-                    </span>
+                        {a.workCredits > 0 && (
+                          <span className="text-sm text-fg-subtle">
+                            (通用 {fmtCredit(a.credits)} + Work {fmtCredit(a.workCredits)})
+                          </span>
+                        )}
+                      </span>
+                    )}
                   </td>
 
                   {/* 账号状态：Badge（颜色 + 文字双重编码） */}
@@ -497,35 +535,40 @@ export function AccountsPage() {
         )}
       </PageBody>
 
-      {/* 底部固定操作栏：四通道添加入口 */}
+      {/*
+        底部固定操作栏：**单一**「添加账号」入口。
+
+        ★ 2026-10 改版（master 指定）：原先这里是四个并排的
+          「添加 <通道> 账号」按钮。通道从四个增到七个之后，这排按钮会挤满
+          整行，而且「哪个通道用哪种登录方式」这个关键差别被藏在按钮文案里。
+          现在收敛为一个入口 → 弹 AddAccountDialog 自选通道（每个通道一行，
+          写清登录方式），再拉起对应登录助手。
+      */}
       <PageFooter>
-        {(
-          [
-            ['Trae', '添加 Trae 账号'],
-            ['WorkBuddy', '添加 WorkBuddy 账号'],
-            ['WorkBuddy_IE', '添加 WorkBuddy 国际账号'],
-            ['Loomy', '添加 Loomy 账号'],
-          ] as [Channel, string][]
-        ).map(([ch, label]) => (
-          <Button
-            key={ch}
-            variant="outline"
-            onClick={() => onAdd(ch)}
-            disabled={busy !== null || loginBusy[ch] === true}
-            loading={loginBusy[ch] === true}
-            title={
-              ch === 'Loomy'
-                ? '使用手机号验证码登录你自己的 Loomy 账号'
-                : loginBusy[ch]
-                  ? '登录助手正在运行，请在浏览器完成登录'
-                  : `拉起 ${channelMeta(ch).label} 登录助手`
-            }
-          >
-            {!loginBusy[ch] && <Plus />}
-            {loginBusy[ch] ? '登录中…' : label}
-          </Button>
-        ))}
+        <Button
+          variant="outline"
+          onClick={() => setAddDialog(true)}
+          disabled={busy !== null}
+          title="选择要添加账号的通道（Qoder CN / Qoder / CodeArts / WorkBuddy / ###/ Loomy）"
+        >
+          <Plus />
+          添加账号
+        </Button>
+        {anyLoginBusy && (
+          <span className="text-xs leading-tight text-fg-subtle">
+            登录助手正在运行，请在浏览器完成登录
+          </span>
+        )}
       </PageFooter>
+
+      {/* 「添加账号」通道选择（点底部按钮弹出，每个通道一行 + 登录方式说明） */}
+      {addDialog && (
+        <AddAccountDialog
+          busy={loginBusy}
+          onClose={() => setAddDialog(false)}
+          onPick={onAdd}
+        />
+      )}
 
       {/* Loomy 图形化登录向导（手机号 → 验证码 → 完成，全程无命令行） */}
       {loomyDialog && (

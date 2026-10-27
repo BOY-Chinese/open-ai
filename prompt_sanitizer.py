@@ -32,14 +32,39 @@ DSH 用 workbuddy 通道时请求被拒：
 * `You are ###, ###'s official CLI for ###.` → **200**（Claude Code 官方句）
 * `You are ###, an AI assistant by ###.`     → **200**（CodeBuddy / Trae 官方句）
 
+## 2026-10-27 第二轮：黑名单不止产品名，还有 DSH 的**整句**提示词
+
+产品名全部屏蔽后仍 400，直打上游逐段二分定位到 DSH 0.2.1-rc.2 新增的
+`dsh-file-reference` 提示词（`FILE_REFERENCE_PROMPT`）前两句：
+
+    Tokens prefixed with @ are paths the user explicitly referenced.
+    Relative paths resolve from the workspace root
+
+实测边界（2026-10-27，逐条直打上游）：
+
+| 形态 | 结果 |
+|---|---|
+| 上述两句**连读**（111 字符，含中间的句号+空格） | 400 |
+| 只发前一句 / 只发后一句 | 200 |
+| 两句之间换行代替空格 | 200 |
+| 把 `Tokens`→`Paths`、`explicitly`删掉、`@`→`at-sign` 等任一处改措辞 | 200 |
+| 同样的句子放进 `user` 消息 | 200 |
+| 放进 `assistant` / `tool` 消息 | 400 |
+
+结论：上游用的是一张**逐字子串**黑名单，条目既包括产品名，也包括 DSH
+系统提示词里的新句子（上游在跟着 DSH 版本补条目）。所以净化不能只盯产品名，
+还要能对「已进黑名单的整句」做**同义改写**（见 `_REWRITES`）。
+
 ## 设计原则
 
 * **只屏蔽产品名**，句子骨架（You are / powered by / the CLI for）原样保留，
   模型仍能理解「你是一个由某方提供的助手」，语义损失最小。
+* **整句指纹用同义改写**，不用「插零宽字符/前置空格」这类绕法（上游随时会收紧，
+  且零宽字符会污染路径与工具参数）。
 * **角色范围：system / assistant / tool**。
-  - `user` 是用户真实输入，**绝不篡改**（实测把身份句发进 user，上游并不拦截）。
-* **幂等**：屏蔽后文本不再含任何产品名，重复调用零副作用。
-* **可审计**：每次屏蔽都写日志，便于排查「模型怎么突然不认识自己是谁」。
+  - `user` 是用户真实输入，**绝不篡改**（实测把身份句/指纹句发进 user，上游都不拦截）。
+* **幂等**：改过的文本不再命中任何规则，重复调用零副作用。
+* **可审计**：每次屏蔽/改写都写日志，便于排查「模型怎么突然不认识自己是谁」。
 """
 import logging
 import re
@@ -119,6 +144,29 @@ _MASKS = [
 
 ]
 
+# ---------------------------------------------------------------------------
+# 整句指纹改写表：(正则, 替换文本, 说明)
+#
+# 为什么单独一张表：这些句子**整句**进了上游黑名单，但句中不含任何产品名，
+# 上面的 `_MASKS`（一律替换成占位符）会把整段指令抹成 `###`，模型就读不懂了。
+# 所以这里按「保留句意、换同义措辞」处理。
+#
+# ★ 上表实测依据（2026-10-27）：
+#   整句连读 → 400；改任一词/标点/空白 → 200。
+#   因此每条规则只需要把**句子骨架里的一个词**换掉即可失效，不必整段重写。
+# ---------------------------------------------------------------------------
+_REWRITES = [
+    # DSH dsh-file-reference 的 FILE_REFERENCE_PROMPT（2026-10-27 实锤）
+    (re.compile(r"Tokens prefixed with @ are paths the user explicitly referenced\.",
+                re.IGNORECASE),
+     "@-prefixed tokens are paths the user explicitly referenced.",
+     "DSH 文件引用提示词（首句）"),
+    (re.compile(r"Relative paths resolve from the workspace root",
+                re.IGNORECASE),
+     "Relative paths are resolved against the workspace root",
+     "DSH 文件引用提示词（次句）"),
+]
+
 
 def _text_of(content) -> str:
     """把消息 content 压平成可扫描的纯文本（多模态数组只取 text 段）。"""
@@ -136,9 +184,16 @@ def _text_of(content) -> str:
 
 
 def _sanitize_text(text: str) -> tuple:
-    """对单段文本跑屏蔽表。返回 (新文本, 命中的说明列表)。"""
+    """对单段文本跑「整句改写 + 产品名屏蔽」。返回 (新文本, 命中的说明列表)。"""
     hits = []
     out = text
+    # 先同义改写整句指纹 —— 必须在产品名屏蔽之前跑，
+    # 否则含产品名的句子会先被替换成 ###，改写规则再也匹配不到原句。
+    for pattern, repl, label in _REWRITES:
+        new, n = pattern.subn(repl, out)
+        if n:
+            hits.append(f"{label} x{n}")
+            out = new
     for pattern, label in _MASKS:
         # 计费头整行删除，其余换成 ###
         repl = "" if "billing" in label else MASK

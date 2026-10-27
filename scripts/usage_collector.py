@@ -164,6 +164,19 @@ def db_init(conn):
         updated_at  INTEGER NOT NULL,
         PRIMARY KEY (platform, uid, day, kind)
     )''')
+    # ★ 2026-10-24：Qoder / CodeArts 的「配额快照」。
+    #   这两家上游**只给累计值**（没有逐笔台账），所以只能拿「当天首次观测」当基线、
+    #   用差值算当天消耗。基线必须落库，否则每次采集都从 0 重算。
+    #   （platform/uid/day 唯一 → 每天一条基线；跨天自动重新基线。）
+    conn.execute('''CREATE TABLE IF NOT EXISTS quota_snapshot (
+        platform   TEXT NOT NULL,           -- qoder_cn / qoder_intl / codearts
+        uid        TEXT NOT NULL,
+        day        TEXT NOT NULL,           -- YYYY-MM-DD (本地日期)
+        base_used  REAL NOT NULL,           -- 当天首次观测到的「累计已用」
+        last_used  REAL NOT NULL,           -- 最近一次观测到的「累计已用」
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (platform, uid, day)
+    )''')
 
 
 def db_upsert(conn, rows):
@@ -699,6 +712,229 @@ def loomy_gains(conn, cfg):
 
 # ============ 汇总入口 ============
 
+# ============ Qoder / CodeArts 消耗（快照差值） ============
+#
+# 为什么是「差值」而不是逐笔：
+#   ### / WorkBuddy / Loomy 都有**逐条台账**接口，能一行一笔地记。
+#   而 Qoder 与 CodeArts 上游**只给累计值**：
+#     Qoder     GET /api/v2/quota/usage               → userQuota.used + addOnQuota.used
+#     CodeArts  GET snap-manager/v1/statistics/plugin → package_credit_used
+#   没有「这一笔扣了多少」的接口。所以采集器**定期记一次累计值**，
+#   拿「当天首次观测」当基线，差值就是当天消耗，
+#   写成一条 platform × uid × 天的聚合行。
+#
+# 如实说明精度（这不是 bug）：
+#   · 当天首次采集**之前**已经消耗掉的部分算不进去（那时还没有基线）；
+#   · 粒度是「账号 × 天」一条聚合行，不是逐笔；
+#   · 池子重置 / 字段消失会让累计值**变小** → 当场重新基线，绝不写负数。
+#
+# entry_id 固定为 `quota-day-<日期>`：同一天多次采集会**覆盖更新同一条**，
+# 所以反复采集不会把看板刷成一堆重复行。
+
+_QUOTA_CHANNELS = (
+    # (流水库 platform 键, config.json providers 段键)
+    ('qoder_cn', 'qoder_cn'),
+    ('qoder_intl', 'qoder_intl'),
+)
+
+
+def _providers_module(name):
+    """惰性导入 providers 下的模块。
+
+    采集器自身只用标准库（urllib），但 Qoder / CodeArts 的接口要 COSY / AK-SK 签名，
+    直接复用 providers 里的实现最稳（签名逻辑不该抄第二遍，抄一遍就多一处会腐烂的代码）。
+    源码态与打包态都要保证项目根在 sys.path 上。
+    """
+    try:
+        from app_paths import ROOT as root
+    except Exception:  # 源码态兜底
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import importlib
+    return importlib.import_module('providers.' + name)
+
+
+def _qoder_used(acc):
+    """Qoder 账号的**累计已用**积分（两个池相加）。返回 (used|None, err)。"""
+    try:
+        qc = _providers_module('qoder_common')
+        quota = qc.account_quota(acc) or {}
+    except Exception as e:  # noqa: BLE001
+        return None, f'quota 查询异常: {str(e)[:120]}'
+    if not quota:
+        return None, 'quota/usage 无响应（token 失效或网络不通）'
+
+    def _used(node):
+        if not isinstance(node, dict):
+            return 0.0
+        try:
+            return float(node.get('used') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    pools = [k for k in ('userQuota', 'addOnQuota', 'shared', 'credits', 'quota')
+             if isinstance(quota.get(k), dict)]
+    if not pools:
+        return None, f"配额响应里没有已知积分池（keys={sorted(quota.keys())[:8]}）"
+    return sum(_used(quota.get(k)) for k in pools), ''
+
+
+def _codearts_used(acc):
+    """CodeArts 账号的**累计已用**积分。返回 (used|None, err)。"""
+    try:
+        ca = _providers_module('codearts')
+        stats, err = ca.fetch_credit_stats(acc)
+    except Exception as e:  # noqa: BLE001
+        return None, f'statistics 查询异常: {str(e)[:120]}'
+    if not stats:
+        return None, err or 'statistics/plugin 无响应'
+    return float(stats.get('used') or 0), ''
+
+
+def quota_day_row(conn, platform, uid, used_now, collected_at, extra=None):
+    """把「累计已用」换算成**当天**的一条 usage 行（幂等）。返回 row 或 None。
+
+    返回 None 的两种情况（都**不该**写行 —— 写了就是假数据）：
+      1) 今天第一次观测，且**没有可接续的昨日快照** → 只建基线。
+         因为「今天 0 点到现在」已经消耗掉的那部分我们无从得知：
+         写 0 是假的，写「历史累计」更是假的。
+      2) 差值 <= 0 → 没有新增消耗（或池子刚重置）。
+
+    ★ 接续昨日（2026-10-24 补，重要）：
+      第一版把「当天首次观测」当基线，于是「昨天最后一次采集 → 今天第一次采集」
+      之间消耗的积分**整段丢掉**。典型场景：夜里关机、早上才开程序 ——
+      那段时间若用官方 IDE 消耗过积分，就永远记不上，看板会长期少算。
+      现在：若存在**恰好是昨天**的最后一条快照，且它的累计值 <= 当前值，
+      就用它当今天的基线（差值立刻产出今天第一条行）。
+      只在「上一条恰好是昨天」时接续 —— 中间断了几天就**不接**，
+      免得把几天的消耗全砸到某一天、在看板上造出假尖峰。
+    """
+    day = time.strftime('%Y-%m-%d', time.localtime(collected_at))
+    uid = str(uid or '')
+    used_now = float(used_now)
+    cur = conn.execute(
+        'SELECT base_used FROM quota_snapshot'
+        ' WHERE platform=? AND uid=? AND day=?', (platform, uid, day)).fetchone()
+    carried_from = ''
+    if cur is None:
+        yday = time.strftime('%Y-%m-%d', time.localtime(collected_at - 86400))
+        prev = conn.execute(
+            'SELECT day, last_used FROM quota_snapshot'
+            ' WHERE platform=? AND uid=? AND day<? ORDER BY day DESC LIMIT 1',
+            (platform, uid, day)).fetchone()
+        base = used_now
+        if prev and str(prev[0]) == yday and float(prev[1]) <= used_now:
+            base = float(prev[1])
+            carried_from = str(prev[0])
+        conn.execute(
+            'INSERT INTO quota_snapshot (platform,uid,day,base_used,last_used,updated_at)'
+            ' VALUES (?,?,?,?,?,?)',
+            (platform, uid, day, base, used_now, int(collected_at)))
+        conn.commit()
+        if not carried_from:
+            return None          # 无可接续 → 只建基线，不写行
+    else:
+        base = float(cur[0])
+
+    if used_now < base:
+        # 池子重置 / 字段变动 → 重新基线，**绝不写负数**
+        conn.execute(
+            'UPDATE quota_snapshot SET base_used=?, last_used=?, updated_at=?'
+            ' WHERE platform=? AND uid=? AND day=?',
+            (used_now, used_now, int(collected_at), platform, uid, day))
+        conn.commit()
+        return None
+    delta = used_now - base
+    conn.execute(
+        'UPDATE quota_snapshot SET last_used=?, updated_at=?'
+        ' WHERE platform=? AND uid=? AND day=?',
+        (used_now, int(collected_at), platform, uid, day))
+    conn.commit()
+    if delta <= 0:
+        return None
+    info = {'base_used': base, 'used_now': used_now,
+            'delta': round(delta, 6), 'day': day}
+    if carried_from:
+        info['carried_from'] = carried_from
+    if extra:
+        info.update(extra)
+    return (platform, uid, f'quota-day-{day}', int(collected_at), '',
+            delta, None, 0, 0, 0, 'quota-delta', None, None,
+            json.dumps(info, ensure_ascii=False), int(collected_at))
+
+
+def _collect_quota_channel(conn, cfg, collected_at, platform, seg_key, used_fn):
+    """采集一个通道的消耗（逐账号取累计值 → 换算成当天差值行）。
+
+    报数口径（★ 2026-10-24 修：初版把后面两类混成一个「建基线」，会误报）：
+      · 记 N 个账号的当日消耗 —— 本轮**写出了/更新了**当天那条行；
+      · 本轮建基线 M 个       —— 今天**此前没有基线**，本轮才建（无可接续）；
+      · 无新增 K 个           —— 已有基线，但累计值没涨（差值 0）；
+      · 失败 F 个             —— 上游读不到累计值。
+    """
+    seg = (cfg.get('providers') or {}).get(seg_key) or {}
+    accs = [a for a in (seg.get('accounts') or []) if isinstance(a, dict)]
+    if not accs:
+        return f'{platform}: 无账号（请先在账号管理中登录）'
+    day = time.strftime('%Y-%m-%d', time.localtime(collected_at))
+    done = fail = fresh = nod = 0
+    for acc in accs:
+        if acc.get('enabled', True) is False:
+            continue                      # 关掉的账号不采（它也不该产生消耗）
+        uid = str(acc.get('uid') or acc.get('userId') or '')
+        if not uid:
+            continue
+        used, err = used_fn(acc)
+        if used is None:
+            log(f'quota {platform}/{uid[:8]}: {err}')
+            fail += 1
+            continue
+        # 先看今天是否已有基线 —— 用来把「本轮才建基线」与「无新增」分开报
+        had_base = conn.execute(
+            'SELECT 1 FROM quota_snapshot WHERE platform=? AND uid=? AND day=?',
+            (platform, uid, day)).fetchone() is not None
+        row = quota_day_row(conn, platform, uid, used, collected_at,
+                            extra={'realm': acc.get('realm') or ''})
+        if row is None:
+            if had_base:
+                nod += 1
+            else:
+                fresh += 1
+        else:
+            db_upsert(conn, [row])
+            done += 1
+    msg = f'{platform}: 记 {done} 个账号的当日消耗'
+    if fresh:
+        msg += f', 本轮建基线 {fresh} 个'
+    if nod:
+        msg += f', 无新增 {nod} 个'
+    if fail:
+        msg += f', 失败 {fail} 个'
+    return msg
+
+
+def collect_quota_channels(conn, cfg, collected_at):
+    """采集 Qoder CN / Qoder 国际 / CodeArts 三通道的消耗（2026-10-24 新增）。
+
+    这三个通道此前**完全没有流水**（usage 表里一行都没有），所以积分看板上
+    它们的消耗恒为 0 —— 本次补齐。数据源是上游的「累计已用」，口径见上方注释。
+    """
+    msgs = []
+    for platform, seg_key in _QUOTA_CHANNELS:
+        try:
+            msgs.append(_collect_quota_channel(conn, cfg, collected_at,
+                                               platform, seg_key, _qoder_used))
+        except Exception as e:  # noqa: BLE001 — 单通道失败不该拖垮其它通道
+            msgs.append(f'{platform}: 采集异常 {str(e)[:120]}')
+    try:
+        msgs.append(_collect_quota_channel(conn, cfg, collected_at,
+                                           'codearts', 'codearts', _codearts_used))
+    except Exception as e:  # noqa: BLE001
+        msgs.append(f'codearts: 采集异常 {str(e)[:120]}')
+    return msgs
+
+
 def collect_all(window_days=WINDOW_DAYS):
     """采集一轮 (TRAE + WorkBuddy 国内 + WorkBuddy 国际 消耗流水 + 获取积分) 并入库。
     返回汇总消息字符串。
@@ -723,6 +959,9 @@ def collect_all(window_days=WINDOW_DAYS):
         msgs = [collect_trae(conn, cfg, collected_at, window_days)]
         msgs.extend(collect_all_workbuddy(conn, cfg, collected_at, window_days))
         msgs.append(collect_loomy(conn, cfg, collected_at, window_days))
+        # ★ 2026-10-24 新增：Qoder CN / Qoder 国际 / CodeArts 的消耗
+        #   （此前这三通道在 usage 表里一行都没有 → 看板恒显示 0 消耗）
+        msgs.extend(collect_quota_channels(conn, cfg, collected_at))
         n_gain = collect_gains(conn, cfg)
         n_gain += loomy_gains(conn, cfg)
         msgs.append(f'获取积分记录 {n_gain} 条')

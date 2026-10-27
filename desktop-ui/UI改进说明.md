@@ -432,7 +432,7 @@ WorkBuddy 国际版原有的对外模型前缀 `wbai-` 已统一改为 `wbie-`�
 **幂等性**：Broker 侧由 `bootstrap.py` 单实例锁保证；界面侧由 Tauri 单实例插件
 （`tauri-plugin-single-instance`）保证——重复触发只会唤醒既有窗口，不会出现双托盘。
 
-**顺带修复**：`open-ai-autostart.bat` 原本硬编码 `D:\…\open-ai` 这类绝对路径，
+**顺带修复**：`open-ai-autostart.bat` 原本硬编码 `<安装根>`，
 安装到其它路径即失效。已改为以脚本自身目录（`%~dp0`）为根。
 
 ### 8.2 管理面 REST 接口（新增 `admin_api.py`）
@@ -606,8 +606,8 @@ Python 托盘 GUI —— 保证「仅后端」的旧资源包依旧可用。
    在 `/mnt/d`（Windows 挂载盘）执行 `npm install` 二十分钟无进展；改到 WSL 本地盘 **15 秒**完成，再用符号链接接回项目。
    ⚠️ **不要在项目内跑 Windows 侧 npm** —— 它会删除 `node_modules` 符号链接。若链接丢失，重建：
    ```bash
-   ln -sfn <WSL本地盘路径>/open-ai/node_modules_store/node_modules \
-           <项目根>/desktop-ui/node_modules
+   ln -sfn /home/boy/code_work/open-ai/node_modules_store/node_modules \
+           /mnt/d/app/dsh_plugin/open-ai/desktop-ui/node_modules
    ```
 
 2. **npm 11 的 allow-scripts 策略**会拦截 `esbuild` / `puppeteer` 的 postinstall。

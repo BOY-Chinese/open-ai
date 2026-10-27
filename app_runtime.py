@@ -97,6 +97,12 @@ SUPERVISED = {
 CHILD_ENV = dict(os.environ)
 CHILD_ENV['OPEN_AI_FROM_BROKER'] = '1'
 CHILD_ENV['PYTHONUNBUFFERED'] = '1'
+# ★ 2026-10-27: 子进程 stdout/stderr 是重定向到 logs/*.log 的文件句柄 ——
+#   不显式指定编码时，Windows 子进程按 ANSI 代码页(cp936)写字节，而这些
+#   .log 之前一直是 UTF-8，于是日志变成「前半 UTF-8、后半 GBK」的混合体，
+#   grep / 看板 / 排查脚本全部失效（本次从命令行 bootstrap restart 后实测踩到）。
+#   只钉 stdio 编码（不设 PYTHONUTF8，避免改动 open() 默认编码影响读旧文件）。
+CHILD_ENV['PYTHONIOENCODING'] = 'utf-8'
 
 # ---------------------------------------------------------------------------
 # 定时任务 (原 daemon.py 的业务职责并入 Broker):
@@ -110,6 +116,8 @@ SIGNIN_STATE = os.path.join(DATA_DIR, '.daemon_last_signin')
 TRAE_STATE = os.path.join(DATA_DIR, '.trae_signin_state')
 TRAE_RETRY_STATE = os.path.join(DATA_DIR, '.daemon_last_trae_retry')
 WB_RETRY_STATE = os.path.join(DATA_DIR, '.daemon_last_wb_retry')
+NEW_SIGNIN_STATE = os.path.join(DATA_DIR, '.daemon_new_signin_done')
+NEW_RETRY_STATE = os.path.join(DATA_DIR, '.daemon_last_new_retry')
 TRAE_RETRY_INTERVAL = 30 * 60
 USAGE_STATE = os.path.join(DATA_DIR, '.collector_last_run')
 USAGE_INTERVAL = 5 * 60
@@ -243,6 +251,22 @@ class TaskScheduler:
         if time.time() - float(_read_state(WB_RETRY_STATE, '0') or 0) >= TRAE_RETRY_INTERVAL:
             _write_state(WB_RETRY_STATE, time.time())
             self.run_signin(['--wb-only'])
+        # 新增三通道补签 (Qoder 国内/国际 + CodeArts)，2026-10-23 加。
+        # ★ 为什么必须是独立节拍、且不在 00:00：
+        #   Qoder 的领取窗口是**每天 10:00 (UTC+8) 开、次日 10:00 前关**，
+        #   00:00 的全量签到上游根本不下发当日活动 → 必然扑空。
+        #   这里在 10:05 之后按 30 分钟一轮补，直到当天签上为止
+        #   （脚本幂等：已签/无活动都不会重复入账）。
+        #   「签上了才标记完成」：--new-only 的退出码 0 表示本轮**成功**，
+        #   非 0（或还在跑）就下一轮再来，直到 23:59 都在补。
+        if _read_state(NEW_SIGNIN_STATE) != today:
+            if time.time() - float(_read_state(NEW_RETRY_STATE, '0') or 0) >= TRAE_RETRY_INTERVAL:
+                if self._busy('signin'):
+                    log('[task] 新增三通道补签撞上其它签到在跑, 下一轮重试')
+                else:
+                    _write_state(NEW_RETRY_STATE, time.time())
+                    log('[task] 新增三通道补签 (--new-only)')
+                    self.run_signin(['--new-only', '--mark-done'])
         # 逐笔流水
         try:
             self.run_collect()

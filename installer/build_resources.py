@@ -114,6 +114,21 @@ REQUIRED_ENTRIES = [
     'desktop-ui/src-tauri/tauri.conf.json',
     'desktop-ui/src-tauri/.cargo/config.toml',
     'desktop-ui/tools/build-tauri-release.ps1',
+    # ★ v4.0（2026-10-27）三通道深度治理 —— 新增运行时模块与脚本。
+    #   providers/ 与 scripts/ 是整目录打包，这两个模块**已在包内**；
+    #   加进 REQUIRED_ENTRIES 是为了让「清单与代码引用脱节」在构建时立刻暴露
+    #   （本项目已踩过 5 次同类事故，见 V4.0同步.md「四、打包白名单」）。
+    'providers/tool_echo.py',        # v4.0 B：工具协议回声回读（qoder/codearts 共用）
+    'providers/cred_store.py',       # v4.0 C：一次性凭据落盘 + 跨进程互斥
+    'providers/qoder_base.py',       # v4.0/v4.1/v4.2：Qoder 共用基类
+    'providers/qoder_common.py',     # v4.1/v4.2：签到/UMID/405/排队
+    'providers/qoder_cn.py', 'providers/qoder_intl.py',
+    'providers/codearts.py',         # v4.0 D + v4.2 N：积分/目录/探活/已用
+    'providers/qoder_baseprompt.json',
+    'scripts/login_qoder.py',        # 三通道登录助手（task_main 按文件名路由）
+    'scripts/login_codearts.py',
+    'scripts/pw_login.py',
+    'scripts/umid_fetch.py',         # 排障用：UMID 身份探测/自检/安装
 ]
 
 

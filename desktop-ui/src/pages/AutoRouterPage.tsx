@@ -67,6 +67,10 @@ import {
  *  ★ Trae 用与「模型列表」等页一致的灰（--fg-subtle），不用 channel-trae 的黑色 */
 const CHANNEL_DOT_COLOR: Partial<Record<Channel, string>> = {
   Loomy: 'hsl(var(--channel-loomy))',
+  // 2026-10 新增三通道（链上模型的通道色点）
+  QoderCN: 'hsl(var(--channel-qdc))',
+  QoderIntl: 'hsl(var(--channel-qd))',
+  CodeArts: 'hsl(var(--channel-ca))',
   WorkBuddy_IE: 'hsl(var(--channel-wbie))',
   WorkBuddy: 'hsl(var(--channel-wb))',
   Trae: 'hsl(var(--fg-subtle))',

@@ -1,12 +1,27 @@
 # -*- coding: utf-8 -*-
-"""Open-AI 主网关 (WorkBuddy + WorkBuddy 国际版 + Trae + Loomy) Provider 注册表"""
+"""Open-AI 主网关 Provider 注册表
+
+通道一览（对外模型前缀 → provider 注册键 → config.json 段名）::
+
+    tr-       →  trae         →  trae         （内嵌 Node 后端 / Work 积分通道）
+    wb-       →  workbuddy      →  workbuddy
+    wbie-     →  workbuddy-intl →  workbuddy_intl （国际版）
+    lm-       →  loomy          →  loomy
+    qdc-      →  qoder-cn       →  qoder_cn       （Qoder 国内版，COSY 签名）
+    qd-       →  qoder-intl     →  qoder_intl     （Qoder 国际版，COSY 签名）
+    ca-       →  codearts       →  codearts       （华为云 CodeArts Agent）
+
+★ 前缀路由存在包含关系，route_provider 里的判断顺序是**语义的一部分**：
+  ``qdc-`` 必须在 ``qd-`` 之前（否则 qdc-* 会被当成 qd-*）；
+  ``wbie-`` 必须在 ``wb-`` 之前；``lm-`` 必须在其它之前。
+"""
 import logging
 
 logger = logging.getLogger("openapi.providers")
 
 
 def build_providers(cfg: dict) -> dict:
-    """根据 config.json 的 providers 段实例化 provider (WorkBuddy + 国际版 + Trae)"""
+    """根据 config.json 的 providers 段实例化 provider"""
     providers = {}
     providers_cfg = cfg.get("providers", {})
 
@@ -55,11 +70,47 @@ def build_providers(cfg: dict) -> dict:
         except Exception as e:  # noqa: BLE001
             logger.error("loomy provider 初始化失败: %s", e)
 
+    # Qoder 国内版 (qoder.com.cn): 模型名 qdc-*
+    # ★ 有账号才注册 —— 与 workbuddy 同规则，避免未登录也把静态模型目录挂出去
+    qdc_cfg = dict(providers_cfg.get("qoder_cn") or {})
+    if qdc_cfg.get("enabled", True) and qdc_cfg.get("accounts"):
+        qdc_cfg["_cfg_key"] = "qoder_cn"
+        try:
+            from .qoder_cn import QoderCNProvider
+            providers["qoder-cn"] = QoderCNProvider(qdc_cfg)
+            logger.info("已注册 provider: qoder-cn (Qoder 国内版, qdc-*)")
+        except Exception as e:  # noqa: BLE001
+            logger.error("qoder-cn provider 初始化失败: %s", e)
+
+    # Qoder 国际版 (qoder.com): 模型名 qd-*
+    qd_cfg = dict(providers_cfg.get("qoder_intl") or {})
+    if qd_cfg.get("enabled", True) and qd_cfg.get("accounts"):
+        qd_cfg["_cfg_key"] = "qoder_intl"
+        try:
+            from .qoder_intl import QoderIntlProvider
+            providers["qoder-intl"] = QoderIntlProvider(qd_cfg)
+            logger.info("已注册 provider: qoder-intl (Qoder 国际版, qd-*)")
+        except Exception as e:  # noqa: BLE001
+            logger.error("qoder-intl provider 初始化失败: %s", e)
+
+    # 华为云 CodeArts Agent (码道): 模型名 ca-*
+    ca_cfg = dict(providers_cfg.get("codearts") or {})
+    if ca_cfg.get("enabled", True) and ca_cfg.get("accounts"):
+        try:
+            from .codearts import CodeArtsProvider
+            providers["codearts"] = CodeArtsProvider(ca_cfg)
+            logger.info("已注册 provider: codearts (华为云码道, ca-*)")
+        except Exception as e:  # noqa: BLE001
+            logger.error("codearts provider 初始化失败: %s", e)
+
     return providers
 
 
 def route_provider(model: str, providers: dict):
-    """按模型名路由到对应 provider (前缀明确匹配)"""
+    """按模型名路由到对应 provider (前缀明确匹配)。
+
+    ★ 判断顺序 = 语义, 见模块文档: qdc- 先于 qd-, wbie- 先于 wb-。
+    """
     m = (model or "").lower()
     if not providers:
         return None
@@ -69,6 +120,15 @@ def route_provider(model: str, providers: dict):
         return providers.get("loomy") or next(iter(providers.values()))
     if "trae" in m or m.startswith("tr-"):
         return providers.get("trae")
+    # Qoder 国内版: qdc- 必须在 qd- 之前 (qdc-* 也以 qd 开头)
+    if m.startswith("qdc-") or m.startswith("qoder-cn-"):
+        return providers.get("qoder-cn")
+    # Qoder 国际版: qd-*（不含 qdc-*，上面已拦）
+    if m.startswith("qd-") or m.startswith("qoder-"):
+        return providers.get("qoder-intl") or providers.get("qoder-cn")
+    # CodeArts: ca- 前缀（历史 codearts- 前缀同样兼容）
+    if m.startswith("ca-") or m.startswith("codearts-"):
+        return providers.get("codearts")
     # WorkBuddy 国际版: wbie- 前缀 / 历史 wbai- 前缀 / 名字含 intl
     # (必须排在 wb- 判断之前, 否则 wbie-xxx 会被误判给国内版 provider)
     if m.startswith("wbie") or m.startswith("wbai") or "intl" in m:

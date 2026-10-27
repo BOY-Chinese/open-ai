@@ -11,6 +11,7 @@
  */
 import { authHeaders, gatewayRuntime, invalidateGatewayRuntime } from './gateway'
 import { filterModelView } from './modelCache'
+import { CHANNEL_PREFIX } from '@/types/domain'
 import { emitAccountsChanged } from './accountEvents'
 import { followLoginLog, type LoginLogChunk } from './loginStream'
 import type {
@@ -146,8 +147,10 @@ export const httpBackend = {
       const c = creditRes.credits[a.id]
       return {
         ...a,
-        credits: c?.credits ?? a.credits ?? 0,
-        workCredits: c?.workCredits ?? a.workCredits ?? 0,
+        // ★ 没有缓存条目 = 未知（后端对「无余额接口」的通道不写缓存），
+        //   保持 null 让界面显示「—」；落 0 就是编数据。
+        credits: c?.credits ?? null,
+        workCredits: c?.workCredits ?? 0,
         refreshedAt: c ? Date.now() / 1000 : a.refreshedAt ?? 0,
       }
     })
@@ -258,7 +261,12 @@ export const httpBackend = {
     const script =
       channel === 'Trae' ? 'login_trae.py'
         : channel === 'WorkBuddy' ? 'login_workbuddy.py'
-          : 'login_workbuddy_intl.py'
+          : channel === 'WorkBuddy_IE' ? 'login_workbuddy_intl.py'
+            // 2026-10 新增三通道：Qoder 国内/国际共用同一脚本（--realm 由后端
+            // 按 channel 补参数），CodeArts 走华为云 OAuth2 PKCE。
+            : channel === 'QoderCN' || channel === 'QoderIntl' ? 'login_qoder.py'
+              : channel === 'CodeArts' ? 'login_codearts.py'
+                : ''
     const r = await req<{ logOffset?: number }>('/v1/admin/accounts/login', {
       method: 'POST',
       body: { channel, script },
@@ -272,6 +280,23 @@ export const httpBackend = {
       onFinished: () => emitAccountsChanged(channel),
     })
 
+    /**
+     * 登录脚本已写完 config.json —— 这里必须让网关**重建 provider**。
+     *
+     * 为什么不能省（2026-10 实测）：所有通道都是「有账号才注册」。首次为某通道
+     * 添加账号时，进程里根本没有该 provider 实例：模型列表为空、请求路由返回
+     * None，界面上就是「账号加好了但模型用不了」，只能重启网关 —— 用户会以为
+     * 这个通道没集成成功。
+     *
+     * 失败只告警不抛出：登录本身已经成功，重载是「让它立刻可用」的加速动作，
+     * 最坏情况退回「重启网关后可用」，不该让一次成功的登录报错。
+     */
+    try {
+      await this.reloadProviders()
+    } catch (e) {
+      console.warn('[admin] provider 热重载失败（重启网关后仍可用）：', (e as Error).message)
+    }
+
     // 登录是异步的：返回占位对象，界面据此提示「已拉起登录助手」
     return {
       id: `${channel}:pending`,
@@ -283,6 +308,21 @@ export const httpBackend = {
       workCredits: 0,
       refreshedAt: 0,
     }
+  },
+
+  /**
+   * 让网关重新读取 config.json 并重建 provider（见后端 /v1/admin/reload-providers）。
+   *
+   * 调用时机：**一次登录跟随结束之后**（addAccount）。登录脚本此时已把新凭据写进
+   * config.json，但运行中的网关仍持着旧 PROVIDERS —— 新通道在「有账号才注册」的
+   * 规则下压根没有实例，不重载就看不到模型。
+   */
+  async reloadProviders(): Promise<string[]> {
+    const r = await req<{ status?: string; providers?: string[] }>(
+      '/v1/admin/reload-providers',
+      { method: 'POST', body: {}, timeoutMs: 20000 }
+    )
+    return r.providers ?? []
   },
 
   /** 增量读取登录脚本输出（只读文件，不联网；见后端 /accounts/login/log） */
@@ -362,8 +402,14 @@ export const httpBackend = {
     ).catch(() => ({ rates: {} as Record<string, Record<string, number>> }))
 
     const merged = r.models.map((m) => {
-      // 路由名去掉通道前缀即上游模型名，用它去倍率表里查
-      const bare = m.routeModelId.replace(/^(tr-|wb-|wbie-|lm-|loomy-)/, '')
+      // 路由名去掉通道前缀即上游模型名，用它去倍率表里查。
+      // ★ 前缀不能写死在正则里：新增通道（qdc-/qd-/ca-）时漏改，剥不掉前缀
+      //   就会查不到倍率、整列显示「未知」。这里直接由 CHANNEL_PREFIX 生成。
+      const channelPrefix = CHANNEL_PREFIX[m.channel as Channel] ?? ''
+      const bare =
+        channelPrefix && m.routeModelId.startsWith(channelPrefix)
+          ? m.routeModelId.slice(channelPrefix.length)
+          : m.routeModelId.replace(/^(tr-|wb-|wbie-|lm-|loomy-)/, '')
       const table = rates.rates[m.channel] ?? {}
       // ★ 不能用 `?? 0`：查不到（undefined）与「查到 0」是两回事。
       //   后端用 -1 作「倍率未知」哨兵（见 admin_api.RATE_UNKNOWN），

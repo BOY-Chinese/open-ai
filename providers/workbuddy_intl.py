@@ -31,6 +31,7 @@ from providers.base import describe_net_exc
 from providers.workbuddy import (
     WorkBuddyProvider, _WB_CONFIG_PATH, _parse_sse_line,
     _to_upstream_body, _upstream_headers, normalize_model_name,
+    _mem_token_is_newer, _dump_rejected,
     UPSTREAM_CHAT_PATH, UPSTREAM_REFRESH_PATH, USER_AGENT,
 )
 
@@ -140,14 +141,19 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
             with open(_WB_CONFIG_PATH, encoding="utf-8") as _f:
                 intl_cfg = (json.load(_f).get("providers") or {}).get("workbuddy_intl", {})
             fresh = intl_cfg.get("accounts", [])
-            # 合并内存中的 token 刷新状态
+            # 合并内存中的 token 刷新状态 —— ★ 只在内存那份**更新**时才覆盖磁盘
+            # (与国内版同口径; 旧实现无条件覆盖会让重新登录的新 token 进不来,
+            #  详见 providers.workbuddy._mem_token_is_newer 的注释)。
             for old in self.accounts:
                 match = next((n for n in fresh
                               if n.get("userId") == old.get("userId")
                               or n.get("accessToken") == old.get("accessToken")), None)
-                if match:
-                    match["accessToken"] = old.get("accessToken", match.get("accessToken", ""))
-                    match["refreshToken"] = old.get("refreshToken", match.get("refreshToken", ""))
+                if not match:
+                    continue
+                if _mem_token_is_newer(old.get("accessToken", ""), match.get("accessToken", "")):
+                    # 成对替换: AT 与 RT 必须来自同一次签发
+                    match["accessToken"] = old.get("accessToken", "")
+                    match["refreshToken"] = old.get("refreshToken") or match.get("refreshToken", "")
             self.accounts = fresh if fresh else self.accounts
         except Exception:
             pass  # 读取失败则沿用内存 accounts
@@ -254,51 +260,50 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
                                     self.default_model, self.aliases)
 
     # ---------- token 刷新 ----------
-    async def _refresh_token(self, account: dict) -> bool:
-        """国际版刷新: Keycloak 离线 token, 走同款插件刷新端点 (host=www.workbuddy.ai)。"""
-        if not account.get("refreshToken"):
-            return False
-        async with self._refresh_lock:
-            if not self._is_expired(account):
+    async def _refresh_http(self, account: dict) -> bool:
+        """国际版刷新: Keycloak 离线 token, 走同款插件刷新端点 (host=www.workbuddy.ai)。
+
+        只覆盖「怎么打上游」这一段：互斥 / 锁内重读磁盘 / 落盘由基类
+        ``_refresh_locked`` 统一做（见 providers/cred_store.py）。
+        """
+        try:
+            client = self.get_client()
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-Domain": INTL_DOMAIN,
+                "X-Refresh-Token": account["refreshToken"],
+                "X-Auth-Refresh-Source": "plugin",
+                "X-Product": INTL_PRODUCT,
+                "X-Product-Code": INTL_PRODUCT,
+                "User-Agent": USER_AGENT,
+                "X-Trace-ID": "0" * 32,
+                "X-Request-ID": "0" * 32,
+            }
+            resp = await client.post(
+                f"https://{INTL_HOST}{UPSTREAM_REFRESH_PATH}",
+                json={}, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("workbuddy-intl refresh HTTP %s: %s",
+                               resp.status_code, resp.text[:200])
+                if resp.status_code in (401, 403):
+                    # 刷新凭据本身被上游拒绝 → refreshToken 已死, 标记失效
+                    self._health.mark_invalid(
+                        account.get("userId"),
+                        reason=f"refresh 被拒 HTTP {resp.status_code}")
+                return False
+            data = resp.json().get("data", {})
+            if data.get("accessToken"):
+                account["accessToken"] = data["accessToken"]
+                if data.get("refreshToken"):
+                    account["refreshToken"] = data["refreshToken"]
+                logger.info("workbuddy-intl accessToken 已自动刷新")
                 return True
-            try:
-                client = self.get_client()
-                headers = {
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "X-Domain": INTL_DOMAIN,
-                    "X-Refresh-Token": account["refreshToken"],
-                    "X-Auth-Refresh-Source": "plugin",
-                    "X-Product": INTL_PRODUCT,
-                    "X-Product-Code": INTL_PRODUCT,
-                    "User-Agent": USER_AGENT,
-                    "X-Trace-ID": "0" * 32,
-                    "X-Request-ID": "0" * 32,
-                }
-                resp = await client.post(
-                    f"https://{INTL_HOST}{UPSTREAM_REFRESH_PATH}",
-                    json={}, headers=headers)
-                if resp.status_code != 200:
-                    logger.warning("workbuddy-intl refresh HTTP %s: %s",
-                                   resp.status_code, resp.text[:200])
-                    if resp.status_code in (401, 403):
-                        # 刷新凭据本身被上游拒绝 → refreshToken 已死, 标记失效
-                        self._health.mark_invalid(
-                            account.get("userId"),
-                            reason=f"refresh 被拒 HTTP {resp.status_code}")
-                    return False
-                data = resp.json().get("data", {})
-                if data.get("accessToken"):
-                    account["accessToken"] = data["accessToken"]
-                    if data.get("refreshToken"):
-                        account["refreshToken"] = data["refreshToken"]
-                    logger.info("workbuddy-intl accessToken 已自动刷新")
-                    return True
-                return False
-            except Exception as e:  # noqa: BLE001
-                logger.error("workbuddy-intl refresh 异常: %s", e)
-                return False
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.error("workbuddy-intl refresh 异常: %s", e)
+            return False
 
     # ---------- 请求体 ----------
     def _inject_system(self, body: dict) -> dict:
@@ -340,7 +345,7 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
                 await resp.aclose()
             except Exception:
                 pass
-            if await self._refresh_token(account):
+            if await self._refresh_token(account, force=True):
                 return await self._request_upstream(up_body, account, retried=True)
         return resp
 
@@ -358,8 +363,11 @@ class WorkBuddyIntlProvider(WorkBuddyProvider):
                 self._health.mark_invalid(
                     account.get("userId"),
                     reason=f"chat 被拒 HTTP {resp.status_code} (含刷新重试)")
+            # ★ 与国内版同款 (2026-10-27): 落盘被拒请求体 + 放宽错误截断,
+            #   便于定位「渠道校验」命中的是哪句提示词。
+            _dump_rejected(resp.status_code, err_text, up_body)
             raise RuntimeError(
-                f"workbuddy-intl upstream HTTP {resp.status_code}: {err_text[:300]}")
+                f"workbuddy-intl upstream HTTP {resp.status_code}: {err_text[:1500]}")
         self._health.mark_ok(account.get("userId"))
         try:
             async for line in resp.aiter_lines():

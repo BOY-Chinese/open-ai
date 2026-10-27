@@ -48,6 +48,18 @@ const MUTATIONS: Record<
     title: '补签未签到账号',
     detail: (a) => `通道=${(a[0] as ChannelFilter) ?? 'all'}${a[1] ? '（强制重签）' : ''}`,
   },
+  /**
+   * 登录跟随结束后触发 provider 热重载。
+   *
+   * 登记为「非静默」操作：它决定「刚加完的账号能不能立刻用」，值得在日志里留一行
+   * （FAQ：加了账号却看不到模型 → 看这里是否有一次成功的重载）。
+   */
+  reloadProviders: {
+    tag: '账号',
+    title: '重载通道',
+    detail: () => '配置已变更，通知网关重建 provider（新通道「有账号才注册」，不重载看不到模型）',
+  },
+
   reconnectAccounts: {
     tag: '账号',
     title: '重新连接账号',

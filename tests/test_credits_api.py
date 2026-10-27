@@ -78,7 +78,10 @@ class CreditsApiTest(unittest.TestCase):
     # ---------- 元信息 ----------
     def test_platforms_include_intl(self):
         keys = [p['key'] for p in api.platforms()]
-        self.assertEqual(keys, ['trae', 'workbuddy', 'workbuddy_intl', 'loomy'])
+        # 2026-10：新增 Qoder 国内/国际 + 华为云 CodeArts 三平台
+        # （签到入账由 scripts/signin_all.py --new-only 写入 gain 表）
+        self.assertEqual(keys, ['trae', 'workbuddy', 'workbuddy_intl', 'loomy',
+                                'qoder_cn', 'qoder_intl', 'codearts'])
         self.assertEqual(api.platform_label('workbuddy_intl'), 'WorkBuddy 国际')
         # 每个平台都带前端要用的字段
         for p in api.platforms():
@@ -212,7 +215,8 @@ class CreditsApiTest(unittest.TestCase):
         self.assertAlmostEqual(ov['net']['delta'], 290.0)
         # platforms/accounts 在过滤时仍返回全集, 前端下拉与图例才稳定
         self.assertEqual([p['key'] for p in ov['platforms']],
-                         ['trae', 'workbuddy', 'workbuddy_intl', 'loomy'])
+                         ['trae', 'workbuddy', 'workbuddy_intl', 'loomy',
+                          'qoder_cn', 'qoder_intl', 'codearts'])
 
     def test_overview_platform_filter_narrows_numbers(self):
         ov = api.overview(start=DAY, end=DAY, platform='workbuddy_intl')
@@ -220,7 +224,7 @@ class CreditsApiTest(unittest.TestCase):
         self.assertAlmostEqual(ov['gains']['total'], 100.0)
         self.assertEqual({x['platform'] for x in ov['usage_daily']},
                          {'workbuddy_intl'})
-        self.assertEqual(len(ov['platforms']), 4)      # 图例仍全量
+        self.assertEqual(len(ov['platforms']), 7)      # 图例仍全量
 
     def test_overview_is_json_serializable(self):
         """前端契约: 必须能直接 json.dumps。"""
@@ -268,7 +272,7 @@ class NoDatabaseTest(unittest.TestCase):
         ov = api.overview(start='2026-09-01', end='2026-09-11')
         self.assertFalse(ov['has_data'])
         # 平台枚举不依赖库, 始终可用
-        self.assertEqual(len(ov['platforms']), 4)
+        self.assertEqual(len(ov['platforms']), 7)
 
 
 class DayHelpersTest(unittest.TestCase):

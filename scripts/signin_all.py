@@ -532,6 +532,8 @@ def main():
     do_renew = '--no-renew' not in sys.argv
     trae_only = '--trae-only' in sys.argv
     wb_only = '--wb-only' in sys.argv
+    # 2026-10 新增：Qoder 国内/国际 + 华为云 CodeArts 三通道签到
+    new_only = '--new-only' in sys.argv
     results = []
 
     # 统一配置: open-ai/config.json
@@ -585,6 +587,38 @@ def main():
         log('WB补签', '本轮补签检查完成')
         sys.exit(0)
 
+    # --new-only: 仅供 daemon 白天补签 2026-10 新增三通道
+    #   QoderCN / QoderIntl -> providers/qoder_common.checkin（sash 接口 + 活动平台）
+    #   CodeArts            -> providers/codearts.checkin（华为云 ops/delivery 活动）
+    # 三通道都不走 token 续期：Qoder 的续期在 provider 请求路径上做（临近过期才刷），
+    # CodeArts 的 STS 凭证由 provider._ensure_token 处理，这里只负责领积分。
+    if new_only:
+        # ★★ 2026-10-23：--new-only 的退出码改为「本轮是否真的全部签上」，
+        #   非 0 让 Broker 下一轮继续补（此前恒 0，于是「今天一个都没签上」
+        #   也被当成本轮完成，再也不重试）。
+        #
+        #   ★ 关键：10:00 之前上游**不下发**当日签到活动（官方窗口 10:00→次日 10:00），
+        #   这段「没有活动」是**正常的**，不能算失败、也不能算完成 ——
+        #   退出码 2 = 「还没开窗，稍后再来」，Broker 照常下一轮再试。
+        import time as _t
+        if _t.localtime().tm_hour < 10:
+            log('新增三通道', '未到官方开窗时间（每天 10:00 后下发当日签到活动），稍后重试')
+            sys.exit(2)
+        stat = new_signin(providers) or {}
+        mark_done = '--mark-done' in sys.argv
+        all_ok = stat.get('total', 0) > 0 and stat.get('pending', 0) == 0
+        if mark_done and all_ok:
+            # 只在「全部账号今日都已入账」时才落完成标记，否则 Broker 会一直补
+            try:
+                done_file = os.path.join(DATA_DIR, '.daemon_new_signin_done')
+                with open(done_file, 'w', encoding='utf-8') as f:
+                    f.write(_t.strftime('%Y-%m-%d'))
+                log('新增三通道', '今日全部已入账，标记完成')
+            except Exception as e:  # noqa: BLE001
+                log('新增三通道', f'写完成标记失败: {e}')
+        sys.exit(0 if all_ok else 1)
+
+
     # --trae-only: 仅供 daemon 白天补试 TRAE, 跳过 WB
     # 修复 (2026-09-13): --trae-only 现在也做 token 续期。旧版跳过续期, 一旦
     # 0 点全量签到被竞态吞掉, 无人续期 → token 过期 → 签到/采集全 401
@@ -633,6 +667,14 @@ def main():
         except Exception as e:
             log('Loomy', f'Loomy 签到异常: {e}')
 
+        # 2.7) 2026-10 新增三通道 (Qoder 国内/国际 + 华为云 CodeArts)
+        #      ★★ 2026-10-23 补：此前 new_signin 只在 `--new-only` 分支被调用，
+        #      **全量签到（每天 00:00 Broker 拉起、不带任何参数）从来不含它** ——
+        #      实锤：signin.log 里所有 [QoderCN] 签到 行都出现在手动点「刷新」后，
+        #      自动全量跑一次都没跑过。于是不做任何操作时 Qoder/CodeArts
+        #      永远不自动签到，账号页常年「未签到」。
+        new_signin(providers)
+
     # 3) TRAE 签到 (始终执行)
     log('TRAE签到', f'TRAE 签到 ({len(trae_accs)} 个账号)')
     # 无账号时视为未完成(避免误标 done 导致 daemon 不再补试)
@@ -655,6 +697,157 @@ def main():
 
     # 退出码: 0=TRAE 已签上(或本就今日已签) / 1=TRAE 仍繁忙(供 daemon 判断补试)
     sys.exit(0 if trae_ok else 1)
+
+
+
+def new_signin(providers):
+    """2026-10 新增三通道的每日签到（Qoder 国内/国际 + 华为云 CodeArts）。
+
+    返回 {"total": 账号数, "credited": 今日真入账的账号数,
+          "pending": 需要下一轮再试的账号数} —— 供 --new-only 判定退出码。
+
+    设计取舍：
+      * **不改账号 dict 落盘**：签到是只读上游的领取动作，凭据续期由各 provider
+        在请求路径上负责（见 qoder_base._ensure_token / codearts._ensure_token），
+        脚本只把「今天领到了多少」写进本地流水库 gain 表，供账号页渲染签到列。
+      * **逐账号 try/except**：一个账号失效不该让其它账号漏签（与 WB 系同口径）。
+      * **幂等**：已签/活动未开放都是上游终态，重复调用无副作用。
+      * **「今天已签过」也写 gain**：否则账号页读不到当日凭证，会把「已签到」
+        显示成「未签到」（2026-10-22 实测：Qoder 两号明明当天已领 100 积分，
+        账号页却全显示未签到）。gain 行按 (platform, uid, day, kind) upsert，
+        重复写不产生重复计数。
+      * ★★ 2026-10-23 修「没签到却显示已签到」：写 gain 的唯一闸门从
+        `r.get('ok')` 改成 **`r.get('credited')`** —— `ok` 只表示「本次调用跑完了」，
+        活动没下发 / sash 未开放时它同样是 True，旧版据此把**活动面额**当入账
+        写进 gain，于是界面显示「已签到」而积分一分没到（master 报障）。
+        `credited` 由各 provider 明确给出：只有真的领到、或上游明确回报
+        「今天已领过」才为 True。「今日无签到活动」只记日志，绝不写库。
+    """
+    import time as _t
+    stat = {'total': 0, 'credited': 0, 'pending': 0}
+
+    def _write_gain(platform, uid, amount, kind='checkin'):
+        """写 gain 表（当日快照，upsert 幂等）。失败只记日志，不中断签到。
+
+        库路径取自 usage_collector.DB_PATH（安装根/data/usage_history.db 的唯一定义处），
+        不自己拼路径 —— 打包态 __file__ 不可信（见 app_paths 的老警告）。
+        """
+        try:
+            import sqlite3
+            import usage_collector as _uc
+            conn = sqlite3.connect(_uc.DB_PATH, timeout=30)
+            try:
+                conn.execute(
+                    'INSERT INTO gain (platform, uid, day, amount, kind, updated_at)'
+                    ' VALUES (?,?,?,?,?,?)'
+                    ' ON CONFLICT(platform, uid, day, kind) DO UPDATE SET'
+                    ' amount=excluded.amount, updated_at=excluded.updated_at',
+                    (platform, str(uid), _t.strftime('%Y-%m-%d'), float(amount or 0),
+                     kind, int(_t.time())))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001
+            log('签到入库', f'{platform}/{uid} 写 gain 失败: {e}')
+
+    # providers 包在安装根（不是 scripts/），补一条 sys.path 才能 import。
+    # ★ 打包态 providers 已冻结进 exe, 这里只对源码态有意义; ROOT 取 app_paths,
+    #   不在运行时裸用 __file__ (check_frozen_paths.py 门禁)。
+    try:
+        from app_paths import ROOT as _root
+    except Exception:  # 源码态兜底
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+
+    # ---- Qoder 国内版 / 国际版 ----
+    try:
+        from providers import qoder_common as qc  # type: ignore
+        for seg_key, platform, label in (('qoder_cn', 'qoder_cn', 'QoderCN'),
+                                         ('qoder_intl', 'qoder_intl', 'QoderIntl')):
+            seg = providers.get(seg_key) or {}
+            accs = [a for a in (seg.get('accounts') or [])
+                    if a.get('enabled', True) is not False]
+            log(label, f'签到 ({len(accs)} 个账号)')
+            stat['total'] += len(accs)
+            for acc in accs:
+                uid = str(acc.get('uid') or '?')
+                try:
+                    r = qc.checkin(acc)
+                except Exception as e:  # noqa: BLE001
+                    log(label, f'账号{uid} 签到异常: {e}')
+                    stat['pending'] += 1
+                    continue
+                if r.get('credited'):
+                    log(label, f"账号{uid} {r.get('msg') or '已签到'}")
+                    # 只有**真的入账**（本次领到 / 上游明确回报今日已领）才写 gain。
+                    # amount 是当日活动面额，「今天已领过」时也给 —— 账号页据此
+                    # 渲染「已签到」。⚠ 闸门必须是 credited，不能是 ok（见 docstring）。
+                    amount = int(r.get('amount') or r.get('credits') or 0)
+                    if amount > 0:
+                        _write_gain(platform, uid, amount)
+                    stat['credited'] += 1
+                elif r.get('ok'):
+                    # 跑通了但今天没有签到可签（no_campaign / 活动未下发）——
+                    # 只记日志，**绝不写 gain**，否则界面会谎报「已签到」。
+                    log(label, f"账号{uid} 今日未签到：{r.get('msg')}")
+                    stat['pending'] += 1
+                else:
+                    log(label, f"账号{uid} 签到失败: {r.get('msg')}")
+                    stat['pending'] += 1
+    except Exception as e:  # noqa: BLE001
+        log('Qoder签到', f'通道不可用: {e}')
+
+    # ---- 华为云 CodeArts ----
+    try:
+        from providers import codearts as ca  # type: ignore
+        seg = providers.get('codearts') or {}
+        accs = [a for a in (seg.get('accounts') or [])
+                if a.get('enabled', True) is not False]
+        log('CodeArts', f'签到 ({len(accs)} 个账号)')
+        stat['total'] += len(accs)
+        for acc in accs:
+            uid = str(acc.get('uid') or '?')
+            # ★★ 2026-10-24：签到前**必须先续期**。
+            #   `ca.checkin()` 是模块级纯函数，直接用 credentials.securityToken
+            #   签名，从不续期 —— 账号 token 一过期，签到就永远 APIG.0602，
+            #   而聊天路径却照常续期，于是表现为「账号能用但天天签不上」。
+            #   实锤：GT-2503 的 token 04:33 过期，refreshedAt 停在 02:33，
+            #   连续 6 轮签到全失败。这里用模块级的同步续期入口补齐。
+            try:
+                exp = int(acc.get('expiresAt') or 0)
+                if not exp or exp - 300 <= _t.time():
+                    refreshed = ca.refresh_account_token(acc)
+                    log('CodeArts', f"账号{uid} 凭据已续期"
+                                    if refreshed else f"账号{uid} 续期未成功，沿用现有凭据")
+            except Exception as e:  # noqa: BLE001
+                log('CodeArts', f'账号{uid} 续期异常（继续尝试签到）: {e}')
+            try:
+                r = ca.checkin(acc)
+            except Exception as e:  # noqa: BLE001
+                log('CodeArts', f'账号{uid} 签到异常: {e}')
+                stat['pending'] += 1
+                continue
+            if r.get('credited'):
+                log('CodeArts', f"账号{uid} {r.get('msg') or '已签到'}")
+                # amount = 当日签到额度（「今天已完成」时也给，如 CONFIRMED）——
+                # 与 Qoder/WorkBuddy 同口径：**只有真的入账才写 gain**。
+                amount = int(r.get('amount') or r.get('credits') or 0)
+                if amount > 0:
+                    _write_gain('codearts', uid, amount)
+                stat['credited'] += 1
+            elif r.get('ok'):
+                log('CodeArts', f"账号{uid} 今日未签到：{r.get('msg')}")
+                stat['pending'] += 1
+            else:
+                log('CodeArts', f"账号{uid} 签到失败: {r.get('msg')}")
+                stat['pending'] += 1
+    except Exception as e:  # noqa: BLE001
+        log('CodeArts签到', f'通道不可用: {e}')
+
+    log('新增三通道', f"共 {stat['total']} 个账号：今日已入账 {stat['credited']}，"
+                     f"待补 {stat['pending']}")
+    return stat
 
 
 if __name__ == '__main__':

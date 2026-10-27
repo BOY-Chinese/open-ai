@@ -255,6 +255,10 @@ CHANNEL_TO_PROVIDER = {
     "WorkBuddy": "workbuddy",
     "WorkBuddy_IE": "workbuddy_intl",
     "Loomy": "loomy",
+    # 2026-10 新增三通道（Qoder 国内/国际 + 华为云 CodeArts）
+    "QoderCN": "qoder_cn",
+    "QoderIntl": "qoder_intl",
+    "CodeArts": "codearts",
 }
 
 # 通道键（对外） → 流水库 gain/usage 表的 platform 键
@@ -272,7 +276,21 @@ CHANNEL_TO_PLATFORM = {
     "WorkBuddy": "workbuddy",
     "WorkBuddy_IE": "workbuddy_intl",
     "Loomy": "loomy",
+    "QoderCN": "qoder_cn",
+    "QoderIntl": "qoder_intl",
+    "CodeArts": "codearts",
 }
+
+# 周视图（/credits/week）每日堆叠柱的**通道骨架**。
+#
+# ★★ 2026-10-24 修：这里原先是**写死的四个通道**（trae / WorkBuddy / WorkBuddy 国际 / Loomy），
+#    漏掉了 2026-10 新增的三个。后果：`/credits/week` 里 `ch in daily[day]`
+#    判定为假 → **Qoder CN / Qoder / CodeArts 的流水被静默丢弃** ——
+#    「每周情况」永远没有它们的柱子（前端 chart.ts 其实早就配好了这三个，
+#    所以是纯后端漏项，界面上看起来像「这三家没数据」）。
+#    教训：这种「另一个地方又写了一遍清单」最容易漏一处；
+#    现在改成**从单一来源推导**，并用测试锁死（tests/test_credits_week_channels.py）。
+WEEK_CHANNELS = tuple(CHANNEL_TO_PLATFORM.keys())
 
 # provider 注册键 → 对外通道名
 #   注意 workbuddy_intl provider 在注册表里的键是 'workbuddy-intl'（连字符），
@@ -285,6 +303,13 @@ PROVIDER_TO_CHANNEL = {
     "workbuddy-intl": "WorkBuddy_IE",
     "workbuddyintl": "WorkBuddy_IE",
     "loomy": "Loomy",
+    "qoder_cn": "QoderCN",
+    "qoder-cn": "QoderCN",
+    "qodercn": "QoderCN",
+    "qoder_intl": "QoderIntl",
+    "qoder-intl": "QoderIntl",
+    "qoderintl": "QoderIntl",
+    "codearts": "CodeArts",
 }
 
 # 归一化：把任何来源的通道写法收敛到对外值
@@ -297,6 +322,19 @@ CHANNEL_ALIASES = {
     "workbuddy-intl": "WorkBuddy_IE",
     "intl": "WorkBuddy_IE",
     "loomy": "Loomy",
+    # 2026-10 新增三通道（多种写法都收敛到对外值）
+    "qodercn": "QoderCN",
+    "qoder_cn": "QoderCN",
+    "qoder-cn": "QoderCN",
+    "qdc": "QoderCN",
+    "qoderintl": "QoderIntl",
+    "qoder_intl": "QoderIntl",
+    "qoder-intl": "QoderIntl",
+    "qoder": "QoderIntl",
+    "qd": "QoderIntl",
+    "codearts": "CodeArts",
+    "ca": "CodeArts",
+    "huawei": "CodeArts",
 }
 
 
@@ -315,6 +353,10 @@ CHANNEL_PREFIX = {
     "WorkBuddy": "wb-",
     "WorkBuddy_IE": "wbie-",
     "Loomy": "lm-",
+    # 2026-10 新增三通道（与 providers 里的 PREFIX 必须逐字一致）
+    "QoderCN": "qdc-",
+    "QoderIntl": "qd-",
+    "CodeArts": "ca-",
 }
 
 # Loomy 历史前缀（v3.0 对外名），请求与倍率匹配仍兼容
@@ -386,12 +428,20 @@ def _account_status(acc: dict) -> str:
       workbuddy*  → accessToken 或 refreshToken（可自动刷新）
       loomy       → session（桌面账号）或 cookies（Web 账号）
                     —— 鉴权整改后两者都是「本账号自己的登录态」，平等可用
+      qoder*      → accessToken 或 refreshToken（COSY 签名用，可自动续期）
+      codearts    → credentials.{accessKeyId,secretAccessKey}（STS 临时凭证）
+                    或 personalToken（PAT 交换 jobToken 用）
     """
     if acc.get("enabled", True) is False:
         return "disabled"
+    # CodeArts 的凭据是 STS 三件套（AK/SK/securityToken），嵌套在 credentials 里，
+    # 顶层没有 accessToken —— 不单列的话账号页会把登录成功的账号判成「断连」。
+    cred = acc.get("credentials") or {}
     has_cred = bool(acc.get("token") or acc.get("accessToken")
                     or acc.get("refreshToken") or acc.get("cookie")
-                    or acc.get("session") or acc.get("cookies"))
+                    or acc.get("session") or acc.get("cookies")
+                    or (cred.get("accessKeyId") and cred.get("secretAccessKey"))
+                    or acc.get("personalToken"))
     return "enabled" if has_cred else "disconnected"
 
 
@@ -455,10 +505,29 @@ def _trae_row_status(base_status: str, uid, runtime) -> tuple[str, str]:
 
 # config 段名 → main.PROVIDERS 注册键（★ 国际版注册名带连字符, 与段名下划线不同）
 _PROVIDER_INSTANCE_KEYS = {
+    # 2026-10 新增三通道：config 段名（下划线）与注册键（连字符）不同，
+    # 漏登记会让「重新连接/刷新账号」清不到它们的运行态红牌。
+    "qoder_cn": "qoder-cn",
+    "qoder_intl": "qoder-intl",
+    "codearts": "codearts",
     "workbuddy": "workbuddy",
     "workbuddy_intl": "workbuddy-intl",
     "loomy": "loomy",
 }
+
+
+def _provider_instance(pkey: str):
+    """取网关进程内已注册的 provider 实例；取不到返回 None。
+
+    与 `_provider_runtime_state` 同一套解析（config 段名 → 注册键 → PROVIDERS）。
+    用于需要 provider 方法的场景（如 CodeArts 积分前必须先续期 token）。
+    """
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    return providers.get(_PROVIDER_INSTANCE_KEYS.get(pkey, pkey))
 
 
 def _provider_runtime_state(pkey: str) -> "dict[str, bool] | None":
@@ -586,13 +655,12 @@ def _load_accounts_raw() -> list[dict]:
             uid = str(acc.get("uid") or acc.get("userId") or acc.get("userid") or "")
             name = acc.get("name") or (uid or f"#{i + 1}")
             status = _account_status(acc)
+            # 断连原因按通道说清楚（新通道的修法各不相同，一句「通道服务未加载」
+            # 会把人引到错误方向）：见 _channel_down_detail / _channel_invalid_detail。
             status, detail = _runtime_row_status(
                 status, uid, rt,
-                down_detail="trae 服务未响应(进程未启动或端口不通)"
-                if channel == "Trae" else "通道服务未加载(provider 未注册)",
-                invalid_detail="账号已失效(trae 运行态; 可试「重新连接」)"
-                if channel == "Trae" else
-                "账号已失效(运行态; 凭据被上游拒绝, 重新登录或重载通道)")
+                down_detail=_channel_down_detail(channel),
+                invalid_detail=_channel_invalid_detail(channel))
             out.append({
                 "id": _account_id(channel, acc, i),
                 "channel": channel,
@@ -607,6 +675,38 @@ def _load_accounts_raw() -> list[dict]:
                 "refreshedAt": 0,
             })
     return out
+
+
+# 通道 → 断连原因文案。
+#
+# 「服务不可用」在不同通道的**根因和修法完全不同**，不能一句「通道未加载」糊过去：
+#   Trae         → 它有一个独立的内嵌 Node 服务（默认 127.0.0.1:18787），
+#                 不可用通常是那个进程没起来/端口不通，与 provider 注册无关；
+#   其余通道 → 纯进程内 provider，注册不上只可能是「没账号 → 没注册」。
+# 新三通道（Qoder/CodeArts）各自还多一层「凭据怎么修」，故单独给文案。
+_CHANNEL_DOWN_DETAIL = {
+    "Trae": "Trae 服务未响应(进程未启动或端口不通)",
+    "QoderCN": "Qoder 国内版通道未加载（provider 未注册；请确认已添加账号后重启网关）",
+    "QoderIntl": "Qoder 国际版通道未加载（provider 未注册；请确认已添加账号后重启网关）",
+    "CodeArts": "CodeArts 通道未加载（provider 未注册；请确认已添加账号后重启网关）",
+}
+_CHANNEL_INVALID_DETAIL = {
+    "Trae": "账号已失效(Trae 运行态; 可试「重新连接」)",
+    "QoderCN": "登录态已失效（凭据被 Qoder 拒绝，请重新添加账号）",
+    "QoderIntl": "登录态已失效（凭据被 Qoder 拒绝，请重新添加账号）",
+    "CodeArts": "凭据已失效（STS 临时凭证被华为云拒绝，请重新添加账号）",
+}
+
+
+def _channel_down_detail(channel: str) -> str:
+    """该通道「服务不可用」时的断连原因（前端 detail 列展示）。"""
+    return _CHANNEL_DOWN_DETAIL.get(channel, "通道服务未加载(provider 未注册)")
+
+
+def _channel_invalid_detail(channel: str) -> str:
+    """该通道「账号凭据被判死」时的断连原因。"""
+    return _CHANNEL_INVALID_DETAIL.get(
+        channel, "账号已失效(运行态; 凭据被上游拒绝, 重新登录或重载通道)")
 
 
 def _loomy_groups(accs: list[dict]) -> "dict[str, dict]":
@@ -792,7 +892,7 @@ def _signin_targets(channel: str | None, signin: dict) -> dict:
     """
     cfg = _read_config()
     prov = cfg.get("providers") or {}
-    out = {"wb": False, "trae": False, "pending": []}
+    out = {"wb": False, "trae": False, "new": False, "pending": []}
     for ch, pkey in CHANNEL_TO_PROVIDER.items():
         if channel and ch != channel:
             continue
@@ -829,6 +929,10 @@ def _signin_targets(channel: str | None, signin: dict) -> dict:
                 continue
             if ch == "Trae":
                 out["trae"] = True
+            elif ch in ("QoderCN", "QoderIntl", "CodeArts"):
+                # 2026-10 新增三通道：签到走 open-ai-task 的 --new-only 分支
+                # （Qoder 走 sash/campaign 接口，CodeArts 走 ops/delivery 活动平台）
+                out["new"] = True
             else:
                 out["wb"] = True
             out["pending"].append(rid)
@@ -1071,6 +1175,10 @@ async def refresh_account_signin(payload: dict = Body(default={})):
         ran.append("--wb-only")
     if force or targets["trae"]:
         ran.append("--trae-only")
+    if force or targets.get("new"):
+        # 2026-10 新增三通道：Qoder 国内/国际 + 华为云 CodeArts
+        # （signin_all.py --new-only；脚本幂等，已签/活动未开放均为终态）
+        ran.append("--new-only")
 
     errors: list[str] = []
     for flag in ran:
@@ -1092,6 +1200,52 @@ async def refresh_account_signin(payload: dict = Body(default={})):
         "day": after.get("day") or "",
         "updatedAt": _now(),
     }
+
+
+def _new_channel_credits(channel: str, acc: dict,
+                         provider=None) -> tuple[float | None, str]:
+    """查 2026-10 新增三通道的账号余额。返回 (credits, err)。
+
+    这三家都不走 ``account_manager``（它只认识 ### / WorkBuddy / Loomy），
+    而是各自问上游：
+      Qoder*   → GET  {openapi}/api/v2/quota/usage      （COSY 签名的账号 Bearer）
+      CodeArts → GET  {snap}/snap-manager/v1/statistics/plugin（AK/SK 签名）
+
+    ★ CodeArts 的积分**有**接口（2026-10-23 更正）：官方桌面端 PackageInfoService
+      用的就是 statistics/plugin，返回的 `usageTotalPackageCredit.package_credit_remain`
+      即门户上那个数字。此前写「没有余额接口」是找错了地方 —— opengw 上的
+      `/api/v1/user/tokens/balance` 是**福利网关**，对任何路径都回 invalid channel。
+
+    ★★ 2026-10-24：CodeArts 分支**必须先确保 token 有效**。
+      `fetch_credits()` 是模块级纯函数，直接拿 ``credentials.securityToken`` 签名，
+      **不会**续期 —— 账号的 token 一过期，积分查询就永远 APIG.0602（实锤：
+      GT-2503 的 token 04:33 过期后，积分整条 key 从接口返回里消失）。
+      这里通过 provider._ensure_token 先续期（`provider` 由调用方传入）。
+
+    失败只记录不抛出（单个账号失效不该让整次刷新失败）。
+    ★ 返回 None 表示**余额未知** —— 绝不用 0 顶替：0 会被界面渲染成
+      「这个账号 0 积分」，是看起来很像真的假数据（本项目口径：读不到显示「—」）。
+    """
+    try:
+        if channel in ("QoderCN", "QoderIntl"):
+            from providers import qoder_common as qc  # type: ignore
+            return qc.fetch_credits(acc)
+        if channel == "CodeArts":
+            from providers import codearts as ca  # type: ignore
+            # ★ _ensure_token 是 async 的，而本函数运行在工作线程里（无事件循环）。
+            #   走 provider 的同步续期入口 _refresh_locked（自带跨进程互斥 +
+            #   锁内重读磁盘 + 成功后落盘），并在“磁盘上更新”时直接采用。
+            if provider is not None and hasattr(provider, "_refresh_locked"):
+                try:
+                    exp = int(acc.get("expiresAt") or 0)
+                    if not exp or exp - 300 <= time.time():
+                        provider._refresh_locked(acc)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("codearts 积分前续期失败（继续用现有 token）: %s", e)
+            return ca.fetch_credits(acc)
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"[:160]
+    return None, f"未知通道 {channel}"
 
 
 @router.post("/accounts/credits/refresh")
@@ -1150,6 +1304,27 @@ async def refresh_account_credits(payload: dict = Body(default={})):
                             continue
                         result[aid] = {"credits": float(g or 0),
                                        "workCredits": float(w or 0)}
+                    elif ch in ("QoderCN", "QoderIntl", "CodeArts"):
+                        # 2026-10 新增三通道：余额直接问上游（COSY / AK-SK 签名），
+                        # 不经过 account_manager（它只认识旧的三家）
+                        total, err = _new_channel_credits(
+                            ch, acc,
+                            provider=_provider_instance(pkey) if ch == "CodeArts" else None)
+                        if total is None:
+                            # ★★ 2026-10-24 修「部分账号不显示积分」：
+                            #   过去这里 `continue` —— **失败的账号整条不进缓存**。
+                            #   前端拿到的是一个「压根没有这个 key」的字典，既不是 0
+                            #   也不是 null，于是那一行要么没有积分、要么永远加载中。
+                            #   而本模块注释的口径明明是「读不到显示『—』」——
+                            #   None 就是要被渲染成「未知」的信号，不该在半路消失。
+                            #   现在：照样写进缓存，credits=None + error，让前端如实显示。
+                            #   实锤：CodeArts:3df18448… 因 APIG.0602 整条缺席。
+                            if err:
+                                errors.append(f"{aid}: {err}")
+                            result[aid] = {"credits": None, "workCredits": 0.0,
+                                           "error": str(err or "余额未知")[:200]}
+                            continue
+                        result[aid] = {"credits": float(total), "workCredits": 0.0}
                     else:
                         total, err = am.wb_credits(acc, domain, product)
                         if err:
@@ -1279,12 +1454,20 @@ async def launch_login(payload: dict = Body(default={})):
         "Trae": "login_trae.py",
         "WorkBuddy": "login_workbuddy.py",
         "WorkBuddy_IE": "login_workbuddy_intl.py",
+        # 2026-10 新增三通道：Qoder 走设备授权（PKCE），CodeArts 走华为云 OAuth2
+        "QoderCN": "login_qoder.py",
+        "QoderIntl": "login_qoder.py",
+        "CodeArts": "login_codearts.py",
     }
     if channel not in allowed:
         raise HTTPException(status_code=400, detail=f"未知通道 {channel}")
     script_name = script_name or allowed[channel]
     if script_name not in allowed.values():
         raise HTTPException(status_code=400, detail="不允许执行该脚本")
+    # Qoder 国内/国际共用同一个脚本，用 --realm 区分；CodeArts 无需额外参数
+    extra_args: list[str] = []
+    if script_name == "login_qoder.py":
+        extra_args = ["--realm", "cn" if channel == "QoderCN" else "intl"]
 
     def _work() -> dict:
         import subprocess
@@ -1302,7 +1485,7 @@ async def launch_login(payload: dict = Body(default={})):
             #   文档头 —— 不再拉系统 Edge), 用户机无需另装)。路径参数本身
             #   不要求存在, 不可用 os.path.exists 拦截 (app_paths 的老警告)。
             exe = os.path.join(BASE, "open-ai-task.exe")
-            cmd = [exe, script]
+            cmd = [exe, script] + extra_args
         else:
             # ★ 源码态 (2026-09-18 起) 同样优先 task shim —— 登录助手进程
             #   因此也显示为 open-ai-task.exe, 与 gateway/trae/daemon 一致
@@ -1312,7 +1495,7 @@ async def launch_login(payload: dict = Body(default={})):
                 exe = os.path.join(BASE, ".venv", "Scripts", "python.exe")
                 if not os.path.exists(exe):
                     exe = sys.executable
-            cmd = [exe, script]
+            cmd = [exe, script] + extra_args
 
         # ★ 必须 CREATE_NO_WINDOW：登录脚本本身只在终端里打印进度，
         #   真正的交互发生在它打开的浏览器里（扫码/密码）。原实现用
@@ -1341,6 +1524,7 @@ async def launch_login(payload: dict = Body(default={})):
         # 留句柄供 /accounts/login/log 判断「还在跑吗」（同通道重复登录则替换旧的）
         _LOGIN_PROCS[channel] = proc
         return {"ok": True, "launched": script_name, "channel": channel,
+                "args": extra_args,
                 "logFile": log_path, "logOffset": log_offset, "pid": proc.pid}
 
     return await _in_thread(_work)
@@ -1437,7 +1621,11 @@ async def refresh_accounts(payload: dict = Body(default={})):
         "Loomy": ["loomy"],
         "WorkBuddy": ["workbuddy"],
         "WorkBuddy_IE": ["workbuddy_intl"],
-    }.get(channel or "", ["loomy", "workbuddy", "workbuddy_intl"])
+        "QoderCN": ["qoder_cn"],
+        "QoderIntl": ["qoder_intl"],
+        "CodeArts": ["codearts"],
+    }.get(channel or "", ["loomy", "workbuddy", "workbuddy_intl",
+                            "qoder_cn", "qoder_intl", "codearts"])
     for _pkey in targets:
         _clear_channel_runtime(_pkey)
     data = await list_accounts(channel)
@@ -1495,13 +1683,16 @@ async def reconnect_accounts(payload: dict = Body(default={})):
         #   没有清牌入口）。这里一并复位，让「重新连接账号」对四条通道
         #   行为一致。
         inproc_cleared: dict = {}
-        for _pkey in ("loomy", "workbuddy", "workbuddy_intl"):
+        for _pkey in ("loomy", "workbuddy", "workbuddy_intl",
+                       "qoder_cn", "qoder_intl", "codearts"):
             inproc_cleared[_pkey] = _clear_channel_runtime(_pkey)
 
         return {"ok": True, "started": True, "pid": proc.pid,
                 "traeRuntime": trae_runtime, "runtimeCleared": inproc_cleared}
 
     return await _in_thread(_work)
+
+
 
 
 # ─────────────────────────── 模型 ───────────────────────────
@@ -1712,6 +1903,41 @@ def _model_rates() -> dict:
                 _put(table, [key, f"{prefix}{key}"], r)
     except Exception as e:  # noqa: BLE001
         logger.warning("别名倍率回填失败: %s", e)
+
+    # ── 2026-10 新增三通道（Qoder CN / Qoder 国际 / 华为云 CodeArts）──
+    #
+    # 这三家的倍率**上游本来就给了**，只是字段名各不相同，故由各 provider 自己
+    # 翻译成 {模型名/键: 倍率}（见 QoderProvider.rate_table / CodeArtsProvider.rate_table）：
+    #   Qoder    → 目录里的 price_factor（Auto 0.5 / Qwen3.8-Max 0.2 / Kimi-K3 1.4）
+    #   CodeArts → builtin 的 credit[].ratio_display（GLM-5.2 0.7x / DeepSeek-V4.1-Flash 0.18x）
+    # 认不到就登记 RATE_UNKNOWN 哨兵（界面显示「--」），而不是留空让前端落到 `?? 0`
+    # ——「未知显示成 0」正是本次要修的毛病。
+    try:
+        import main as gateway  # type: ignore
+        providers = getattr(gateway, "PROVIDERS", {}) or {}
+    except Exception:  # noqa: BLE001
+        providers = {}
+    for pkey, channel in (("qoder-cn", "QoderCN"), ("qoder-intl", "QoderIntl"),
+                          ("codearts", "CodeArts")):
+        prov = providers.get(pkey)
+        fn = getattr(prov, "rate_table", None) if prov is not None else None
+        if fn is None:
+            continue
+        try:
+            table = fn() or {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("%s 倍率表失败: %s", pkey, e)
+            continue
+        if not table:
+            continue
+        clean: dict[str, float] = {}
+        for k, v in table.items():
+            try:
+                clean[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+        if clean:
+            out[channel] = clean
 
     return {k: v for k, v in out.items() if v}
 
@@ -2132,8 +2358,8 @@ async def credits_week(offset: int = 0, channel: str | None = None):
         daily: dict[str, dict] = {}
         for d in range(7):
             day = (monday + _dt.timedelta(days=d)).isoformat()
-            daily[day] = {"day": day, "Trae": 0.0, "WorkBuddy": 0.0,
-                          "WorkBuddy_IE": 0.0, "Loomy": 0.0}
+            daily[day] = {"day": day,
+                          **{ch: 0.0 for ch in WEEK_CHANNELS}}
 
         stats = {"gained": 0.0, "used": 0.0}
         # 探活: 同 /credits/today —— 读不到就报错, 不交出一份「全周零消耗」的假数据
@@ -2149,8 +2375,11 @@ async def credits_week(offset: int = 0, channel: str | None = None):
                 day = r.get("day")
                 ch = PROVIDER_TO_CHANNEL.get(r.get("platform") or "",
                                              r.get("platform") or "")
-                if day in daily and ch in daily[day]:
-                    daily[day][ch] += float(r.get("credits") or 0)
+                if day in daily:
+                    # ★ 不按「已知通道」过滤 —— 出现未登记的通道名也要照实累加，
+                    #   绝不静默丢数据（2026-10-24 修：正是这个过滤把三个新通道丢了）。
+                    daily[day][ch] = (daily[day].get(ch, 0.0)
+                                      + float(r.get("credits") or 0))
             ov = credits_api.overview(start=s, end=e, platform=plat)
             net = ov.get("net") or {}
             stats["gained"] = float(net.get("gained") or 0)

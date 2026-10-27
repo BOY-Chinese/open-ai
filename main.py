@@ -166,11 +166,43 @@ async def _refresh_loomy_models(force: bool = False):
             logger.warning("loomy 模型刷新异常: %s", e)
 
 
+async def _refresh_dynamic_models(force: bool = False):
+    """遍历**所有**注册 provider，调用它自己的模型目录刷新钩子。
+
+    ★ 为什么必须遍历而不是逐个点名（2026-10-22 修正）：原先这里写死了
+      workbuddy / workbuddy-intl / 本地代理 / loomy 四条 —— 新增 Qoder CN /
+      Qoder 国际 / CodeArts 三通道时**漏加了**，于是它们的模型目录从来没被拉过，
+      界面一直显示 provider 内部的静态兜底目录（看起来就是「模型不对/变少」，
+      静态表里 enable=false 的条目还会被再过滤一道，数量更少）。
+      改为遍历 PROVIDERS 后，新通道只要实现 refresh_models / sync_models
+      就自动纳入每日刷新，不会再因为「忘了改这里」而静默使用过期目录。
+    """
+    for pkey, prov in list(PROVIDERS.items()):
+        fn = (getattr(prov, "refresh_models", None)
+              or getattr(prov, "sync_models", None))
+        if fn is None:
+            continue
+        try:
+            await fn(force=force)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("provider %s 模型刷新异常: %s", pkey, e)
+
+
 async def _model_refresh_loop():
-    """启动时先刷新, 之后每 24h 刷新一次 (workbuddy + 国际版 + trae + loomy 动态模型)。"""
+    """启动时先刷新, 之后每 24h 刷新一次（所有实现了刷新钩子的通道）。"""
     await _refresh_workbuddy_models(force=True)
     await _refresh_workbuddy_intl_models(force=True)
     await _refresh_trae_models()
+    await _refresh_loomy_models()
+    # 三新通道（Qoder CN / Qoder 国际 / CodeArts）以及将来任何新通道
+    await _refresh_dynamic_models(force=True)
+    while True:
+        await asyncio.sleep(MODEL_REFRESH_INTERVAL)
+        await _refresh_workbuddy_models()
+        await _refresh_workbuddy_intl_models()
+        await _refresh_trae_models()
+        await _refresh_loomy_models()
+        await _refresh_dynamic_models()
     await _refresh_loomy_models()
     while True:
         await asyncio.sleep(MODEL_REFRESH_INTERVAL)
@@ -498,16 +530,46 @@ async def anthropic_messages(request: Request):
 
 @app.post("/v1/admin/reload-providers")
 async def reload_providers(request: Request):
-    """重新加载 config.json 并重建所有 provider（用于账号启用/禁用等配置变更后热更新）。"""
+    """重新加载 config.json 并重建所有 provider（配置变更后热更新）。
+
+    ★ 什么时候必须调它（2026-10 补记）：三新通道（Qoder CN/Qoder/CodeArts）
+      与 workbuddy 系一样，**有账号才注册**（避免未登录时把静态模型目录挂上
+      /v1/models）。因此「第一次添加某通道账号」这件事，光写 config.json 是不够的 ——
+      进程里根本没有那个 provider 实例，模型列表为空、请求路由返回 None，
+      用户看到的就是「加了账号但用不了」，只能重启网关。
+      现在前端在**一次登录跟随结束后**自动调本端点，六个通道一视同仁。
+
+    ★ 旧实例的 httpx.AsyncClient 会被顺手关掉：本端点可被反复调用（每次登录一次），
+      只替换字典而不关闭旧客户端会按次泄漏连接池。关闭是 best-effort ——
+      失败只记日志，绝不影响重载本身（重载的意义是让新配置立刻生效）。
+    """
     global PROVIDERS, CONFIG
+    old_providers = PROVIDERS
+    old_keys = list(old_providers.keys())
     try:
         CONFIG = load_config()
         PROVIDERS = build_providers(CONFIG)
-        logger.info("provider 已重新加载: %s", list(PROVIDERS.keys()))
-        return {"status": "ok", "providers": list(PROVIDERS.keys())}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.exception("provider 重载失败")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    closed = 0
+    for name, prov in (old_providers or {}).items():
+        if prov is PROVIDERS.get(name):
+            continue          # 同一实例（如未变更的通道）不能关，否则会打断在途请求
+        closer = getattr(prov, "close", None)
+        if closer is None:
+            continue
+        try:
+            res = closer()
+            if asyncio.iscoroutine(res):
+                await res
+            closed += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("关闭旧 provider %s 失败（不影响重载）: %s", name, e)
+    logger.info("provider 已重新加载: %s -> %s（关闭旧实例 %d 个）",
+                old_keys, list(PROVIDERS.keys()), closed)
+    return {"status": "ok", "providers": list(PROVIDERS.keys()),
+            "previous": old_keys, "closed": closed}
 
 
 def _run_gateway():

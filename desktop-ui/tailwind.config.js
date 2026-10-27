@@ -45,12 +45,16 @@ export default {
           hover: 'hsl(var(--danger-hover))',
           soft: 'hsl(var(--danger-soft))',
         },
-        /* 四通道品牌色（图表/徽标共用，避免逐处硬编码） */
+        /* 七通道品牌色（图表/徽标共用，避免逐处硬编码）
+           2026-10 新增三通道：qdc=Qoder CN / qd=Qoder 国际 / ca=CodeArts */
         channel: {
           trae: 'hsl(var(--channel-trae))',
           wb: 'hsl(var(--channel-wb))',
           wbie: 'hsl(var(--channel-wbie))',
           loomy: 'hsl(var(--channel-loomy))',
+          qdc: 'hsl(var(--channel-qdc))',
+          qd: 'hsl(var(--channel-qd))',
+          ca: 'hsl(var(--channel-ca))',
         },
         /* 模态遮罩：深浅两套主题下浓度不同，故走令牌而非 bg-black/60 */
         overlay: 'hsl(var(--overlay))',

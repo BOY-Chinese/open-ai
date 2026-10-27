@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-测试: prompt_sanitizer —— 竞品产品名屏蔽 (无网络部分)
-======================================================
-覆盖屏蔽表、角色白名单、幂等性、多模态 content、请求体无副作用。
+测试: prompt_sanitizer —— 产品名屏蔽 + 整句提示词同义改写 (无网络部分)
+====================================================================
+覆盖屏蔽表、整句改写表、角色白名单、幂等性、多模态 content、请求体无副作用。
 运行: python -m unittest tests.test_prompt_sanitizer -v
 
 背景: workbuddy 通道 400 code=11128
-("Illegal API invocation from an unapproved channel") —— 上游扫描提示词里的
-竞品产品名。策略见 prompt_sanitizer 模块文档: **屏蔽产品名**, 而非改写句式。
+("Illegal API invocation from an unapproved channel") —— 上游扫描提示词内容。
+两轮策略见 prompt_sanitizer 模块文档:
+  * 产品名 → 屏蔽成占位符（2026-10-20）；
+  * 系统提示词整句指纹 → 同义改写（2026-10-27）。
 """
 import os
 import sys
@@ -139,6 +141,53 @@ class TestRoleScoping(unittest.TestCase):
                  "content": "You are an AI agent powered by DeepSeek Harness."}]
         r = sanitize_messages(msgs)
         self.assertEqual(r["changed"], 1)
+
+
+class TestSystemPromptFingerprintRewrite(unittest.TestCase):
+    """★ 2026-10-27 第二轮：黑名单不止产品名 —— DSH 的**整句**提示词也会被拦。
+
+    实测（直打上游）：
+      `Tokens prefixed with @ ... Relative paths resolve from the workspace root`
+      两句**连读** → 400；单独任一句 → 200；把任一词/空白改掉 → 200；
+      user 角色 → 200；assistant / tool → 400。
+    所以按「整句同义改写」处理，不抹成 ###（否则模型读不懂文件引用指令）。
+    """
+
+    RAW = ("Tokens prefixed with @ are paths the user explicitly referenced. "
+           "Relative paths resolve from the workspace root; "
+           "absolute paths identify files or directories on the host.")
+
+    def test_file_reference_prompt_rewritten(self):
+        msgs = _sys(self.RAW)
+        r = sanitize_messages(msgs)
+        self.assertEqual(r["changed"], 1)
+        out = msgs[0]["content"]
+        self.assertNotIn(
+            "Tokens prefixed with @ are paths the user explicitly referenced. "
+            "Relative paths resolve from the workspace root", out)
+        # 句意保留：后半段指令原样在
+        self.assertIn(
+            "absolute paths identify files or directories on the host", out)
+        self.assertIn("@-prefixed tokens", out)
+        self.assertIn("resolved against the workspace root", out)
+
+    def test_rewrite_is_idempotent(self):
+        msgs = _sys(self.RAW)
+        sanitize_messages(msgs)
+        first = msgs[0]["content"]
+        self.assertEqual(sanitize_messages(msgs)["changed"], 0)
+        self.assertEqual(msgs[0]["content"], first)
+
+    def test_rewrite_user_untouched(self):
+        """user 是用户真实输入 —— 实测把手写指纹句发进 user 上游并不拦。"""
+        msgs = _sys(self.RAW, role="user")
+        self.assertEqual(sanitize_messages(msgs)["changed"], 0)
+        self.assertEqual(msgs[0]["content"], self.RAW)
+
+    def test_rewrite_in_tool_message(self):
+        """实测 tool 消息里的指纹句同样 400，必须一起改写。"""
+        msgs = [{"role": "tool", "tool_call_id": "c1", "content": self.RAW}]
+        self.assertEqual(sanitize_messages(msgs)["changed"], 1)
 
 
 class TestIdempotentAndStructure(unittest.TestCase):

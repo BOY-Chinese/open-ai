@@ -158,8 +158,43 @@ class LoomyProvider(Provider):
     MODELS_TTL = 4 * 3600
 
     # 鉴权类失效信号: HTTP 状态码 + 上游业务码 (100002 = 未登录/token 失效)
-    AUTH_STATUS = (401, 403)
+    #
+    # ★★ 2026-10-24 修「Loomy 莫名其妙断连」（master 报障，A/B 实测确认）：
+    #   403 **不能**无条件算鉴权失效。上游（讯飞星火）对**内容审核拦截**回的是
+    #     HTTP 400（部分链路见过 403） + {"error":{"type":"data_inspection_failed",
+    #     "message":"内容可能包含敏感信息，无法处理，请调整后重试"}}
+    #   旧版把 403/400 一律当鉴权失败 → mark_invalid() 把账号标死 →
+    #   两个账号一旦都被标死就报「所有账号均不可用」，**后续正常对话也全挂**。
+    #   实测：同一账号发正常内容 HTTP 200，发敏感内容 400(data_inspection_failed)
+    #   —— 账号本身完全正常，纯粹是内容问题。
+    #
+    #   现在：401 才算鉴权失效；403/400 必须**先排除审核特征**再决定（见
+    #   _is_inspection_block），审核拦截只抛错、绝不换账号、绝不标死。
+    AUTH_STATUS = (401,)
     AUTH_BIZ_CODES = ("100002",)
+    # 内容审核拦截特征（上游原样返回，大小写不敏感）
+    INSPECTION_MARKERS = ("data_inspection_failed",
+                          "内容可能包含敏感信息",
+                          "inappropriate content")
+    INSPECTION_MESSAGE = ("内容触发上游审核，请调整措辞后重试"
+                          "（这是内容问题，与账号/通道无关）")
+
+    @classmethod
+    def _is_inspection_block(cls, err_text: str) -> bool:
+        """响应体是否为**内容审核拦截**（不是鉴权问题）。
+
+        2026-10-24 实测响应：
+          {"error":{"message":"内容可能包含敏感信息，无法处理，请调整后重试",
+                    "type":"data_inspection_failed","code":400,
+                    "metadata":{"provider_name":"iflytek-spark-loomy"}}}
+        这类错误 100% 是「这段话过不了审」——换账号、等一会、重试全都没用，
+        唯一正确的动作是**如实告诉用户调整措辞**，并且**不得标死账号**。
+        """
+        low = (err_text or "").lower()
+        if any(m.lower() in low for m in cls.INSPECTION_MARKERS):
+            return True
+        # 上游把 message 放在 "message" 字段里；中文特征单独兜一次
+        return "敏感" in (err_text or "")
 
     def __init__(self, cfg: dict):
         self.base_url = (cfg.get("base_url") or UPSTREAM_BASE).rstrip("/")
@@ -340,13 +375,30 @@ class LoomyProvider(Provider):
                 err_text = (await resp.aread()).decode("utf-8", errors="replace")
                 await resp.aclose()
                 last_err = f"loomy upstream HTTP {resp.status_code}: {err_text[:300]}"
-                # 仅鉴权类错误才换账号 (401/403 或业务码未登录/token失效)
+                # ★ 内容审核拦截必须**排在最前面**：它既不是鉴权失效、也不该换账号。
+                #   换账号只会拿同一段内容再去撞另一个账号的审核，白白拖慢响应，
+                #   更糟的是旧版会 mark_invalid() 把账号标死 → 后续正常对话全挂。
+                if self._is_inspection_block(err_text):
+                    logger.warning(
+                        "loomy 内容触发上游审核（HTTP %s），不换账号、不标失效",
+                        resp.status_code)
+                    raise RuntimeError(
+                        f"loomy upstream HTTP {resp.status_code}: "
+                        f"{self.INSPECTION_MESSAGE}") from None
+                # 仅鉴权类错误才换账号 (401, 或业务码未登录/token失效)
                 if resp.status_code in self.AUTH_STATUS or \
                         any(c in err_text for c in self.AUTH_BIZ_CODES):
                     logger.warning("loomy 账号 %s session 失效, 换下一个账号", label)
                     self._health.mark_invalid(
                         account.get("userid"),
                         reason=f"HTTP {resp.status_code} 鉴权拒绝")
+                    continue
+                # 403 但不像审核也不像鉴权: 不标死账号（保守），只换下一个账号试。
+                # 实测上游在限流/风控抖动时也会回 403，标死会造成「假断连」。
+                if resp.status_code == 403:
+                    logger.warning(
+                        "loomy 账号 %s HTTP 403（非审核/非鉴权特征），"
+                        "换下一个账号但不标记失效", label)
                     continue
                 raise RuntimeError(last_err)
 
@@ -360,6 +412,14 @@ class LoomyProvider(Provider):
                 await resp.aclose()
                 code, msg = inband_err
                 last_err = f"loomy upstream 业务错误 {code}: {msg}"
+                # 带内错误也可能是内容审核（上游把审核体包进 200 的情况）——
+                # 同样只抛错、不换账号、不标死（与上面 HTTP 分支同口径）
+                if self._is_inspection_block(f"{msg}"):
+                    logger.warning(
+                        "loomy 内容触发上游审核（带内错误），不换账号、不标失效")
+                    raise RuntimeError(
+                        f"loomy upstream 业务错误 {code}: {self.INSPECTION_MESSAGE}"
+                    ) from None
                 if code in self.AUTH_BIZ_CODES:
                     logger.warning("loomy 账号 %s 登录已失效 (%s), 换下一个账号",
                                    label, code)

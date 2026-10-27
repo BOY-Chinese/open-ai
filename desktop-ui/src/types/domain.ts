@@ -5,13 +5,35 @@
 
 /* ═══════════ 通道 ═══════════ */
 
-/** 四通道：Trae / WorkBuddy / WorkBuddy 国际版 / Loomy（讯飞） */
-export type Channel = 'Trae' | 'WorkBuddy' | 'WorkBuddy_IE' | 'Loomy'
+/** 七通道：Trae / WorkBuddy / WorkBuddy 国际版 / Loomy（讯飞）
+ *          / Qoder CN / Qoder 国际版 / CodeArts（华为云码道）
+ *
+ * ★ 通道名是前后端的**稳定契约**：必须与 admin_api.CHANNEL_TO_PROVIDER 的键
+ *   逐字一致（后端 normalize_channel 也认这些别名）。改名之前先看那张映射表。
+ */
+export type Channel =
+  | 'Trae'
+  | 'WorkBuddy'
+  | 'WorkBuddy_IE'
+  | 'Loomy'
+  /* 2026-10 新增三通道：Qoder 国内版 / Qoder 国际版 / 华为云 CodeArts */
+  | 'QoderCN'
+  | 'QoderIntl'
+  | 'CodeArts'
 
 /** 筛选用值（含"全部"） */
 export type ChannelFilter = Channel | 'all'
 
-export const CHANNELS: Channel[] = ['Trae', 'WorkBuddy', 'WorkBuddy_IE', 'Loomy']
+export const CHANNELS: Channel[] = [
+  'Trae',
+  'WorkBuddy',
+  'WorkBuddy_IE',
+  'Loomy',
+  // 2026-10 新增（数组顺序即筛选下拉/图例顺序）
+  'QoderCN',
+  'QoderIntl',
+  'CodeArts',
+]
 
 /** 通道展示配置：色值走 CSS 变量，此处只做语义映射 */
 export const CHANNEL_META: Record<
@@ -19,6 +41,10 @@ export const CHANNEL_META: Record<
   { label: string; token: string; dot: string }
 > = {
   Trae: { label: 'Trae', token: 'bg-channel-trae', dot: 'bg-fg-subtle' },
+  // 2026-10 新增三通道（色值走 CSS 变量，见 styles/globals.css 的 --channel-qdc/qd/ca）
+  QoderCN: { label: 'Qoder CN', token: 'bg-channel-qdc', dot: 'bg-channel-qdc' },
+  QoderIntl: { label: 'Qoder', token: 'bg-channel-qd', dot: 'bg-channel-qd' },
+  CodeArts: { label: 'CodeArts', token: 'bg-channel-ca', dot: 'bg-channel-ca' },
   WorkBuddy: { label: 'WorkBuddy', token: 'bg-channel-wb', dot: 'bg-success' },
   WorkBuddy_IE: {
     label: 'WorkBuddy 国际',
@@ -26,6 +52,24 @@ export const CHANNEL_META: Record<
     dot: 'bg-warning',
   },
   Loomy: { label: 'Loomy', token: 'bg-channel-loomy', dot: 'bg-channel-loomy' },
+}
+
+/**
+ * 通道 → 对外模型名前缀（**后端 CHANNEL_PREFIX 的前端副本**）。
+ *
+ * 用途：把 routeModelId（如 `qdc-Qwen3.8-Max`）剥成上游模型名去倍率表里查。
+ * ★ 前端原先在 httpBackend 里写死正则 `^(tr-|wb-|wbie-|lm-|loomy-)`，
+ *   新增三个通道时漏改 → 前缀剥不掉 → 倍率整列显示「未知」。
+ *   现在集中在这里，加通道只改一处；仍须与后端逐字一致。
+ */
+export const CHANNEL_PREFIX: Record<Channel, string> = {
+  Trae: 'tr-',
+  WorkBuddy: 'wb-',
+  WorkBuddy_IE: 'wbie-',
+  Loomy: 'lm-',
+  QoderCN: 'qdc-',
+  QoderIntl: 'qd-',
+  CodeArts: 'ca-',
 }
 
 /**
@@ -60,7 +104,12 @@ export interface Account {
   /** 派生状态（UI 直接消费，避免组件内重复推导） */
   status: AccountStatus
   /** 通用积分 */
-  credits: number
+  /**
+   * 可用积分；**null = 未知**（该通道没有余额接口，如华为云 CodeArts）。
+   * ★ 不用 0 顶替：「0」会被读成「这个账号真的没积分」，
+   *   而实际是「查不到」——按本项目既有口径，未知要显示成「—」。
+   */
+  credits: number | null
   /** Work 积分（Trae 通道特有，其余为 0） */
   workCredits: number
   /** 最近一次刷新时间（epoch 秒） */
@@ -248,6 +297,10 @@ export interface DailyUsage {
   WorkBuddy: number
   WorkBuddy_IE: number
   Loomy: number
+  /* 2026-10 新增三通道（与 credits_api.PLATFORMS 的 key 逐字一致） */
+  QoderCN: number
+  QoderIntl: number
+  CodeArts: number
 }
 
 export interface WeekBundle {

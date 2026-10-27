@@ -1260,3 +1260,16 @@ master 明确指示：**推出 v3.4.1 小版本**。上一版 **v3.4 的资产�
 过滤器从「**改写句式**」（只在上游原句一字不差时生效）换成
 「**屏蔽产品名**」（23 条规则，命中替换为占位符）—— 上游改措辞也不再失效。
 接入点（`main.py` / `providers/workbuddy.py`）零改动，**界面零改动、无需重打包桌面端**。
+
+---
+
+## v4.0 三端同步（2026-10-28，本地构建，未 push / 未发布）
+
+- **来源**：`D:\app\dsh_plugin\open-ai` @ `076da46`，`APP_VERSION='local-v4.0'`。
+- **本仓版本**：`dev-v4.0`（`UPDATE_CHANNEL='dev'`）。
+- **同步范围**：v4.0（A–E）+ v4.1（F–I）+ v4.2（J–P）+ 追加段（Q / Q·补），并补入 2026-10 新增的 Qoder 国内 / Qoder 国际 / CodeArts 三通道全部运行时文件。
+- **前端**：重建 v4 界面（`index-BoxG0D-B.js` / `index-D5yQ5E3E.css`），Tauri 桌面端重编译；已登记 `check_desktop_bundle.CLEAN_BUNDLES`。
+- **打包门禁**：`check_frozen_paths` / `check_undefined_names` / `test_frozen_script_launch` / 前端指纹全部通过；`build_resources.REQUIRED_ENTRIES` 增补 `tool_echo` / `cred_store` / Qoder / CodeArts 模块与登录脚本。
+- **测试**：`python -m unittest discover -s tests -t .` → **738 项，失败 0，错误 4**（`test_procman` ×3 + `test_model_rate_unknown` ×1）。同样 4 项在 v3.4.1 基线复现，原因是发布仓无 `config.json`、Windows Job Object 环境差异，**非本次引入**。
+- **产物**：`open-ai-installer-dev.exe` 34,916,718 字节，sha256 `dcc8b9b240863215a11fb8fc05429ec0149397d0cca19b1943f1d2bc2a2514e6`，已复制到 `D:\Lenovo\Desktop`。
+- **未做**：未 push、未建 tag/release；安装后的 live 冒烟需在真实安装实例上执行（见 `V4.0同步.md` 三、五节）。

@@ -35,6 +35,10 @@ const DARK_SERIES: SeriesColor[] = [
   { key: 'WorkBuddy', label: 'WorkBuddy 通道', color: '#22C55E' },
   { key: 'WorkBuddy_IE', label: 'WorkBuddy 国际', color: '#EAB308' },
   { key: 'Loomy', label: 'Loomy 通道', color: '#A78BFA' },
+  /* 2026-10 新增三通道（深色底提亮版，与 --channel-* 深色主题同值） */
+  { key: 'QoderCN', label: 'Qoder CN', color: '#7DD3FC' },
+  { key: 'QoderIntl', label: 'Qoder', color: '#2563EB' },
+  { key: 'CodeArts', label: 'CodeArts', color: '#F76A73' },
 ]
 
 /**
@@ -46,6 +50,10 @@ const LIGHT_SERIES: SeriesColor[] = [
   { key: 'WorkBuddy', label: 'WorkBuddy 通道', color: '#1A9E4A' },
   { key: 'WorkBuddy_IE', label: 'WorkBuddy 国际', color: '#BD6705' },
   { key: 'Loomy', label: 'Loomy 通道', color: '#7C3AED' },
+  /* 2026-10 新增三通道（白底压暗版，与 --channel-* 浅色主题同值，均 ≥4.3:1） */
+  { key: 'QoderCN', label: 'Qoder CN', color: '#0E9CE0' },
+  { key: 'QoderIntl', label: 'Qoder', color: '#16336E' },
+  { key: 'CodeArts', label: 'CodeArts', color: '#C81E28' },
 ]
 
 /**

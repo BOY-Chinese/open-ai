@@ -121,7 +121,15 @@ CLEAN_BUNDLES = ['index-DcXtEmiT.js', 'index-BusDnuvG.js', 'index-3q5GVwtK.js',
                   #   分支) ; CSS 仍 index-pWqO-GDi.css (与来源端同名 —— CSS 侧
                   #   改动一致)。
                   #   ★ dev / portable 两仓同一源码产出, bundle 名相同。
-                  'index-DRRRdT-l.js']
+                  'index-DRRRdT-l.js',
+                  # BoxG0D-B: 2026-10-27 **v4.0 前端** —— 同步本机端 local-v4.0
+                  #   (v4.0/v4.1/v4.2 的 UI: 七通道账号页 / AddAccountDialog 单一
+                  #   「添加账号」入口 / chart.ts 七通道配色 / 三通道登录与积分 /
+                  #   E 项账号页文案) 。已剔除 master 个人定制的「启动dsh」按钮。
+                  #   产物 837.90 kB, CSS 为 index-D5yQ5E3E.css (七通道品牌色)。
+                  #   已按本仓 sanitize_check.py 扫描产物: 0 命中真实凭据。
+                  #   ★ dev / portable 两仓同一源码产出, bundle 名相同。
+                  'index-BoxG0D-B.js']
 
 # 可选加强: 本机若放了「已知真实值」清单 (不入库, 见 sanitize_check.py),
 # 顺带在 exe 里搜一遍。前端资源是压缩存放的, 明文搜不到 bundle 里的密钥;

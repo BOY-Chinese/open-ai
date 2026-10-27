@@ -100,6 +100,15 @@ PLATFORMS = (
      'provider': 'workbuddy_intl', 'color': '#2fa87a'},
     {'key': 'loomy', 'label': 'Loomy', 'short': 'Loomy',
      'provider': 'loomy', 'color': '#A78BFA'},
+    # 2026-10 新增三通道：签到入账由 scripts/signin_all.py --new-only 写入 gain 表
+    # （Qoder 走 sash/campaign 接口，CodeArts 走华为云 ops/delivery 活动平台）。
+    # color 取前端 --channel-* 同一套色相，保证看板图例与账号页圆点一致。
+    {'key': 'qoder_cn', 'label': 'Qoder CN', 'short': 'Qoder CN',
+     'provider': 'qoder_cn', 'color': '#0E9CE0'},
+    {'key': 'qoder_intl', 'label': 'Qoder', 'short': 'Qoder',
+     'provider': 'qoder_intl', 'color': '#16336E'},
+    {'key': 'codearts', 'label': 'CodeArts', 'short': 'CodeArts',
+     'provider': 'codearts', 'color': '#C81E28'},
 )
 PLATFORM_KEYS = tuple(p['key'] for p in PLATFORMS)
 _BY_KEY = {p['key']: p for p in PLATFORMS}

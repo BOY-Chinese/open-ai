@@ -77,12 +77,13 @@ class AccountHealthTest(unittest.TestCase):
 class _FakeResp:
     """httpx 流式响应的最小桩 (status/aread/aclose/aiter_lines)。"""
 
-    def __init__(self, status, lines=()):
+    def __init__(self, status, lines=(), body=b'{}'):
         self.status_code = status
         self._lines = list(lines)
+        self._body = body
 
     async def aread(self):
-        return b'{}'
+        return self._body
 
     async def aclose(self):
         return None
@@ -201,6 +202,72 @@ class LoomyRuntimeTest(unittest.TestCase):
         LM.load_config_accounts = fake_load
         self.addCleanup(lambda: setattr(LM, 'load_config_accounts', self._orig_load))
 
+    # ───── 2026-10-24：内容审核拦截 ≠ 鉴权失效（修「假断连」）─────
+    # 实测上游（讯飞星火）响应：
+    #   HTTP 400 {"error":{"message":"内容可能包含敏感信息，无法处理，请调整后重试",
+    #            "type":"data_inspection_failed","code":400}}
+    # 旧版把 403/400 当鉴权失败 → mark_invalid() 标死账号 → 后续正常对话全挂。
+
+    INSPECTION = json.dumps({"error": {
+        "message": "内容可能包含敏感信息，无法处理，请调整后重试",
+        "type": "data_inspection_failed", "param": None, "code": 400,
+        "metadata": {"provider_name": "iflytek-spark-loomy"}}},
+        ensure_ascii=False).encode('utf-8')
+
+    def test_inspection_block_does_not_mark_invalid(self):
+        """审核拦截：必须抛错、且**绝不**把账号标成失效、也不该换账号。"""
+        calls = []
+
+        async def fake_upstream(body, token):
+            calls.append(token)
+            return _FakeResp(400, body=self.INSPECTION)
+
+        self.prov._request_upstream = fake_upstream
+        with self.assertRaises(RuntimeError) as ctx:
+            _drain(self.prov._chat_events({'model': 'x'}))
+        self.assertIn('审核', str(ctx.exception))
+        # ★ 核心断言：账号不能被标死
+        self.assertFalse(self.prov._health.is_invalid('26091'))
+        self.assertFalse(self.prov._health.is_invalid('26092'))
+        # 也不该拿同一段内容去撞第二个账号
+        self.assertEqual(len(calls), 1, '审核拦截不该换账号重试')
+
+    def test_inspection_on_403_also_not_invalid(self):
+        """403 但带审核特征 → 同样不能标死（旧版 403 无条件判鉴权失败）。"""
+        async def fake_upstream(body, token):
+            return _FakeResp(403, body=self.INSPECTION)
+
+        self.prov._request_upstream = fake_upstream
+        with self.assertRaises(RuntimeError):
+            _drain(self.prov._chat_events({'model': 'x'}))
+        self.assertFalse(self.prov._health.is_invalid('26091'))
+
+    def test_info_403_without_auth_feature_not_marked_invalid(self):
+        """403 但既不像审核也不像鉴权（限流/风控抖动）→ 换账号但**不标死**。
+
+        实测上游在抖动时也会回 403；标死会造成「假断连」。
+        """
+        async def fake_upstream(body, token):
+            if token == 's1':
+                return _FakeResp(403, body=b'{"error":"forbidden"}')
+            return _FakeResp(200, lines=['data: {"choices":[]}', 'data: [DONE]'])
+
+        self.prov._request_upstream = fake_upstream
+        _drain(self.prov._chat_events({'model': 'x'}))
+        self.assertFalse(self.prov._health.is_invalid('26091'),
+                         '无鉴权特征的 403 不允许标死账号')
+
+    def test_real_401_still_marks_invalid(self):
+        """真鉴权失效（401）必须保持原行为：标死 + 换账号。"""
+        async def fake_upstream(body, token):
+            return _FakeResp(401, body=b'{"error":"unauthorized"}')
+
+        self.prov._request_upstream = fake_upstream
+        with self.assertRaises(RuntimeError):
+            _drain(self.prov._chat_events({'model': 'x'}))
+        self.assertTrue(self.prov._health.is_invalid('26091'))
+        self.assertTrue(self.prov._health.is_invalid('26092'))
+
     def test_auth_reject_marks_invalid_and_rotates(self):
         calls = []
 
@@ -271,7 +338,7 @@ class LoomyRuntimeTest(unittest.TestCase):
 
 # ═════════ 2026-10-14 假断连回归: 主动清牌入口 ═════════
 #
-# 事故现象：Loomy 通道 13489836080 这个账号「刚重新添加过，又显示断连」。
+# 事故现象：Loomy 通道 13800000000 这个账号「刚重新添加过，又显示断连」。
 # 根因：失效标记活在**网关进程内存**里，而重新登录只写 config.json ——
 # 两者之间原先没有任何通路；`observe_token` 的自动复位要等下一发该通道的
 # 请求跑过请求路径才生效。trae 侧早有对等能力（/v1/admin/reconnect →
@@ -314,7 +381,7 @@ class ProviderClearHookTest(unittest.TestCase):
 
     def test_loomy_clear_hook(self):
         cfg = {'loomy': {'accounts': [
-            {'userid': '26091', 'session': 's1', 'phone': '13489836080'}]}}
+            {'userid': '26091', 'session': 's1', 'phone': '13800000000'}]}}
         with tempfile.TemporaryDirectory() as d:
             self._patch_config(d, cfg)
             prov = LoomyProvider({})
@@ -501,9 +568,17 @@ class LoadAccountsFourChannelTest(unittest.TestCase):
         self.assertEqual(rows['Trae:t1']['status'], 'enabled')
 
     def test_each_channel_probed_once(self):
+        """每个通道**恰好**探一次运行态（懒探测 + 结果缓存）。
+
+        2026-10：三新通道（Qoder 国内/国际 + CodeArts）与旧三家同规则 ——
+        它们都是**进程内 provider**，运行态走 _PROVIDER_INSTANCE_KEYS 映射；
+        config 段名带下划线、注册键带连字符，两者都要在表里登记，否则
+        probe 会去查一个不存在的键（漏登记时本条断言先炸）。
+        """
         self._rows()
         self.assertEqual(sorted(self.probe_calls),
-                         ['loomy', 'workbuddy', 'workbuddy_intl'])
+                         ['codearts', 'loomy', 'qoder_cn', 'qoder_intl',
+                          'workbuddy', 'workbuddy_intl'])
 
 
 if __name__ == '__main__':

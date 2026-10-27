@@ -29,6 +29,7 @@ from providers.base import (
     make_usage_chunk, normalize_usage, wants_usage_in_stream,
 )
 from prompt_sanitizer import sanitize_messages
+from providers import cred_store
 
 # 每次 _pick_account 都从 config.json 实时读取启用状态
 # ★ 打包态 __file__ 指向解包临时目录, 相对路径会读错 config —— 钉死安装根。
@@ -36,6 +37,7 @@ try:
     import app_paths as _ap
     _WB_CONFIG_PATH = _ap.CONFIG_PATH
 except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    _ap = None          # 供 _REJECT_LOG 的 getattr 兜底
     _WB_CONFIG_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'config.json'))
 
 logger = logging.getLogger("openapi.workbuddy")
@@ -44,6 +46,56 @@ UPSTREAM_HOST = "copilot.tencent.com"
 UPSTREAM_CHAT_PATH = "/v2/chat/completions"
 UPSTREAM_REFRESH_PATH = "/v2/plugin/auth/token/refresh"
 USER_AGENT = "WorkBuddy/5.3.12 WorkBuddy/5.3.12 CLI/2.115.0"
+
+# 被上游拒绝时落盘请求体（2026-10-27 新增，见 _dump_rejected 注释）
+try:
+    _REJECT_LOG_DIR = _ap.LOGS_DIR  # type: ignore[union-attr]
+except Exception:  # 源码态: __file__ 是绝对路径, 兜底安全
+    _REJECT_LOG_DIR = os.path.join(os.path.dirname(__file__), '..', 'logs')
+_REJECT_LOG = os.path.join(_REJECT_LOG_DIR, "rejected_bodies.jsonl")
+_REJECT_LOG_MAX = 4 * 1024 * 1024      # 单文件上限 4 MB
+_REJECT_BODY_MAX = 800 * 1024          # 单条 body 最多记 800 KB
+
+
+def _dump_rejected(status: int, err_text: str, up_body: dict) -> None:
+    """把被上游拒绝的请求体落盘, 供下次定位「渠道校验」的指纹句。
+
+    ★ 为什么需要（2026-10-27 实录）：这次只修好产品名屏蔽是不够的 ——
+      上游黑名单里还有 DSH 系统提示词的**整句**，而 `err_text[:300]` 把
+      displayTips 截断、日志里又没有请求体，只能靠猜。真因是
+      dsh-file-reference 提示词前两句（见 prompt_sanitizer 文档）。
+      下次同类问题：看本文件里 body.messages 的 system/tool 段，逐句二分。
+    """
+    try:
+        rec = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+            "err": (err_text or "")[:4000],
+            "body": up_body,
+        }
+        line = json.dumps(rec, ensure_ascii=False)
+        if len(line) > _REJECT_BODY_MAX:
+            rec["body"] = {
+                "model": up_body.get("model"),
+                "truncated": True,
+                "messages": [
+                    {"role": m.get("role"),
+                     "len": len(json.dumps(m, ensure_ascii=False))}
+                    for m in (up_body.get("messages") or [])
+                ],
+            }
+            line = json.dumps(rec, ensure_ascii=False)
+        try:
+            if os.path.getsize(_REJECT_LOG) > _REJECT_LOG_MAX:
+                os.replace(_REJECT_LOG,
+                           _REJECT_LOG + "." + time.strftime("%Y%m%d-%H%M%S"))
+        except OSError:
+            pass
+        with open(_REJECT_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        # 落盘失败绝不影响主流程（日志目录只读等）
+        logger.debug("rejected_bodies 落盘失败", exc_info=True)
 
 # 客户端叫法(workbuddy- 前缀) -> 上游模型名 (与 workbuddy内置deepseek代理/proxy.py 同步)
 MODEL_ALIASES = {
@@ -123,6 +175,74 @@ def _jwt_exp(token: str) -> int:
         return int(payload.get("exp", 0))
     except Exception:
         return 0
+
+def _wb_credentials_newer(a: dict, b: dict) -> bool:
+    """workbuddy 侧凭据新旧：先比 JWT 的 exp，再退回 refreshedAt / expiresAt。
+
+    workbuddy 账号本来不存 expiresAt（有效期藏在 accessToken 的 JWT 里），
+    续期后我们会补写 expiresAt/refreshedAt —— 老账号两者都没有时按「不比它新」
+    处理（宁可多续期一次，也不要把旧凭据当新的用）。
+    """
+    ea = _jwt_exp(a.get("accessToken") or "") or int(a.get("expiresAt") or 0)
+    eb = _jwt_exp(b.get("accessToken") or "") or int(b.get("expiresAt") or 0)
+    if ea or eb:
+        return ea > eb
+    return int(a.get("refreshedAt") or 0) > int(b.get("refreshedAt") or 0)
+
+
+def _wb_adopt(account: dict, disk: dict) -> None:
+    """采用磁盘上更新的凭据（AT/RT 必须成对，不能一半内存一半磁盘）。"""
+    if disk.get("accessToken"):
+        account["accessToken"] = disk["accessToken"]
+    if disk.get("refreshToken"):
+        account["refreshToken"] = disk["refreshToken"]
+    for k in ("expiresAt", "refreshedAt"):
+        if disk.get(k) not in (None, ""):
+            account[k] = disk[k]
+
+
+
+def _jwt_payload(token: str) -> dict:
+    """解析 JWT payload (解析失败返回空 dict)。"""
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
+    except Exception:
+        return {}
+
+
+def _jwt_iat(token: str) -> int:
+    """JWT 的签发时间 (iat, 回退 exp); 取不到返回 0。"""
+    if not token:
+        return 0
+    payload = _jwt_payload(token)
+    try:
+        return int(payload.get("iat") or payload.get("exp") or 0)
+    except Exception:
+        return 0
+
+
+def _mem_token_is_newer(mem: str, disk: str) -> bool:
+    """内存凭据是否比磁盘上的更新 —— 决定 _pick_account 合并时用哪一份。
+
+    ★ 2026-10-22 修 (uid=93350cbf 实报「一直断连、重连后很快又断」)：
+      旧实现无条件用内存覆盖磁盘，于是「重新登录写进 config.json 的新 token」
+      永远进不了运行中的网关。该网关进程比那次登录早 16 小时，继续拿旧 token
+      打上游（HTTP 401），再用已被吊销的 refreshToken 续期
+      （401 invalid_grant: Offline user session not found）→ 标失效 → 页面「断连」；
+      点「重新连接」只清内存红牌、不重载凭据，所以很快又红。
+      判定依据：比 JWT 的 iat（无则 exp）；内存那份取不到时间时以磁盘为准
+      （磁盘 = 用户显式登录的结果）。
+    """
+    if not mem:
+        return False            # 内存没有 → 用磁盘
+    if not disk:
+        return True             # 磁盘没有 → 用内存
+    t_mem, t_disk = _jwt_iat(mem), _jwt_iat(disk)
+    if not t_mem:
+        return False            # 内存无法判定 → 以磁盘为准
+    return not t_disk or t_mem > t_disk
 
 
 # 上游需要透传的固定头
@@ -236,12 +356,17 @@ class WorkBuddyProvider(Provider):
             with open(_WB_CONFIG_PATH, encoding='utf-8') as _f:
                 _wb_cfg = json.load(_f).get('providers', {}).get('workbuddy', {})
             _fresh = _wb_cfg.get('accounts', [])
-            # 合并内存中的 token 刷新状态
+            # 合并内存中的 token 刷新状态 —— ★ 只在内存那份**更新**时才覆盖磁盘。
+            # 旧实现是无条件覆盖，于是用户重新登录写进 config.json 的新 token
+            # 永远进不来（详见 _mem_token_is_newer 的注释，2026-10-22 实测踩过）。
             for _old in self.accounts:
                 _match = next((_n for _n in _fresh if _n.get('userId') == _old.get('userId') or _n.get('accessToken') == _old.get('accessToken')), None)
-                if _match:
-                    _match['accessToken'] = _old.get('accessToken', _match.get('accessToken', ''))
-                    _match['refreshToken'] = _old.get('refreshToken', _match.get('refreshToken', ''))
+                if not _match:
+                    continue
+                if _mem_token_is_newer(_old.get('accessToken', ''), _match.get('accessToken', '')):
+                    # 成对替换: AT 与 RT 必须来自同一次签发, 不能一半内存一半磁盘
+                    _match['accessToken'] = _old.get('accessToken', '')
+                    _match['refreshToken'] = _old.get('refreshToken') or _match.get('refreshToken', '')
             self.accounts = _fresh if _fresh else self.accounts
         except Exception:
             pass  # 读取失败则沿用内存 accounts
@@ -360,49 +485,97 @@ class WorkBuddyProvider(Provider):
         exp = _jwt_exp(account.get("accessToken", ""))
         return bool(exp and exp - 600 < time.time())
 
-    async def _refresh_token(self, account: dict) -> bool:
+    def cfg_key(self) -> str:
+        """本 provider 对应的 config.json 段名。
+
+        WorkBuddyProvider.__init__ 历史原因不保留 cfg，取不到 _cfg_key 时按
+        name 推导：workbuddy → workbuddy、workbuddy-intl → workbuddy_intl
+        （与 config.json 里的段名逐字一致）。
+        """
+        cfg = getattr(self, "cfg", None) or {}
+        return cfg.get("_cfg_key") or self.name.replace("-", "_")
+
+    async def _refresh_token(self, account: dict, force: bool = False) -> bool:
+        """续期入口：``force=False`` 时只在 accessToken 临近过期才真的去换。
+
+        :param force: 上游明确回 401/403 时强制续期一次
+
+        ★ 2026-10-23 与 Qoder / CodeArts 同款加固（见 providers/cred_store.py）：
+          **跨进程互斥 + 锁内重读磁盘 + 成功后立刻落盘**。此前这里只改内存，
+          而 refreshToken 可能轮换 —— 一旦重启，磁盘上剩下的就是已作废的旧
+          token（CodeArts 就是这么把账号玩死的）。
+        """
         if not account.get("refreshToken"):
             return False
         async with self._refresh_lock:
-            if not self._is_expired(account):
+            if not force and not self._is_expired(account):
                 return True
-            try:
-                client = self.get_client()
-                headers = {
-                    "Accept": "application/json, text/plain, */*",
-                    "Content-Type": "application/json",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "X-Domain": self.domain,
-                    "X-Refresh-Token": account["refreshToken"],
-                    "X-Auth-Refresh-Source": "plugin",
-                    "X-Product": self.product,
-                    "User-Agent": USER_AGENT,
-                    "X-Trace-ID": "0" * 32,
-                    "X-Request-ID": "0" * 32,
-                }
-                resp = await client.post(
-                    f"https://{UPSTREAM_HOST}{UPSTREAM_REFRESH_PATH}",
-                    json={}, headers=headers)
-                if resp.status_code != 200:
-                    logger.warning("workbuddy refresh HTTP %s: %s",
-                                   resp.status_code, resp.text[:200])
-                    if resp.status_code in (401, 403):
-                        # 刷新凭据本身被上游拒绝 → refreshToken 已死, 标记失效
-                        self._health.mark_invalid(
-                            account.get("userId"),
-                            reason=f"refresh 被拒 HTTP {resp.status_code}")
-                    return False
-                data = resp.json().get("data", {})
-                if data.get("accessToken"):
-                    account["accessToken"] = data["accessToken"]
-                    if data.get("refreshToken"):
-                        account["refreshToken"] = data["refreshToken"]
-                    logger.info("workbuddy accessToken 已自动刷新")
-                    return True
+            return await self._refresh_locked(account)
+
+    async def _refresh_locked(self, account: dict) -> bool:
+        """加锁续期：重读磁盘 → （必要时）换 token → 立刻回写 config.json。"""
+        uid = str(account.get("userId") or "")
+        seg = self.cfg_key()
+        lock = await asyncio.to_thread(cred_store.lock_acquire, seg, uid)
+        try:
+            canonical = next((a for a in self.accounts
+                              if str(a.get("userId") or "") == uid), account)
+            disk = await asyncio.to_thread(cred_store.read_account, seg, uid)
+            if disk and _wb_credentials_newer(disk, canonical):
+                _wb_adopt(account, disk)
+                logger.info("%s 账号 %s 采用磁盘上更新的凭据（另一进程刚续期）",
+                            self.name, uid[:8])
+                return True
+            if not await self._refresh_http(account):
                 return False
-            except Exception as e:  # noqa: BLE001
-                logger.error("workbuddy refresh 异常: %s", e)
+            account["refreshedAt"] = int(time.time())
+            exp = _jwt_exp(account.get("accessToken") or "")
+            if exp:
+                account["expiresAt"] = int(exp)
+            await asyncio.to_thread(cred_store.persist_account, seg, uid, account)
+            return True
+        finally:
+            await asyncio.to_thread(cred_store.lock_release, lock)
+
+    async def _refresh_http(self, account: dict) -> bool:
+        """真正打上游换 token（子类只管这块：主机 / 产品 / 日志文案不同）。"""
+        try:
+            client = self.get_client()
+            headers = {
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-Domain": self.domain,
+                "X-Refresh-Token": account["refreshToken"],
+                "X-Auth-Refresh-Source": "plugin",
+                "X-Product": self.product,
+                "User-Agent": USER_AGENT,
+                "X-Trace-ID": "0" * 32,
+                "X-Request-ID": "0" * 32,
+            }
+            resp = await client.post(
+                f"https://{UPSTREAM_HOST}{UPSTREAM_REFRESH_PATH}",
+                json={}, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("workbuddy refresh HTTP %s: %s",
+                               resp.status_code, resp.text[:200])
+                if resp.status_code in (401, 403):
+                    # 刷新凭据本身被上游拒绝 → refreshToken 已死, 标记失效
+                    self._health.mark_invalid(
+                        account.get("userId"),
+                        reason=f"refresh 被拒 HTTP {resp.status_code}")
                 return False
+            data = resp.json().get("data", {})
+            if data.get("accessToken"):
+                account["accessToken"] = data["accessToken"]
+                if data.get("refreshToken"):
+                    account["refreshToken"] = data["refreshToken"]
+                logger.info("workbuddy accessToken 已自动刷新")
+                return True
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.error("workbuddy refresh 异常: %s", e)
+            return False
 
     # ---------- 上游请求 ----------
     async def _request_upstream(self, up_body: dict, account: dict,
@@ -421,7 +594,7 @@ class WorkBuddyProvider(Provider):
                 await resp.aclose()
             except Exception:
                 pass
-            if await self._refresh_token(account):
+            if await self._refresh_token(account, force=True):
                 return await self._request_upstream(up_body, account, retried=True)
 
         return resp
@@ -442,7 +615,11 @@ class WorkBuddyProvider(Provider):
                 self._health.mark_invalid(
                     account.get("userId"),
                     reason=f"chat 被拒 HTTP {resp.status_code} (含刷新重试)")
-            raise RuntimeError(f"workbuddy upstream HTTP {resp.status_code}: {err_text[:300]}")
+            # ★ 2026-10-27: 400 code=11128 的 displayTips 会被旧的 300 字上限截断,
+            #   同时把被拒请求体落盘 —— 否则定位不到是哪一句触发了渠道校验。
+            _dump_rejected(resp.status_code, err_text, up_body)
+            raise RuntimeError(
+                f"workbuddy upstream HTTP {resp.status_code}: {err_text[:1500]}")
         self._health.mark_ok(account.get("userId"))
         try:
             async for line in resp.aiter_lines():

@@ -215,16 +215,31 @@ let MOCK_CHAINS: AutoChain[] = [
     WorkBuddy: ['deepseek-v4.1-flash', 'glm-5.3-flash'],
     WorkBuddy_IE: ['kimi-k2.6', 'deepseek-v4.1-flash'],
     Loomy: [],
+    // 2026-10 新增三通道（演示数据；上游真实模型名见各 provider 的目录）
+    QoderCN: ['qdc-gmodel', 'qdc-dmodel'],
+    QoderIntl: ['qd-qmodel_38max', 'qd-kmodel_latest'],
+    CodeArts: ['ca-GLM-5.2', 'ca-deepseek-v4-flash-0731'],
   }
   const accounts: Record<Channel, string[]> = {
     Trae: ['trae_3937', 'trae_2857'],
     WorkBuddy: ['WB_fea0', 'WB_e383'],
     WorkBuddy_IE: ['WB_IE_boy'],
     Loomy: [],
+    QoderCN: ['qoder_cn_demo'],
+    QoderIntl: ['qoder_intl_demo'],
+    CodeArts: ['codearts_demo'],
   }
   for (let d = 0; d < 9; d++) {
     const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() - d)
-    for (const ch of ['Trae', 'WorkBuddy', 'WorkBuddy_IE', 'Loomy'] as Channel[]) {
+    for (const ch of [
+      'Trae',
+      'WorkBuddy',
+      'WorkBuddy_IE',
+      'Loomy',
+      'QoderCN',
+      'QoderIntl',
+      'CodeArts',
+    ] as Channel[]) {
       // Loomy 不造演示流水（主机同款账号/模型数据不进演示包），行数恒 0
       const count = ch === 'WorkBuddy_IE' ? 2 : ch === 'Loomy' ? 0 : 4 + (d % 3)
       for (let i = 0; i < count; i++) {
@@ -333,6 +348,10 @@ function buildWeek(offset: number, channel: ChannelFilter = 'all'): WeekBundle {
       WorkBuddy: isFuture ? 0 : Number((seed * 3.1 + (offset === 0 ? 150 : 60)).toFixed(1)),
       WorkBuddy_IE: isFuture ? 0 : Number((seed * 1.6 + 30).toFixed(1)),
       Loomy: 0,
+      // 2026-10 新增三通道（演示值量级给小些，避免压过主力通道）
+      QoderCN: isFuture ? 0 : Number((seed * 1.1 + 18).toFixed(1)),
+      QoderIntl: isFuture ? 0 : Number((seed * 0.9 + 12).toFixed(1)),
+      CodeArts: isFuture ? 0 : Number((seed * 1.4 + 24).toFixed(1)),
     }
     // 通道筛选：非选中通道归零，选中通道（或 all）保留
     const pick = (ch: Channel) => (channel === 'all' || channel === ch ? raw[ch] : 0)
@@ -340,19 +359,36 @@ function buildWeek(offset: number, channel: ChannelFilter = 'all'): WeekBundle {
     const wb = pick('WorkBuddy')
     const wbie = pick('WorkBuddy_IE')
     const loomy = pick('Loomy')
-    used += trae + wb + wbie + loomy
+    const qdc = pick('QoderCN')
+    const qd = pick('QoderIntl')
+    const ca = pick('CodeArts')
+    used += trae + wb + wbie + loomy + qdc + qd + ca
     gained += isFuture ? 0 : seed * 2.2 + 120
-    daily.push({ day: key, Trae: trae, WorkBuddy: wb, WorkBuddy_IE: wbie, Loomy: loomy })
+    daily.push({
+      day: key,
+      Trae: trae,
+      WorkBuddy: wb,
+      WorkBuddy_IE: wbie,
+      Loomy: loomy,
+      QoderCN: qdc,
+      QoderIntl: qd,
+      CodeArts: ca,
+    })
   }
 
   // 本周获取积分：按通道等比分摊（Trae 贡献最大），保证切通道时数字随之变化
   const weekGainBase = offset === 0 ? 3200 : 2800 + ((offset * 137) % 900)
   const share: Record<ChannelFilter, number> = {
     all: 1,
-    Trae: 0.52,
-    WorkBuddy: 0.31,
-    WorkBuddy_IE: 0.17,
+    // 2026-10：新增三通道后原三家份额相应下调，总和仍为 1（否则切通道时
+    // 各份额之和 >1，看板「获取积分」会凭空放大）
+    Trae: 0.46,
+    WorkBuddy: 0.28,
+    WorkBuddy_IE: 0.14,
     Loomy: 0,
+    QoderCN: 0.05,
+    QoderIntl: 0.04,
+    CodeArts: 0.03,
   }
 
   const last = new Date(monday)
@@ -409,6 +445,10 @@ function makeMockAccount(channel: Channel): Account {
     WorkBuddy: crypto.randomUUID(),
     WorkBuddy_IE: `国际版账号(user-${Math.floor(Math.random() * 9000 + 1000)})`,
     Loomy: `Loomy(${Math.floor(Math.random() * 9e9 + 1.3e10)})`,
+    // 2026-10 新增三通道（uid 形态与真实登录助手写入的一致：随机串 + 昵称）
+    QoderCN: `Qoder CN(u${Math.floor(Math.random() * 9e5 + 1e5)})`,
+    QoderIntl: `Qoder(u${Math.floor(Math.random() * 9e5 + 1e5)})`,
+    CodeArts: `CodeArts(user-${Math.floor(Math.random() * 9000 + 1000)})`,
   }
   return {
     id: uid('acc'),
@@ -459,9 +499,11 @@ export const mockBackend = {
       const inScope = filter === 'all' || a.channel === filter
       if (!inScope || a.status === 'disconnected') return a
       const delta = Number((Math.random() * 40 - 8).toFixed(2))
+      // credits 可能是 null（未知）——演示态同样不该把「未知」算成数字
+      const base = a.credits ?? 0
       return {
         ...a,
-        credits: Number(Math.max(0, a.credits + delta).toFixed(2)),
+        credits: Number(Math.max(0, base + delta).toFixed(2)),
         refreshedAt: now,
       }
     })
@@ -548,7 +590,10 @@ export const mockBackend = {
     const script =
       channel === 'Trae' ? 'login_trae.py'
         : channel === 'WorkBuddy' ? 'login_workbuddy.py'
-          : channel === 'Loomy' ? 'loomy_client.py'
+          : channel === 'WorkBuddy_IE' ? 'login_workbuddy_intl.py'
+            : channel === 'QoderCN' || channel === 'QoderIntl' ? 'login_qoder.py'
+              : channel === 'CodeArts' ? 'login_codearts.py'
+                : channel === 'Loomy' ? 'loomy_client.py'
             : 'login_workbuddy_intl.py'
     const host =
       channel === 'Trae' ? 'www.trae.cn'
@@ -870,6 +915,17 @@ export const mockBackend = {
 
   async setAutostart(_enabled: boolean): Promise<void> {
     await sleep(LATENCY)
+  },
+
+  /**
+   * Mock 版：演示模式下「热重载」只是回一个演示用的通道名单。
+   *
+   * 真实实现见 httpBackend.reloadProviders —— 那里会真的让网关重建 provider，
+   * 因为新通道「有账号才注册」，不重载就看不到模型。
+   */
+  async reloadProviders(): Promise<string[]> {
+    await sleep(LATENCY)
+    return ['workbuddy', 'workbuddy-intl', 'loomy', 'qoder-cn', 'qoder-intl', 'codearts']
   },
 
   async getVersion(): Promise<{ current: string; latest?: string; repo?: string }> {

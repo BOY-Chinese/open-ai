@@ -49,7 +49,16 @@ GUI「设置」页显示该版本号, 「一键更新」据此与 GitHub 最新 
 #   * 本次只动 prompt_sanitizer.py + 其测试 2 个文件; main.py / workbuddy.py
 #     的接入点零改动(原 C 已装好, 两版兼容)。
 #   * install、白名单无需再改: 文件名未变, 只是内容变了。
-APP_VERSION = 'dev-v3.4.1'
+# v4.0 (2026-10) 三端同步自本机端 local-v4.0 —— 详见《open-ai三端同步文件夹/V4.0同步.md》
+#   * v4.0 三通道深度治理：工具协议回声回读 / 一次性凭据落盘与互斥 /
+#     CodeArts 积分与探活节流
+#   * v4.1 Qoder 签到真修复（ok vs credited）+ 官方 UMID 风控身份 +
+#     RESOURCE_LIMIT / 405 归类 + Loomy 内容审核不再误判成断连
+#   * v4.2 关闭 Qoder 模型自动降级 / 签到跨区域真实身份兜底 / 405 同主机退避 /
+#     三通道消耗入流水库 / 周视图补柱子 / RESOURCE_LIMIT 等待拉长到约 160 秒
+#   * 追加（2026-10-27）Q：workbuddy 400/11128 复发 —— 整句提示词同义改写 +
+#     被拒请求体落盘 + 子进程 stdio 编码钉 UTF-8
+APP_VERSION = 'dev-v4.0'
 
 # 更新通道标识 (UPDATE_CHANNEL): 当前构建版本的更新通道, 决定「一键更新」在
 # GitHub Release Assets 中精确匹配文件名含该关键词的安装包。dev 通道匹配

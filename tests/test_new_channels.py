@@ -1174,6 +1174,54 @@ class CodeArtsCheckinTest(unittest.TestCase):
         self.assertTrue(any(CA.EP_CREDIT_CLAIM == p for _m, p in calls))
         self.assertTrue(any(CA.EP_CREDIT_CONFIRM == p for _m, p in calls))
 
+    def test_rotated_campaign_is_recognized_by_type(self):
+        """★ 2026-10-28：活动 id 会轮换（1 → 34），必须按 type 认人。
+
+        实测当日 items 里已经没有 id=1（「每日签到领积分」+1000），
+        取而代之的是 id=34（「每日签到领100积分」+100，USER_LOGIN、claimable）。
+        旧实现只认 id ∈ {1,4} → 每天报「今日未签到」，两个账号一分不领。
+        """
+        items = [{"campaignId": 34, "title": "每日签到领100积分",
+                  "type": "USER_LOGIN", "benefitAmount": 100,
+                  "benefitUnit": "CREDIT", "status": "ELIGIBLE",
+                  "claimable": True, "pendingTotalAmount": 100.0,
+                  "extra": {"startTime": "2026-10-26T16:00:00Z",
+                            "endTime": "2026-12-31T15:59:59Z"}}]
+        CA.fetch_campaigns = lambda acc: items
+        calls = []
+        orig_cr = CA.credit_request
+        CA.credit_request = lambda acc, m, path, body=None: (
+            calls.append((m, path, body)), {})[1]
+        self.addCleanup(lambda: setattr(CA, "credit_request", orig_cr))
+        r = CA.checkin({"uid": "u"})
+        self.assertTrue(r["credited"], r)
+        self.assertEqual(r["amount"], 100)
+        self.assertEqual(r["credits"], 100)
+        claims = [b for _m, path, b in calls if path == CA.EP_CREDIT_CLAIM]
+        self.assertTrue(claims and claims[0].get("campaignId") == 34, calls)
+
+    def test_daily_id_fallback_without_type(self):
+        """type 缺失时仍按历史 id=1 兜底（兼容老响应/老夹具）。"""
+        items = [dict(self.ITEMS[0])]
+        items[0]["type"] = None
+        CA.fetch_campaigns = lambda acc: items
+        r = CA.checkin({"uid": "u"})
+        self.assertTrue(r["credited"])
+        self.assertEqual(r["amount"], 1000)
+
+    def test_new_user_by_type_even_if_id_changes(self):
+        """新用户礼同样按 type 认；CONFIRMED 只记消息，不能算成每日签到。"""
+        items = [{"campaignId": 99, "title": "新用户注册送 4000 积分",
+                  "type": "NEW_USER_REGISTER", "benefitAmount": 4000,
+                  "benefitUnit": "CREDIT", "status": "CONFIRMED",
+                  "claimable": False, "pendingTotalAmount": 0.0,
+                  "extra": {"startTime": "2026-09-08T16:00:00Z",
+                            "endTime": "2026-12-30T16:00:00Z"}}]
+        CA.fetch_campaigns = lambda acc: items
+        r = CA.checkin({"uid": "u"})
+        self.assertIn("新用户", r["msg"])
+        self.assertFalse(r["credited"], "新手礼不是每日签到，不能写签到 gain")
+
     def test_credits_unknown_not_zero(self):
         """没有余额接口 → 返回 None（未知），绝不能是 0。"""
         credits, reason = CA.fetch_credits({"uid": "u"})

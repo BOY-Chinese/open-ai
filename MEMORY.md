@@ -1273,3 +1273,19 @@ master 明确指示：**推出 v3.4.1 小版本**。上一版 **v3.4 的资产�
 - **测试**：`python -m unittest discover -s tests -t .` → **738 项，失败 0，错误 4**（`test_procman` ×3 + `test_model_rate_unknown` ×1）。同样 4 项在 v3.4.1 基线复现，原因是发布仓无 `config.json`、Windows Job Object 环境差异，**非本次引入**。
 - **产物**：`open-ai-installer-dev.exe` 已复制到 `D:\Lenovo\Desktop`（构建日志 `installer/build_installer.log`；最终大小与 sha256 见本次会话回复）。
 - **未做**：未 push、未建 tag/release；安装后的 live 冒烟需在真实安装实例上执行（见 `V4.0同步.md` 三、五节）。
+
+---
+
+## v4.0 补丁 A（2026-10-29 同步）：CodeArts 每日签到改按 type 识别
+
+- **现象**：2026-10-28 起 CodeArts 两个账号每轮都报「今日未签到」。上游把每日签到活动从
+  `campaignId=1`（+1000）轮换为 `campaignId=34`（`type=USER_LOGIN`，+100）；
+  旧代码写死 `id ∈ {1,4}`，把 34 整条过滤，`daily_done` 恒 False。
+- **修法**：`providers/codearts.py` 新增 `_is_daily_campaign` / `_is_new_user_campaign`，
+  按 `type`（`USER_LOGIN` / `NEW_USER_REGISTER`）识别，`campaignId` 仅作兜底；
+  多个每日活动时额度累加。
+- **测试**：`tests/test_new_channels.py` 新增 3 例（id 轮换 / type 缺失兜底 / 新手礼按 type）；
+  `CodeArtsCheckinTest` **8/8 通过**。
+- **生效**：签到是 Broker 每轮按需拉起的 `open-ai-task.exe` 新进程，覆盖文件即生效，
+  **不需要重启网关**；但 portable 的 task/gateway 内嵌 providers，**必须重打安装包**。
+- **版本**：仍为 `dev-v4.0` / `portable-v4.0`（本次是 v4.0 的补丁，未改版本号）。

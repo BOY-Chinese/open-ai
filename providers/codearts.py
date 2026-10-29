@@ -891,9 +891,36 @@ def fetch_campaigns(account: dict) -> list:
 
 
 # 每日签到活动的 campaignId（实测 2026-10-22：id=1 为「每日签到领积分」）
+# ★ 2026-10-28 事故：活动轮换了 —— 旧的 id=1「每日签到领积分」(+1000) 从 items
+#   里消失，新的 id=34「每日签到领100积分」(+100) 出现且 claimable=True；
+#   而 checkin 只认 id ∈ {1,4}，于是每天报「今日未签到」、一分不领（两个账号全挂）。
+#   活动方随时会换 id、换面额（1000 → 100），按 id 写死必然复发，
+#   所以改成按 **type** 识别（USER_LOGIN / NEW_USER_REGISTER），id 仅作兜底。
 DAILY_CAMPAIGN_ID = 1
+DAILY_CAMPAIGN_TYPE = "USER_LOGIN"
 # 新用户注册礼（一次性）
 NEW_USER_CAMPAIGN_ID = 4
+NEW_USER_CAMPAIGN_TYPE = "NEW_USER_REGISTER"
+
+
+def _is_daily_campaign(c: dict) -> bool:
+    """是否「每日签到」活动（按 type 识别，id 兜底）。"""
+    if str(c.get("type") or "").strip().upper() == DAILY_CAMPAIGN_TYPE:
+        return True
+    try:
+        return int(c.get("campaignId")) == DAILY_CAMPAIGN_ID
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_new_user_campaign(c: dict) -> bool:
+    """是否「新用户注册礼」（一次性；按 type 识别，id 兜底）。"""
+    if str(c.get("type") or "").strip().upper() == NEW_USER_CAMPAIGN_TYPE:
+        return True
+    try:
+        return int(c.get("campaignId")) == NEW_USER_CAMPAIGN_ID
+    except (TypeError, ValueError):
+        return False
 
 
 def _campaign_amount(c: dict) -> float:
@@ -908,7 +935,7 @@ def _campaign_amount(c: dict) -> float:
 
 
 def checkin(account: dict) -> dict:
-    """领取每日签到（campaignId=1）与新用户礼（4）。
+    """领取每日签到（type=USER_LOGIN）与新用户礼（type=NEW_USER_REGISTER）。
 
     返回 {ok, credited, credits, amount, already?, msg}
       * ok       = 本次调用是否正常跑完（**不代表签到成功**，见下）
@@ -942,7 +969,9 @@ def checkin(account: dict) -> dict:
             cid_int = int(c.get("campaignId"))
         except (TypeError, ValueError):
             continue
-        if cid_int not in (DAILY_CAMPAIGN_ID, NEW_USER_CAMPAIGN_ID):
+        is_daily = _is_daily_campaign(c)
+        is_new = _is_new_user_campaign(c)
+        if not (is_daily or is_new):
             continue
         unit = str(c.get("benefitUnit") or "")
         if unit and unit != "CREDIT":
@@ -962,8 +991,9 @@ def checkin(account: dict) -> dict:
         if status in ("CONFIRMED", "CONSUMED"):
             # 今日已完成（后端按天重置，见活动接口的 serverTime 语义）
             msgs.append(f"{title}: 今日已完成" + (f" +{int(amount)}" if amount else ""))
-            if cid_int == DAILY_CAMPAIGN_ID:
-                daily_done, daily_amount = True, amount
+            if is_daily:
+                daily_done = True
+                daily_amount += amount
             continue
         if status == "EXPIRED":
             msgs.append(f"{title}: 已过期")
@@ -976,8 +1006,9 @@ def checkin(account: dict) -> dict:
             except Exception as e:  # noqa: BLE001
                 ok = False
                 msgs.append(f"{title}: 确认失败 {str(e)[:80]}")
-            if cid_int == DAILY_CAMPAIGN_ID:
-                daily_done, daily_amount = True, amount
+            if is_daily:
+                daily_done = True
+                daily_amount += amount
             continue
         if not c.get("claimable"):
             msgs.append(f"{title}: 不可领取({status or 'Unknown'})")
@@ -1006,8 +1037,9 @@ def checkin(account: dict) -> dict:
         got = got or amount
         total += got
         msgs.append(f"{title}: +{int(got)}" if got else f"{title}: 已领取")
-        if cid_int == DAILY_CAMPAIGN_ID:
-            daily_done, daily_amount = True, got
+        if is_daily:
+            daily_done = True
+            daily_amount += got
     return {"ok": ok, "credited": bool(daily_done), "credits": int(total),
             "amount": int(daily_amount), "already": bool(daily_done and not total),
             "msg": "; ".join(msgs) or "无可领取的签到或新手活动"}

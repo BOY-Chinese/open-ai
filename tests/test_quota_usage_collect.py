@@ -360,5 +360,76 @@ class TestCodeartsFetchCreditStats(unittest.TestCase):
         self.assertIn('失败', err)
 
 
+class CodeArtsTokenRefreshTest(unittest.TestCase):
+    """★ 2026-10-30：采集器取 CodeArts 积分时必须自己管 token 生命周期。
+
+    实锤（logs/collector.log）：两个账号**交替**报
+    `statistics/plugin 请求失败 … the security token has expired`，
+    20:41~21:41 一个、22:11~22:26 另一个、23:46~23:56 又换回来，历史累计 1209 条；
+    期间该账号的 quota 快照与「当日消耗」整段缺数。
+    根因：`fetch_credit_stats()` 是纯函数（不续期），而采集器每 5 分钟跑一轮、
+    STS token 只有约 1 小时寿命。
+    """
+
+    class _FakeCA:
+        @staticmethod
+        def is_expiry_error_text(text):
+            return 'security token has expired' in str(text or '').lower()
+
+        def __init__(self, seq):
+            self.seq = list(seq)
+            self.fetched = 0
+            self.refreshed = 0
+
+        def refresh_account_token(self, acc):
+            self.refreshed += 1
+            return True
+
+        def fetch_credit_stats(self, acc):
+            self.fetched += 1
+            return self.seq.pop(0) if self.seq else ({}, 'security token has expired')
+
+    def setUp(self):
+        self._orig_mod = U._providers_module
+        self._orig_log = U.log
+        self.logs = []
+        U.log = lambda m: self.logs.append(m)
+        self.addCleanup(lambda: setattr(U, "_providers_module", self._orig_mod))
+        self.addCleanup(lambda: setattr(U, "log", self._orig_log))
+
+    def _use(self, fake, acc):
+        U._providers_module = lambda name: fake
+        return U._codearts_used(acc)
+
+    def test_refreshes_before_fetch_when_token_expiring(self):
+        fake = self._FakeCA([({'used': 12.5}, '')])
+        used, err = self._use(fake, {'uid': 'u1', 'expiresAt': int(time.time()) - 10})
+        self.assertEqual(err, '')
+        self.assertAlmostEqual(used, 12.5)
+        self.assertEqual(fake.refreshed, 1, '临近过期要先续期')
+        self.assertEqual(fake.fetched, 1)
+
+    def test_retries_once_after_expired_error(self):
+        fake = self._FakeCA([
+            ({}, 'statistics/plugin 请求失败: codearts api code=None http=400 '
+                 'msg={"error_msg":"Bad request: the security token has expired"}'),
+            ({'used': 7.0}, ''),
+        ])
+        used, err = self._use(fake, {'uid': 'u2',
+                                     'expiresAt': int(time.time()) + 3600})
+        self.assertEqual(err, '')
+        self.assertAlmostEqual(used, 7.0)
+        self.assertEqual(fake.fetched, 2, '过期后必须重试一次')
+        self.assertEqual(fake.refreshed, 1, '重试前必须续期')
+
+    def test_persistent_expired_returns_none_not_zero(self):
+        fake = self._FakeCA([({}, 'security token has expired'),
+                             ({}, 'security token has expired')])
+        used, err = self._use(fake, {'uid': 'u3',
+                                     'expiresAt': int(time.time()) + 3600})
+        self.assertIsNone(used, '拿不到就必须是 None —— 0 会被看板当成「今天没消耗」')
+        self.assertIn('expired', err)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -1222,6 +1222,19 @@ class CodeArtsCheckinTest(unittest.TestCase):
         self.assertIn("新用户", r["msg"])
         self.assertFalse(r["credited"], "新手礼不是每日签到，不能写签到 gain")
 
+    def test_is_expiry_error_text(self):
+        """★ 2026-10-30：过期判据必须覆盖华为云的几种文案。
+
+        采集器/admin 刷新没有 provider 实例可用，只能靠错误文本判断
+        （此前没有这个判据 → token 一过期就静默失败）。
+        """
+        for text in ("APIG.0602",
+                     '{"error_msg":"Bad request: the security token has expired"}',
+                     "STS5.1806", "APIG.0301", "decrypt token fail"):
+            self.assertTrue(CA.is_expiry_error_text(text), text)
+        self.assertFalse(CA.is_expiry_error_text("并发会话数已达上限(3个)"))
+        self.assertFalse(CA.is_expiry_error_text(None))
+
     def test_credits_unknown_not_zero(self):
         """没有余额接口 → 返回 None（未知），绝不能是 0。"""
         credits, reason = CA.fetch_credits({"uid": "u"})

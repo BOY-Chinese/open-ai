@@ -1289,3 +1289,22 @@ master 明确指示：**推出 v3.4.1 小版本**。上一版 **v3.4 的资产�
 - **生效**：签到是 Broker 每轮按需拉起的 `open-ai-task.exe` 新进程，覆盖文件即生效，
   **不需要重启网关**；但 portable 的 task/gateway 内嵌 providers，**必须重打安装包**。
 - **版本**：仍为 `dev-v4.0` / `portable-v4.0`（本次是 v4.0 的补丁，未改版本号）。
+
+## v4.0 补丁 B（2026-10-30 同步）：CodeArts 积分/采集自己管 STS token
+
+- **现象**：CodeArts 账号积分偶发「—」、看板当日消耗整段缺数；`collector.log` 成片
+  `the security token has expired`（累计 1209 条，两个账号交替）。
+- **根因**：`fetch_credit_stats()` / `fetch_credits()` 是纯函数，**从不续期**；
+  华为 STS `securityToken` 约 1 小时寿命，而采集器每 5 分钟一轮 —— 空窗期必失败。
+  续期只活在聊天路径 `_ensure_token()` 与签到脚本 `refresh_account_token()`。
+- **修法（来源提交 `edc246e`）**：
+  - `scripts/usage_collector.py`：`_codearts_used` 临近过期先 `refresh_account_token()`，
+    遇过期错误再续期重试一次；持续失败返回 `None`（绝不伪造 0）；
+  - `admin_api._new_channel_credits`：叠加「过期 → 强制续期 → 重试」，失败写 WARNING（带 uid）；
+  - `providers/codearts.py`：抽出 `is_expiry_error_text()`（APIG.0602 / security token has expired /
+    STS5.1806 / APIG.0301 / decrypt token fail），供无 provider 实例的调用方复用。
+- **测试**：`test_quota_usage_collect` 新增 3 例（先续期 / 过期重试一次 / 持续失败返回 None）、
+  `test_new_channels` 新增 1 例（过期判据 5 种文案，且不误判并发上限）。
+- **生效**：采集器/签到是每轮新进程，覆盖即生效；**admin_api 是常驻代码，必须重启网关**；
+  portable 的 gateway/task 内嵌代码，**必须重打安装包**。
+- **版本**：仍为 `dev-v4.0` / `portable-v4.0`（v4.0 补丁 B）。

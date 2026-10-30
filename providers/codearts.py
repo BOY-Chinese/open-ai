@@ -80,6 +80,20 @@ EP_STAT_PLUGIN = "/snap-manager/v1/statistics/plugin"
 EP_PACKAGE_OVERVIEW = "/snap-manager/v1/package/overview"
 EP_BENEFIT_GATEWAY = "/v1/benefit-gateway-config"
 EP_EDUCATION_GATEWAY = "/v1/education-gateway-config"
+# 「凭据过期」类错误的文本特征（APIG.0602 / STS5.1806 / …）。
+# ★ 2026-10-30：抽成**模块级**函数 —— 采集器与 admin 积分刷新都没有 provider
+#   实例可用来判断，只能看错误文本；过去它们各自没有这个判据，
+#   于是 token 一过期就静默失败（见 usage_collector._codearts_used 注释）。
+_EXPIRY_ERROR_TOKENS = ("apig.0602", "security token has expired",
+                        "sts5.1806", "apig.0301", "decrypt token fail")
+
+
+def is_expiry_error_text(text) -> bool:
+    """错误文本/响应体是否属于「凭据过期」类。"""
+    blob = str(text or "").lower()
+    return any(t in blob for t in _EXPIRY_ERROR_TOKENS)
+
+
 EP_CREDIT_DELIVERY = "/v1/ops/delivery"
 EP_CREDIT_CLAIM = "/v1/ops/claim"
 EP_CREDIT_CONFIRM = "/v1/ops/confirm"
@@ -1456,14 +1470,8 @@ class CodeArtsProvider(Provider):
     @staticmethod
     def _is_expired_error(exc: Exception) -> bool:
         """判断异常是否为「凭据过期」类。"""
-        text = f"{exc}"
         body = getattr(exc, "body", "") or ""
-        blob = f"{text} {body}".lower()
-        for token in ("apig.0602", "security token has expired",
-                      "sts5.1806", "apig.0301", "decrypt token fail"):
-            if token in blob:
-                return True
-        return False
+        return is_expiry_error_text(f"{exc} {body}")
 
     async def _call_with_token(self, account: dict, fn, *args, **kwargs):
         """在**有效 token** 的前提下执行 `fn(account, *args)`。

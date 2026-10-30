@@ -780,13 +780,60 @@ def _qoder_used(acc):
     return sum(_used(quota.get(k)) for k in pools), ''
 
 
+# 「凭据过期」类错误的文本特征（与 providers/codearts.is_expiry_error_text 同口径）。
+# 采集器这里自己留一份：它会把 providers 模块整体替换成替身（测试/降级），
+# 不能假设对方一定实现了这个函数。
+_EXPIRY_ERROR_HINTS = ("apig.0602", "security token has expired",
+                       "sts5.1806", "apig.0301", "decrypt token fail")
+
+
+def _is_expiry_error_text(text) -> bool:
+    blob = str(text or '').lower()
+    return any(h in blob for h in _EXPIRY_ERROR_HINTS)
+
+
 def _codearts_used(acc):
-    """CodeArts 账号的**累计已用**积分。返回 (used|None, err)。"""
+    """CodeArts 账号的**累计已用**积分。返回 (used|None, err)。
+
+    ★ 2026-10-30 修「又有账号没有正常返回积分」：采集器每 5 分钟一轮，而华为
+      STS securityToken 寿命约 1 小时；`fetch_credit_stats()` 是**纯函数**
+      （只拿 credentials 签名，从不续期），token 一过期整轮就报
+      `Bad request: the security token has expired`，
+      该账号当天的 quota 快照与「当日消耗」直接缺数。
+
+      实锤（logs/collector.log）：两个账号**交替**出现这种失败，按小时成片 ——
+      20:41~21:41 是 01a16c50，22:11~22:26 是 3df18448，23:46~23:56 又是 01a16c50；
+      累计 1209 条同类报错。期间只要网关那边有请求（会续期并落盘）就自动恢复，
+      所以表现为「时好时坏」。
+
+      修法：临近过期先续期（复用 `refresh_account_token`，它自带跨进程互斥，
+      不会把单次使用的 refresh token 玩坏）；遇到过期错误再续期重试一次。
+    """
     try:
         ca = _providers_module('codearts')
+    except Exception as e:  # noqa: BLE001
+        return None, f'codearts 模块不可用: {str(e)[:120]}'
+    uid = str(acc.get('uid') or '')[:8]
+    refresh = getattr(ca, 'refresh_account_token', None)   # 替身模块可能没有
+    try:
+        exp = int(acc.get('expiresAt') or 0)
+        if refresh is not None and (not exp or exp - 300 <= time.time()):
+            if refresh(acc):
+                log(f'quota codearts/{uid}: 凭据已续期')
+    except Exception as e:  # noqa: BLE001
+        log(f'quota codearts/{uid}: 续期异常（继续用现有凭据）: {str(e)[:100]}')
+    try:
         stats, err = ca.fetch_credit_stats(acc)
     except Exception as e:  # noqa: BLE001
-        return None, f'statistics 查询异常: {str(e)[:120]}'
+        stats, err = {}, f'statistics 查询异常: {str(e)[:120]}'
+    if not stats and _is_expiry_error_text(err):
+        # 过期错误 —— 强制续期后重试一次（仍失败就照实返回，不伪造 0）
+        try:
+            if refresh is not None:
+                refresh(acc)
+            stats, err = ca.fetch_credit_stats(acc)
+        except Exception as e:  # noqa: BLE001
+            err = f'{err} | 过期后重试异常: {str(e)[:80]}'
     if not stats:
         return None, err or 'statistics/plugin 无响应'
     return float(stats.get('used') or 0), ''

@@ -1242,7 +1242,25 @@ def _new_channel_credits(channel: str, acc: dict,
                         provider._refresh_locked(acc)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("codearts 积分前续期失败（继续用现有 token）: %s", e)
-            return ca.fetch_credits(acc)
+            total, err = ca.fetch_credits(acc)
+            # ★ 2026-10-30：「expiresAt 还写着有效、上游却已判过期」这种情况存在
+            #   （STS 被提前吊销 / 时钟差 / 上一轮续期落在别的进程），届时上面的
+            #   预防性续期不会触发，积分就整条吞掉、前端只能显示「—」。
+            #   这里补一次「过期 → 强制续期 → 重试」，并把失败写日志
+            #   （过去失败只回给前端、日志里什么都没有，排查全靠猜）。
+            if total is None and ca.is_expiry_error_text(err):
+                logger.info("codearts 积分遇凭据过期，强制续期后重试（uid=%s）",
+                            str(acc.get("uid") or "")[:8])
+                if provider is not None and hasattr(provider, "_refresh_locked"):
+                    try:
+                        provider._refresh_locked(acc)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("codearts 积分重试前续期失败: %s", e)
+                total, err = ca.fetch_credits(acc)
+            if total is None:
+                logger.warning("codearts 积分获取失败（uid=%s）: %s",
+                               str(acc.get("uid") or "")[:8], err)
+            return total, err
     except Exception as e:  # noqa: BLE001
         return None, f"{type(e).__name__}: {e}"[:160]
     return None, f"未知通道 {channel}"
